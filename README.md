@@ -36,6 +36,24 @@ Page des [releases](https://github.com/lburdier/EasyUV/releases/latest) :
 6. **Plusieurs objets :** rangement dans une tuile commune (même densité pour tous) ou une tuile par objet.
 7. **Empaquetage :** rotation qui minimise la boîte englobante, puis skyline avec rotation de 90°.
 
+## Auto-apprentissage
+
+EasyUV s'améliore à force de déplier.
+
+1. **Empreinte.** Chaque maillage est décrit par une empreinte invariante d'échelle : taille, part de triangles, arêtes vives, courbure, bords ouverts, topologie, forme.
+2. **Prédiction.** Un modèle de substitution à noyau estime, à partir des expériences sur des maillages similaires, le gain de chaque réglage (angle de couture, tolérance de distorsion, ARAP) par rapport aux réglages d'usine.
+3. **Essais.** EasyUV essaie en parallèle la prédiction, les réglages d'usine, vos réglages et quelques variantes, puis garde le meilleur. L'exploration diminue quand la confiance augmente.
+4. **Mémoire.** Les mesures de chaque essai (distorsion, coutures, îlots, remplissage, retournements) sont enregistrées. Elles servent pour tous les maillages qui suivent.
+
+Le curseur **Priorité : coutures ↔ distorsion** change le compromis immédiatement, sans réentraînement : les mesures sont stockées brutes et le score est recalculé.
+
+Le modèle se trouve dans `%APPDATA%\EasyUV\apprentissage.txt`. Il est partagé par l'application, le CLI et Blender, et écrit en ajout seul. Un modèle de base pré-entraîné est livré. Pour l'enrichir d'un coup sur vos propres modèles :
+
+```text
+easyuv-cli --train D:\mes_modeles --rounds 3      # entraîner
+easyuv-cli --eval D:\autres_modeles               # mesurer le gain sur des maillages jamais vus
+```
+
 ## Formats
 
 | Format | Import | Export |

@@ -5,6 +5,7 @@ use crate::update::{self, Release};
 use crate::uvview::{self, UvCamera};
 use crate::viewport::{self, Camera, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
+use easyuv::learn::{self, Learner};
 use easyuv::math::V3;
 use easyuv::mesh::Mesh;
 use easyuv::model::Model;
@@ -12,6 +13,16 @@ use easyuv::{primitives, DensityMode, Params, UvResult};
 use eframe::egui::{self, Color32, RichText, TextureHandle, TextureOptions};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+
+/// Résumé d'un dépliage appris, affiché dans le panneau.
+struct LearnInfo {
+    params: Params,
+    score: f64,
+    default_score: f64,
+    trials: usize,
+    confidence: f64,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Workspace {
@@ -44,7 +55,14 @@ pub struct EasyUvApp {
     texture: Option<TextureHandle>,
     texture_dirty: bool,
     workspace: Workspace,
-    job: Option<Receiver<UvResult>>,
+    job: Option<Receiver<(UvResult, Option<LearnInfo>)>>,
+    learner: Arc<Mutex<Learner>>,
+    auto_learn: bool,
+    trials: usize,
+    /// 0 = moins de coutures, 1 = moins de distorsion.
+    priority: f64,
+    last_learn: Option<LearnInfo>,
+    confirm_reset: bool,
     update: UpdateState,
     show_update: bool,
     status: String,
@@ -69,6 +87,12 @@ impl EasyUvApp {
             texture_dirty: true,
             workspace: Workspace::Layout,
             job: None,
+            learner: Arc::new(Mutex::new(Learner::load(&learn::default_path()))),
+            auto_learn: true,
+            trials: 6,
+            priority: 0.5,
+            last_learn: None,
+            confirm_reset: false,
             update: UpdateState::Idle,
             show_update: false,
             status: "Prêt".into(),
@@ -140,9 +164,29 @@ impl EasyUvApp {
         let together = self.pack_together;
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let learner = self.auto_learn.then(|| self.learner.clone());
+        let trials = self.trials;
+        let priority = self.priority;
         std::thread::spawn(move || {
-            let r = easyuv::model::unwrap_model(&model, &params, together);
-            let _ = tx.send(r);
+            let out = match learner {
+                Some(l) => {
+                    let mut l = l.lock().unwrap();
+                    l.priority = priority;
+                    let res = learn::unwrap_learned(&model, &params, together, &mut l, trials);
+                    // l'expérience est conservée même si l'application est fermée ensuite
+                    let _ = l.save(&learn::default_path());
+                    let info = LearnInfo {
+                        params: res.params,
+                        score: res.score,
+                        default_score: res.default_score,
+                        trials: res.trials,
+                        confidence: res.confidence,
+                    };
+                    (res.result, Some(info))
+                }
+                None => (easyuv::model::unwrap_model(&model, &params, together), None),
+            };
+            let _ = tx.send(out);
             ctx.request_repaint();
         });
         self.job = Some(rx);
@@ -151,7 +195,14 @@ impl EasyUvApp {
 
     fn poll_job(&mut self) {
         let Some(rx) = &self.job else { return };
-        if let Ok(r) = rx.try_recv() {
+        if let Ok((r, info)) = rx.try_recv() {
+            if let Some(i) = &info {
+                // les curseurs montrent les réglages retenus par le modèle
+                self.params.angle_deg = i.params.angle_deg;
+                self.params.max_distortion = i.params.max_distortion;
+                self.params.relax_iterations = i.params.relax_iterations;
+            }
+            self.last_learn = info;
             let s = &r.stats;
             self.status = format!(
                 "Dépliage : {} îlots, {} coutures, distorsion {:.3}, {:.0} ms{}",
@@ -524,6 +575,25 @@ impl EasyUvApp {
                             ui.label("Pivoter les îlots");
                             ui.checkbox(&mut self.params.rotate_islands, "");
                             ui.end_row();
+                            ui.label("Auto-apprentissage");
+                            ui.checkbox(&mut self.auto_learn, "").on_hover_text(
+                                "EasyUV essaie plusieurs réglages, garde le meilleur et retient ce qui marche\npour chaque type de maillage. Plus il travaille, mieux il prédit.",
+                            );
+                            ui.end_row();
+                            if self.auto_learn {
+                                ui.label("Essais par dépliage");
+                                ui.add(egui::Slider::new(&mut self.trials, 1..=16));
+                                ui.end_row();
+                                ui.label("Priorité");
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("coutures").small().color(theme::TEXT_DIM));
+                                    ui.add(egui::Slider::new(&mut self.priority, 0.0..=1.0).show_value(false)).on_hover_text(
+                                        "Gauche : le moins de coutures et d'îlots possible.\nDroite : le moins de distorsion possible.\nS'applique immédiatement à ce que le modèle a déjà appris.",
+                                    );
+                                    ui.label(RichText::new("distorsion").small().color(theme::TEXT_DIM));
+                                });
+                                ui.end_row();
+                            }
                             ui.label("Ranger ensemble");
                             ui.checkbox(&mut self.pack_together, "").on_hover_text(
                                 "Coché : tous les objets partagent la tuile 0-1 et la même densité.\nDécoché : chaque objet a sa propre tuile.",
@@ -540,8 +610,41 @@ impl EasyUvApp {
                         if busy {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Segmentation, LSCM, ARAP, empaquetage…");
+                                ui.label(if self.auto_learn { "Essais en parallèle, notation, apprentissage…" } else { "Segmentation, LSCM, ARAP, empaquetage…" });
                             });
+                        }
+                        if self.auto_learn {
+                            ui.add_space(4.0);
+                            let (total, local) = self.learner.try_lock().map(|l| (l.samples.len(), l.local_len())).unwrap_or((0, 0));
+                            egui::Frame::new().fill(theme::FIELD).corner_radius(4).inner_margin(6).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(format!("Modèle : {total} expériences ({local} acquises ici)")).small().color(theme::TEXT_DIM));
+                                if let Some(i) = &self.last_learn {
+                                    let gain = i.score - i.default_score;
+                                    ui.label(
+                                        RichText::new(format!("Retenu : {:.0}°, tolérance {:.2}, ARAP {}", i.params.angle_deg, i.params.max_distortion, i.params.relax_iterations))
+                                            .small(),
+                                    );
+                                    let col = if gain > 1e-4 { theme::AXIS_Y } else { theme::TEXT_DIM };
+                                    ui.label(
+                                        RichText::new(format!("Score {:+.3} ({:+.3} vs défaut) · {} essais · confiance {:.1}", i.score, gain, i.trials, i.confidence))
+                                            .small()
+                                            .color(col),
+                                    );
+                                }
+                            });
+                            let label = if self.confirm_reset { "Confirmer : oublier l'expérience locale" } else { "Oublier l'expérience locale" };
+                            if ui.small_button(label).clicked() {
+                                if self.confirm_reset {
+                                    let _ = std::fs::remove_file(learn::default_path());
+                                    if let Ok(mut l) = self.learner.lock() {
+                                        *l = Learner::base();
+                                    }
+                                    self.last_learn = None;
+                                    self.status = "Expérience locale effacée (modèle de base conservé)".into();
+                                }
+                                self.confirm_reset = !self.confirm_reset;
+                            }
                         }
                     });
 

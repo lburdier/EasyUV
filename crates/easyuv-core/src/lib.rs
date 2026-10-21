@@ -7,6 +7,7 @@ pub mod chart;
 pub mod checker;
 pub mod ffi;
 pub mod glb;
+pub mod learn;
 pub mod math;
 pub mod mesh;
 pub mod model;
@@ -74,6 +75,8 @@ pub struct Stats {
     /// Vrai si la densité cible fait déborder la tuile 0-1.
     pub overflow: bool,
     pub seams: usize,
+    /// Longueur totale des coutures / racine de l'aire (sans unité, comparable entre maillages).
+    pub seam_length: f64,
     pub time_ms: f64,
 }
 
@@ -164,9 +167,13 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
                     || corner_uv[e.faces[0].cb as usize] != corner_uv[e.faces[1].cb as usize]));
         if is_seam {
             seams.push(e.key);
+            stats.seam_length += e.length;
         }
     }
     stats.seams = seams.len();
+    if total_area > 0.0 {
+        stats.seam_length /= total_area.sqrt();
+    }
     stats.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
     UvResult { corner_uv, face_chart, seams, stats }
 }

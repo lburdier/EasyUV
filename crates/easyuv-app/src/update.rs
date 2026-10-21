@@ -107,6 +107,12 @@ fn hex(bytes: &[u8]) -> String {
 /// Télécharge, vérifie et installe la release à la place de l'exécutable courant.
 /// Retourne le chemin de l'exécutable (à relancer).
 pub fn install(rel: &Release) -> Result<PathBuf, String> {
+    install_to(rel, None)
+}
+
+/// Comme [`install`], mais vers `target` si fourni (utilisé par easyuv-cli pour mettre à jour
+/// l'application posée à côté de lui, sans se remplacer lui-même).
+pub fn install_to(rel: &Release, target: Option<&std::path::Path>) -> Result<PathBuf, String> {
     let data = download(&rel.exe_url)?;
     if data.len() < 1024 || &data[0..2] != b"MZ" {
         return Err("le fichier téléchargé n'est pas un exécutable Windows".into());
@@ -116,6 +122,13 @@ pub fn install(rel: &Release) -> Result<PathBuf, String> {
     let actual = hex(&Sha256::digest(&data));
     if expected != actual {
         return Err(format!("empreinte invalide (attendue {expected}, obtenue {actual}) : mise à jour refusée"));
+    }
+    if let Some(target) = target {
+        // écriture à côté puis renommage : jamais d'exécutable à moitié écrit
+        let tmp = target.with_extension("exe.download");
+        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, target).map_err(|e| format!("remplacement de {} (application ouverte ?) : {e}", target.display()))?;
+        return Ok(target.to_path_buf());
     }
     let tmp = std::env::temp_dir().join(format!("EasyUV-{}.exe", rel.version));
     std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;

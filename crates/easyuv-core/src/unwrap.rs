@@ -184,7 +184,9 @@ pub fn arap(chart: &Chart, uv: &mut [V2], iterations: usize, max_cg: usize) {
                 *acc.entry(key).or_insert(0.0) += t.cot[k];
             }
         }
-        for (&(i, j), &w) in &acc {
+        let mut acc: Vec<((usize, usize), f64)> = acc.into_iter().collect();
+        acc.sort_unstable_by_key(|e| e.0); // sommes flottantes dans un ordre déterministe
+        for &((i, j), w) in &acc {
             lap.diag[i] += w;
             lap.diag[j] += w;
             lap.nbr[i].push((j as u32, -w));
