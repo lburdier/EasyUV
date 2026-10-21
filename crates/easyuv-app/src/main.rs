@@ -2,6 +2,7 @@
 
 mod app;
 mod io;
+mod raster;
 mod scene;
 mod theme;
 mod update;

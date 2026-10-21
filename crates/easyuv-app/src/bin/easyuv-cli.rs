@@ -27,6 +27,7 @@ USAGE : easyuv-cli [options] <fichier|dossier>...
   --separate               une tuile UV par objet (défaut : rangement commun)
   --density <px/m>         densité de texels cible (défaut : remplir 0-1)
   --tex <px>               taille de texture (défaut : 2048)
+  --shape <forme>          auto | hard | cyl | organic (défaut : auto, détecté par morceau)
   --angle <deg>            angle de couture (défaut : 66)
   --distortion <x>         tolérance de distorsion (défaut : 0.12)
   --relax <n>              itérations ARAP (défaut : 4)
@@ -93,6 +94,10 @@ fn run() -> Result<(), String> {
             "--separate" => together = false,
             "--density" => p.density = DensityMode::Target(num(args.next(), "--density")?),
             "--tex" => p.texture_size = num(args.next(), "--tex")? as u32,
+            "--shape" => {
+                let v = args.next().ok_or("--shape : valeur manquante")?;
+                p.shape = easyuv::regions::ShapePreset::parse(&v).ok_or(format!("--shape : forme inconnue « {v} » (auto, hard, cyl, organic)"))?;
+            }
             "--angle" => p.angle_deg = num(args.next(), "--angle")?,
             "--distortion" => p.max_distortion = num(args.next(), "--distortion")?,
             "--relax" => p.relax_iterations = num(args.next(), "--relax")? as u32,
@@ -290,11 +295,14 @@ fn process(model: &Model, p: &Params, together: bool, out: &Path, learner: Optio
     io::export(out, model, Some(&r.corner_uv))?;
     let s = &r.stats;
     println!(
-        "{} : {} objet(s), {} faces -> {} îlots, distorsion {:.3}, {:.0} px/m{}, {:.0} ms{extra}",
+        "{} : {} objet(s), {} faces -> {} îlots [hard {} · cyl {} · orga {}], distorsion {:.3}, {:.0} px/m{}, {:.0} ms{extra}",
         out.display(),
         model.objects.len(),
         model.mesh.face_count(),
         s.charts,
+        s.shapes[0],
+        s.shapes[1],
+        s.shapes[2],
         s.mean_distortion,
         s.density_px_per_unit,
         if s.overflow { " (déborde de 0-1)" } else { "" },

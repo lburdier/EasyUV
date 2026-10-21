@@ -117,6 +117,9 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
         out.stats.charts += s.charts;
         out.stats.flipped += s.flipped;
         out.stats.seams += s.seams;
+        for k in 0..3 {
+            out.stats.shapes[k] += s.shapes[k];
+        }
         out.stats.seam_length += s.seam_length * a.sqrt();
         out.stats.overflow |= s.overflow;
         out.stats.max_distortion = out.stats.max_distortion.max(s.max_distortion);

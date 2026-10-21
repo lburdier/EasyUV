@@ -35,6 +35,7 @@ class EuvParams(ctypes.Structure):
         ("quality", ctypes.c_uint32),
         ("rotate_islands", ctypes.c_uint32),
         ("priority", ctypes.c_float),
+        ("shape", ctypes.c_uint32),
     ]
 
 
@@ -66,7 +67,7 @@ class EuvStats(ctypes.Structure):
 
 
 _lib = None
-_API_VERSION = 2
+_API_VERSION = 3
 
 
 def lib():
@@ -226,6 +227,11 @@ class EasyUVSettings(bpy.types.PropertyGroup):
     auto_learn: BoolProperty(name="Auto-apprentissage", default=True,
                              description="Essaie plusieurs reglages, garde le meilleur et memorise ce qui marche "
                                          "(modele partage avec l'application EasyUV)")
+    shape: EnumProperty(name="Forme", default="0", items=[
+        ("0", "Auto (detection)", "Detecte la forme de chaque morceau connexe"),
+        ("1", "Hard-surface", "Cube, boite, piece mecanique : grandes faces planes"),
+        ("2", "Cylindre / revolution", "Pot, tuyau, bouteille : bandes droites + couvercles"),
+        ("3", "Organique", "Personnage, sculpture : decoupage guide par la distorsion")])
     priority: FloatProperty(name="Priorite", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
                             description="0 : le moins de coutures et d'ilots possible ; 1 : le moins de distorsion possible")
     trials: IntProperty(name="Essais", default=6, min=2, max=32,
@@ -274,6 +280,7 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
             texture_size=tex_size(s), target_density=s.target_density,
             quality=int(s.quality), rotate_islands=1 if s.rotate else 0,
             priority=s.priority,
+            shape=int(s.shape),
         )
         reports = []
         with _ObjectMode(context):
@@ -542,6 +549,7 @@ class EASYUV_OT_checker_refresh(bpy.types.Operator):
 
 def draw_ui(layout, context):
     s = context.scene.easyuv
+    layout.prop(s, "shape")
     col = layout.column(align=True)
     col.prop(s, "angle")
     col.prop(s, "max_distortion")

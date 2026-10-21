@@ -2,13 +2,15 @@ use crate::io;
 use crate::scene::Scene;
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
-use crate::uvview::{self, UvCamera};
-use crate::viewport::{self, Camera, Shading, ViewOptions, TEX_SIZE};
+use crate::uvview::{self, UvCache, UvCamera};
+use crate::raster::Mips;
+use crate::viewport::{self, Camera, RenderCache, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
 use easyuv::learn::{self, Learner};
 use easyuv::math::V3;
 use easyuv::mesh::Mesh;
 use easyuv::model::Model;
+use easyuv::regions::ShapePreset;
 use easyuv::{primitives, DensityMode, Params, UvResult};
 use eframe::egui::{self, Color32, RichText, TextureHandle, TextureOptions};
 use std::path::PathBuf;
@@ -24,9 +26,19 @@ struct LearnInfo {
     confidence: f64,
 }
 
+/// Action demandée depuis l'outliner, appliquée après l'affichage du panneau.
+enum OutlinerAction {
+    Click(usize, bool),
+    ToggleHidden(usize),
+    StartRename(usize),
+    Rename(usize, String),
+    CancelRename,
+    Duplicate(usize),
+    Delete(usize),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Workspace {
-    Layout,
+enum Workspace {    Layout,
     UvEditing,
     Viewport,
 }
@@ -56,6 +68,8 @@ pub struct EasyUvApp {
     texture_dirty: bool,
     workspace: Workspace,
     job: Option<Receiver<(UvResult, Option<LearnInfo>)>>,
+    /// Objets visés par le dépliage en cours.
+    job_targets: Vec<usize>,
     learner: Arc<Mutex<Learner>>,
     auto_learn: bool,
     trials: usize,
@@ -67,7 +81,19 @@ pub struct EasyUvApp {
     show_update: bool,
     status: String,
     error: Option<String>,
+    /// Damier en mipmaps pour le rendu 3D logiciel.
+    mips: Mips,
+    render: RenderCache,
+    uv_cache: UvCache,
+    undo: Vec<Scene>,
+    redo: Vec<Scene>,
+    /// Objet en cours de renommage dans l'outliner.
+    renaming: Option<(usize, String)>,
+    /// Menu « Supprimer ? » ouvert par X, à la position du pointeur (comme Blender).
+    confirm_delete: Option<egui::Pos2>,
 }
+
+const UNDO_LEVELS: usize = 32;
 
 impl EasyUvApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -87,6 +113,7 @@ impl EasyUvApp {
             texture_dirty: true,
             workspace: Workspace::Layout,
             job: None,
+            job_targets: Vec::new(),
             learner: Arc::new(Mutex::new(Learner::load(&learn::default_path()))),
             auto_learn: true,
             trials: 6,
@@ -97,6 +124,13 @@ impl EasyUvApp {
             show_update: false,
             status: "Prêt".into(),
             error: None,
+            mips: Mips::new(1, &[255, 255, 255, 255]),
+            render: RenderCache::default(),
+            uv_cache: UvCache::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            renaming: None,
+            confirm_delete: None,
         };
         // fichier passé en argument (double-clic / « Ouvrir avec »)
         let arg = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
@@ -127,6 +161,7 @@ impl EasyUvApp {
 
     /// Ajoute des objets à la scène courante, posés à droite des objets existants.
     fn append_model(&mut self, mut add: Model) {
+        self.snapshot();
         let Some(s) = &self.scene else {
             let name = add.objects.first().map(|o| o.name.clone()).unwrap_or_default();
             self.set_model(name, add);
@@ -141,10 +176,16 @@ impl EasyUvApp {
         let mut model = s.model.clone();
         model.append(&add);
         let name = s.name.clone();
+        let first_new = s.len();
         let active = model.objects.len() - 1;
         self.set_model(name, model);
+        // comme Blender : les objets ajoutés sont sélectionnés, le dernier est actif
         if let Some(s) = &mut self.scene {
+            for i in 0..s.len() {
+                s.selected[i] = i >= first_new;
+            }
             s.active = active;
+            s.touch();
         }
     }
 
@@ -159,7 +200,12 @@ impl EasyUvApp {
         if self.job.is_some() {
             return;
         }
-        let model = scene.model.clone();
+        // comme Blender : seuls les objets sélectionnés sont dépliés (tous si aucune sélection)
+        let targets = scene.unwrap_targets();
+        let model = scene.sub_model(&targets);
+        let n_targets = targets.len();
+        let all = n_targets == scene.len();
+        self.job_targets = targets;
         let params = self.effective_params();
         let together = self.pack_together;
         let (tx, rx) = channel();
@@ -190,7 +236,7 @@ impl EasyUvApp {
             ctx.request_repaint();
         });
         self.job = Some(rx);
-        self.status = "Dépliage en cours…".into();
+        self.status = if all { "Dépliage de tous les objets…".into() } else { format!("Dépliage de {n_targets} objet(s) sélectionné(s)…") };
     }
 
     fn poll_job(&mut self) {
@@ -212,8 +258,21 @@ impl EasyUvApp {
                 s.time_ms,
                 if s.overflow { " — ATTENTION : la densité cible dépasse la tuile 0-1" } else { "" }
             );
-            if let Some(scene) = &mut self.scene {
-                scene.set_uv(r, self.params.texture_size);
+            // la scène a pu changer pendant le calcul (objet supprimé, ajouté…)
+            let targets = std::mem::take(&mut self.job_targets);
+            let fits = self.scene.as_ref().is_some_and(|s| s.fits_partial(&targets, &r));
+            if fits {
+                self.snapshot();
+                let ts = self.params.texture_size;
+                if let Some(scene) = &mut self.scene {
+                    if targets.len() == scene.len() {
+                        scene.set_uv(r, ts);
+                    } else {
+                        scene.merge_partial_uv(&targets, r, ts);
+                    }
+                }
+            } else {
+                self.status = "La scène a changé pendant le dépliage : résultat ignoré, relancez U".into();
             }
             self.job = None;
         }
@@ -396,7 +455,244 @@ impl EasyUvApp {
         let img = egui::ColorImage::from_rgba_unmultiplied([TEX_SIZE, TEX_SIZE], &rgba);
         let opts = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR_REPEAT };
         self.texture = Some(ctx.load_texture("checker", img, opts));
+        self.mips = Mips::new(TEX_SIZE, &rgba);
+        self.render.mips_gen += 1;
         self.texture_dirty = false;
+    }
+
+    // ---------- objets : sélection, suppression, annulation ----------
+
+    /// Mémorise l'état courant avant une modification (Ctrl+Z).
+    fn snapshot(&mut self) {
+        if let Some(s) = &self.scene {
+            self.undo.push(s.clone());
+            if self.undo.len() > UNDO_LEVELS {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            if let Some(cur) = self.scene.take() {
+                self.redo.push(cur);
+            }
+            self.scene = Some(prev);
+            self.touch_scene();
+            self.status = "Annuler".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            if let Some(cur) = self.scene.take() {
+                self.undo.push(cur);
+            }
+            self.scene = Some(next);
+            self.touch_scene();
+            self.status = "Rétablir".into();
+        }
+    }
+
+    /// Force le rendu après un échange de scène (la génération seule peut coïncider).
+    fn touch_scene(&mut self) {
+        self.render.invalidate();
+        if let Some(s) = &mut self.scene {
+            s.touch();
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let ts = self.params.texture_size;
+        let n = self.scene.as_ref().map_or(0, |s| s.selection().len());
+        if n == 0 {
+            self.status = "Rien de sélectionné".into();
+            return;
+        }
+        self.snapshot();
+        let s = self.scene.as_mut().unwrap();
+        s.delete_selected(ts);
+        self.status = format!("{n} objet(s) supprimé(s) — Ctrl+Z pour annuler");
+        if s.len() == 0 {
+            self.scene = None;
+        }
+        self.renaming = None;
+    }
+
+    fn duplicate_selected(&mut self) {
+        let ts = self.params.texture_size;
+        if !self.scene.as_ref().is_some_and(|s| s.has_selection()) {
+            return;
+        }
+        self.snapshot();
+        let n = self.scene.as_mut().unwrap().duplicate_selected(ts);
+        self.status = format!("{n} objet(s) dupliqué(s)");
+    }
+
+    fn hide_selected(&mut self) {
+        if !self.scene.as_ref().is_some_and(|s| s.has_selection()) {
+            return;
+        }
+        self.snapshot();
+        let n = self.scene.as_mut().unwrap().hide_selected();
+        self.status = format!("{n} objet(s) masqué(s) — Alt+H pour tout afficher");
+    }
+
+    fn reveal_all(&mut self) {
+        if !self.scene.as_ref().is_some_and(|s| s.hidden.iter().any(|&h| h)) {
+            return;
+        }
+        self.snapshot();
+        self.scene.as_mut().unwrap().reveal_all();
+    }
+
+    fn frame_selection(&mut self) {
+        if let Some(s) = &self.scene {
+            let (lo, hi) = s.focus_bounds();
+            self.cam.frame(lo, hi);
+        }
+        self.uv_cam = UvCamera::default();
+    }
+
+    /// Opérations d'objet communes au menu Objet, au clic droit et à l'outliner.
+    fn object_menu_items(&mut self, ui: &mut egui::Ui) {
+        let has_sel = self.scene.as_ref().is_some_and(|s| s.has_selection());
+        let has_hidden = self.scene.as_ref().is_some_and(|s| s.hidden.iter().any(|&h| h));
+        let item = |ui: &mut egui::Ui, enabled: bool, label: &str, key: &str| {
+            ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(key)).clicked()
+        };
+        if item(ui, self.scene.is_some(), "Tout sélectionner", "A") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.select_all(true);
+            }
+        }
+        if item(ui, has_sel, "Tout désélectionner", "Alt+A") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.select_all(false);
+            }
+        }
+        if item(ui, self.scene.is_some(), "Inverser la sélection", "Ctrl+Maj+I") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.invert_selection();
+            }
+        }
+        ui.separator();
+        if item(ui, has_sel, "Dupliquer", "Maj+D") {
+            ui.close();
+            self.duplicate_selected();
+        }
+        if item(ui, has_sel, "Renommer l'actif", "F2") {
+            ui.close();
+            if let Some(s) = &self.scene {
+                self.renaming = Some((s.active, s.model.objects[s.active].name.clone()));
+            }
+        }
+        if item(ui, has_sel, "Masquer la sélection", "H") {
+            ui.close();
+            self.hide_selected();
+        }
+        if item(ui, has_hidden, "Tout afficher", "Alt+H") {
+            ui.close();
+            self.reveal_all();
+        }
+        if item(ui, has_sel, "Cadrer la sélection", "F") {
+            ui.close();
+            self.frame_selection();
+        }
+        ui.separator();
+        if item(ui, has_sel, "Supprimer", "X / Suppr") {
+            ui.close();
+            self.delete_selected();
+        }
+    }
+
+    /// Raccourcis clavier de type Blender (ignorés pendant la saisie de texte).
+    fn object_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (k_a, k_x, k_del, k_d, k_h, k_z, k_y, k_f2, k_inv, alt, shift, cmd, pointer) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::X),
+                i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::D),
+                i.key_pressed(egui::Key::H),
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::Y),
+                i.key_pressed(egui::Key::F2),
+                i.key_pressed(egui::Key::I),
+                i.modifiers.alt,
+                i.modifiers.shift,
+                i.modifiers.command,
+                i.pointer.hover_pos(),
+            )
+        });
+        if cmd && k_z && !shift {
+            self.undo();
+        } else if (cmd && k_z && shift) || (cmd && k_y) {
+            self.redo();
+        }
+        if cmd && k_inv && shift {
+            if let Some(s) = &mut self.scene {
+                s.invert_selection();
+            }
+        }
+        if cmd {
+            return;
+        }
+        if k_a {
+            if let Some(s) = &mut self.scene {
+                s.select_all(!alt);
+            }
+        }
+        if k_del {
+            self.delete_selected();
+        }
+        if k_x && self.scene.as_ref().is_some_and(|s| s.has_selection()) {
+            self.confirm_delete = pointer;
+        }
+        if k_d && shift {
+            self.duplicate_selected();
+        }
+        if k_h {
+            if alt {
+                self.reveal_all();
+            } else {
+                self.hide_selected();
+            }
+        }
+        if k_f2 {
+            if let Some(s) = &self.scene {
+                if s.has_selection() {
+                    self.renaming = Some((s.active, s.model.objects[s.active].name.clone()));
+                }
+            }
+        }
+    }
+
+    /// Menu de confirmation de X, comme le « Delete » de Blender.
+    fn confirm_delete_popup(&mut self, ctx: &egui::Context) {
+        let Some(pos) = self.confirm_delete else { return };
+        let n = self.scene.as_ref().map_or(0, |s| s.selection().len());
+        let mut close = false;
+        let resp = egui::Area::new(egui::Id::unique("confirm_delete")).order(egui::Order::Foreground).fixed_pos(pos - egui::vec2(60.0, 14.0)).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(format!("Supprimer {n} objet(s) ?")).color(theme::TEXT_DIM));
+                if ui.add(egui::Button::new("Supprimer").min_size(egui::vec2(140.0, 22.0))).clicked() {
+                    self.delete_selected();
+                    close = true;
+                }
+            });
+        });
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if close || esc || resp.response.clicked_elsewhere() {
+            self.confirm_delete = None;
+        }
     }
 
     // ---------- interface ----------
@@ -434,9 +730,10 @@ impl EasyUvApp {
                         }
                     });
                     ui.menu_button("Ajouter", |ui| {
-                        let items: [(&str, fn() -> Mesh); 5] = [
+                        let items: [(&str, fn() -> Mesh); 6] = [
                             ("Cube", || primitives::cube(2.0)),
                             ("Cylindre", || primitives::cylinder(1.0, 2.0, 32, 4)),
+                            ("Pot biseauté", || primitives::beveled_cylinder(1.0, 1.6, 0.15, 4, 48, 8)),
                             ("Sphère UV", || primitives::uv_sphere(1.0, 32, 16)),
                             ("Tore", || primitives::torus(1.0, 0.35, 48, 16)),
                             ("Forme organique", || primitives::blob(1.0, 48, 24)),
@@ -447,6 +744,9 @@ impl EasyUvApp {
                                 self.append_model(Model::single(name, f()));
                             }
                         }
+                    });
+                    ui.menu_button("Objet", |ui| {
+                        self.object_menu_items(ui);
                     });
                     ui.menu_button("UV", |ui| {
                         if ui.button("Dépliage intelligent   U").clicked() {
@@ -514,11 +814,14 @@ impl EasyUvApp {
             .show(root, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let ts = self.params.texture_size;
-                    if let Some(s) = &mut self.scene {
+                    let mut act: Option<OutlinerAction> = None;
+                    if let Some(s) = &self.scene {
+                        let renaming = &mut self.renaming;
                         section(ui, "Outliner", true, |ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "{} sommets · {} faces · {} tris",
+                                    "{} objet(s) · {} sommets · {} faces · {} tris",
+                                    s.len(),
                                     s.model.mesh.positions.len(),
                                     s.model.mesh.face_count(),
                                     s.model.mesh.triangle_count()
@@ -527,18 +830,81 @@ impl EasyUvApp {
                                 .color(theme::TEXT_DIM),
                             );
                             let has_uv = s.uv.is_some();
-                            egui::ScrollArea::vertical().id_salt("outliner").max_height(150.0).show(ui, |ui| {
-                                for i in 0..s.model.objects.len() {
+                            egui::ScrollArea::vertical().id_salt("outliner").max_height(180.0).show(ui, |ui| {
+                                for i in 0..s.len() {
                                     let o = &s.model.objects[i];
-                                    let active = s.active == i;
-                                    let label = format!("{}   ({} faces)", o.name, o.face_end - o.face_start);
-                                    let col = if active { theme::ACCENT_ORANGE } else { theme::TEXT };
-                                    let density = if has_uv { Some(s.object_density(i, ts)) } else { None };
+                                    let (sel, hidden) = (s.selected[i], s.hidden[i]);
+                                    let active = s.active == i && sel;
                                     ui.horizontal(|ui| {
-                                        if ui.selectable_label(active, RichText::new(label).color(col)).clicked() {
-                                            s.active = i;
+                                        // œil de visibilité, dessiné (la police n'a pas d'icônes)
+                                        let (r, p) = ui.allocate_painter(egui::vec2(16.0, 16.0), egui::Sense::click());
+                                        let c = r.rect.center();
+                                        let col = if hidden { theme::TEXT_DIM.gamma_multiply(0.5) } else if r.hovered() { Color32::WHITE } else { theme::TEXT };
+                                        let eye = [c + egui::vec2(-6.0, 0.0), c + egui::vec2(0.0, -4.0), c + egui::vec2(6.0, 0.0), c + egui::vec2(0.0, 4.0)];
+                                        p.add(egui::Shape::closed_line(eye.to_vec(), egui::Stroke::new(1.2, col)));
+                                        if hidden {
+                                            p.line_segment([c + egui::vec2(-6.0, 5.0), c + egui::vec2(6.0, -5.0)], egui::Stroke::new(1.2, col));
+                                        } else {
+                                            p.circle_filled(c, 2.0, col);
                                         }
-                                        if let Some(d) = density {
+                                        if r.on_hover_text(if hidden { "Afficher (Alt+H)" } else { "Masquer (H)" }).clicked() {
+                                            act = Some(OutlinerAction::ToggleHidden(i));
+                                        }
+                                        if let Some((ri, text)) = renaming.as_mut().filter(|(ri, _)| *ri == i) {
+                                            let te = ui.add(egui::TextEdit::singleline(text).desired_width(150.0));
+                                            if !te.has_focus() && !te.lost_focus() {
+                                                te.request_focus();
+                                            }
+                                            if te.lost_focus() {
+                                                if ui.input(|k| k.key_pressed(egui::Key::Escape)) {
+                                                    act = Some(OutlinerAction::CancelRename);
+                                                } else {
+                                                    act = Some(OutlinerAction::Rename(*ri, text.clone()));
+                                                }
+                                            }
+                                        } else {
+                                            // ligne sélectionnée : fond bleu, texte blanc (actif : orange clair)
+                                            let name_col = if active {
+                                                Color32::from_rgb(0xff, 0xd2, 0x8a)
+                                            } else if sel {
+                                                Color32::WHITE
+                                            } else if hidden {
+                                                theme::TEXT_DIM
+                                            } else {
+                                                theme::TEXT
+                                            };
+                                            let label = RichText::new(format!("{}   ({} faces)", o.name, o.face_end - o.face_start)).color(name_col);
+                                            let resp = ui.selectable_label(sel, label);
+                                            if resp.double_clicked() {
+                                                act = Some(OutlinerAction::StartRename(i));
+                                            } else if resp.clicked() {
+                                                act = Some(OutlinerAction::Click(i, ui.input(|k| k.modifiers.shift || k.modifiers.command)));
+                                            }
+                                            resp.context_menu(|ui| {
+                                                if !sel {
+                                                    act = Some(OutlinerAction::Click(i, false));
+                                                }
+                                                if ui.button("Renommer   F2").clicked() {
+                                                    ui.close();
+                                                    act = Some(OutlinerAction::StartRename(i));
+                                                }
+                                                if ui.button("Dupliquer   Maj+D").clicked() {
+                                                    ui.close();
+                                                    act = Some(OutlinerAction::Duplicate(i));
+                                                }
+                                                if ui.button(if hidden { "Afficher" } else { "Masquer   H" }).clicked() {
+                                                    ui.close();
+                                                    act = Some(OutlinerAction::ToggleHidden(i));
+                                                }
+                                                ui.separator();
+                                                if ui.button("Supprimer   X").clicked() {
+                                                    ui.close();
+                                                    act = Some(OutlinerAction::Delete(i));
+                                                }
+                                            });
+                                        }
+                                        if has_uv {
+                                            let d = s.object_density(i, ts);
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 ui.label(RichText::new(format!("{d:.0} px/m")).small().color(theme::TEXT_DIM));
                                             });
@@ -546,11 +912,30 @@ impl EasyUvApp {
                                     });
                                 }
                             });
+                            ui.label(RichText::new("Clic : sélection · Maj+clic : ajouter · double-clic : renommer · clic droit : menu").small().color(theme::TEXT_DIM));
                         });
+                    }
+                    if let Some(a) = act {
+                        self.outliner_action(a);
                     }
 
                     section(ui, "Dépliage intelligent", true, |ui| {
                         egui::Grid::new("unwrap").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.label("Forme");
+                            let before = self.params.shape;
+                            egui::ComboBox::from_id_salt("shape").selected_text(self.params.shape.label()).width(190.0).show_ui(ui, |ui| {
+                                for p in ShapePreset::ALL {
+                                    ui.selectable_value(&mut self.params.shape, p, p.label());
+                                }
+                            });
+                            if self.params.shape != before && self.params.shape != ShapePreset::Auto {
+                                // un preset choisi à la main applique aussi ses réglages conseillés
+                                let (a, d, r) = self.params.shape.suggested();
+                                self.params.angle_deg = a;
+                                self.params.max_distortion = d;
+                                self.params.relax_iterations = r;
+                            }
+                            ui.end_row();
                             ui.label("Angle de couture");
                             ui.add(egui::Slider::new(&mut self.params.angle_deg, 15.0..=89.0).suffix("°"));
                             ui.end_row();
@@ -603,7 +988,15 @@ impl EasyUvApp {
                         ui.add_space(6.0);
                         let busy = self.job.is_some();
                         ui.add_enabled_ui(!busy && self.scene.is_some(), |ui| {
-                            if primary_button(ui, if busy { "Dépliage…" } else { "Déplier  (U)" }).clicked() {
+                            let n_sel = self.scene.as_ref().map_or(0, |s| s.selection().len());
+                            let label = if busy {
+                                "Dépliage…".to_string()
+                            } else if n_sel > 0 {
+                                format!("Déplier la sélection ({n_sel})  (U)")
+                            } else {
+                                "Déplier tout  (U)".to_string()
+                            };
+                            if primary_button(ui, &label).clicked() {
                                 self.start_unwrap(ui.ctx());
                             }
                         });
@@ -754,6 +1147,15 @@ impl EasyUvApp {
                             egui::Grid::new("stats").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
                                 for (k, v) in [
                                     ("Îlots", s.charts.to_string()),
+                                    (
+                                        "Formes",
+                                        [(s.shapes[0], "hard-surface"), (s.shapes[1], "cylindre"), (s.shapes[2], "organique")]
+                                            .iter()
+                                            .filter(|(n, _)| *n > 0)
+                                            .map(|(n, l)| format!("{n} {l}"))
+                                            .collect::<Vec<_>>()
+                                            .join(" · "),
+                                    ),
                                     ("Coutures", s.seams.to_string()),
                                     ("Distorsion moy.", format!("{:.3}", s.mean_distortion)),
                                     ("Distorsion max", format!("{:.3}", s.max_distortion)),
@@ -772,8 +1174,58 @@ impl EasyUvApp {
             });
     }
 
-    fn apply_density(&mut self) {
-        let ts = self.params.texture_size;
+    fn outliner_action(&mut self, a: OutlinerAction) {
+        match a {
+            OutlinerAction::Click(i, extend) => {
+                if let Some(s) = &mut self.scene {
+                    s.click(Some(i), extend);
+                }
+            }
+            OutlinerAction::ToggleHidden(i) => {
+                self.snapshot();
+                if let Some(s) = &mut self.scene {
+                    s.toggle_hidden(i);
+                }
+            }
+            OutlinerAction::StartRename(i) => {
+                if let Some(s) = &self.scene {
+                    self.renaming = Some((i, s.model.objects[i].name.clone()));
+                }
+            }
+            OutlinerAction::Rename(i, name) => {
+                self.renaming = None;
+                let changed = self.scene.as_ref().is_some_and(|s| s.model.objects[i].name != name.trim() && !name.trim().is_empty());
+                if changed {
+                    self.snapshot();
+                    if let Some(s) = &mut self.scene {
+                        s.rename(i, &name);
+                    }
+                }
+            }
+            OutlinerAction::CancelRename => self.renaming = None,
+            OutlinerAction::Duplicate(i) => {
+                if let Some(s) = &mut self.scene {
+                    if !s.selected[i] {
+                        s.click(Some(i), false);
+                    }
+                }
+                self.duplicate_selected();
+            }
+            OutlinerAction::Delete(i) => {
+                if let Some(s) = &mut self.scene {
+                    if !s.selected[i] {
+                        s.click(Some(i), false);
+                    }
+                }
+                self.delete_selected();
+            }
+        }
+    }
+
+    fn apply_density(&mut self) {        let ts = self.params.texture_size;
+        if self.scene.as_ref().is_some_and(|s| s.uv.is_some()) {
+            self.snapshot();
+        }
         if let Some(s) = &mut self.scene {
             if s.apply_density(self.target_density, ts) {
                 self.status = format!("Densité appliquée : {:.1} px/m", s.density);
@@ -846,6 +1298,8 @@ impl eframe::App for EasyUvApp {
             self.export_file();
         }
 
+        self.object_shortcuts(ctx);
+
         self.top_bar(root);
         self.status_bar(root);
         self.side_panel(root);
@@ -871,14 +1325,31 @@ impl eframe::App for EasyUvApp {
                     let body = egui::Rect::from_min_max(r.min + egui::vec2(0.0, 26.0), r.max);
                     let resp = ui.interact(body, ui.scope_id().with("vp3d"), egui::Sense::click_and_drag());
                     viewport::handle_input(ui, &resp, &mut self.cam, body);
-                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, tex);
+                    if resp.clicked() {
+                        let hit = resp.interact_pointer_pos().and_then(|p| self.render.pick(p));
+                        let extend = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                        if let Some(s) = &mut self.scene {
+                            s.click(hit, extend);
+                        }
+                    }
+                    if resp.secondary_clicked() {
+                        // le clic droit sélectionne l'objet visé avant d'ouvrir le menu
+                        let hit = resp.interact_pointer_pos().and_then(|p| self.render.pick(p));
+                        if let (Some(s), Some(h)) = (&mut self.scene, hit) {
+                            if !s.selected[h] {
+                                s.click(Some(h), false);
+                            }
+                        }
+                    }
+                    resp.context_menu(|ui| self.object_menu_items(ui));
+                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, &self.mips, &mut self.render);
                     Self::editor_header(ui, r, "Vue 3D · Perspective", &mut self.view, true);
                 }
                 if let Some(r) = ruv {
                     let body = egui::Rect::from_min_max(r.min + egui::vec2(0.0, 26.0), r.max);
                     let resp = ui.interact(body, ui.scope_id().with("uv2d"), egui::Sense::click_and_drag());
                     uvview::handle_input(ui, &resp, &mut self.uv_cam, body);
-                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling);
+                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling, &mut self.uv_cache);
                     let title = match self.scene.as_ref().filter(|s| s.uv.is_some()) {
                         Some(s) => format!("Éditeur UV · {:.0} px/m @ {}px", s.density, self.params.texture_size),
                         None => "Éditeur UV".to_string(),
@@ -896,6 +1367,7 @@ impl eframe::App for EasyUvApp {
                 }
             });
         }
+        self.confirm_delete_popup(ctx);
         self.update_window(ctx);
         if self.job.is_some() || matches!(self.update, UpdateState::Checking(..) | UpdateState::Installing(_)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));

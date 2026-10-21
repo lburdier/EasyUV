@@ -4,6 +4,9 @@ use crate::scene::Scene;
 use crate::theme;
 use crate::viewport::{island_color, stretch_color, Shading, WHITE_UV};
 use eframe::egui::{self, epaint::Vertex, Color32, Pos2, Rect, Shape, Stroke, TextureId};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 pub struct UvCamera {
     pub center: egui::Vec2,
@@ -30,7 +33,8 @@ pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, re
     }
 }
 
-pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera, shading: Shading, tex: TextureId, tiling: f32) {
+#[allow(clippy::too_many_arguments)]
+pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera, shading: Shading, tex: TextureId, tiling: f32, cache: &mut UvCache) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, theme::BG_UV);
     let side = rect.width().min(rect.height()) * cam.zoom;
@@ -58,16 +62,50 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Pas encore d'UV — appuyez sur U", egui::FontId::proportional(14.0), theme::TEXT_DIM);
         return;
     };
+    // Les maillages de l'éditeur ne sont reconstruits que si la vue ou les UV changent :
+    // les reconstruire à chaque image faisait saccader l'application sur les gros modèles.
+    let mut hs = DefaultHasher::new();
+    (scene.generation, scene as *const Scene as usize, shading as u8, rect.min.x.to_bits(), rect.min.y.to_bits(), rect.max.x.to_bits(), rect.max.y.to_bits()).hash(&mut hs);
+    (cam.center.x.to_bits(), cam.center.y.to_bits(), cam.zoom.to_bits()).hash(&mut hs);
+    let key = hs.finish();
+    if key != cache.key || cache.fill.is_none() {
+        let (fill, lines) = build_meshes(scene, uv, shading, tex, &to_screen);
+        cache.fill = Some(Arc::new(fill));
+        cache.lines = Some(Arc::new(lines));
+        cache.key = key;
+    }
+    if let (Some(f), Some(l)) = (&cache.fill, &cache.lines) {
+        painter.add(Shape::Mesh(f.clone()));
+        painter.add(Shape::Mesh(l.clone()));
+    }
+}
+
+/// Maillages mis en cache de l'éditeur UV.
+#[derive(Default)]
+pub struct UvCache {
+    key: u64,
+    fill: Option<Arc<egui::Mesh>>,
+    lines: Option<Arc<egui::Mesh>>,
+}
+
+fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: TextureId, to_screen: &dyn Fn(f32, f32) -> Pos2) -> (egui::Mesh, egui::Mesh) {
     let m = &scene.model.mesh;
     let mut fill = egui::Mesh::with_texture(tex);
     let mut lines = egui::Mesh::with_texture(tex);
     let nf = m.face_count();
     let draw_edges = nf < 150_000;
+    let has_sel = scene.has_selection();
     for f in 0..nf {
+        let o = scene.face_object[f] as usize;
+        if scene.hidden[o] {
+            continue;
+        }
+        // comme Blender : avec une sélection, les autres objets sont estompés
+        let dim = has_sel && !scene.selected[o];
         let r = m.face_range(f);
         let col = match shading {
-            Shading::Stretch => stretch_color(scene.face_stretch[f]).gamma_multiply(0.75),
-            _ => island_color(uv.face_chart[f]).gamma_multiply(0.30),
+            Shading::Stretch => stretch_color(scene.face_stretch[f]).gamma_multiply(if dim { 0.2 } else { 0.75 }),
+            _ => island_color(uv.face_chart[f]).gamma_multiply(if dim { 0.08 } else { 0.30 }),
         };
         let i0 = fill.vertices.len() as u32;
         for ci in r.clone() {
@@ -78,6 +116,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
             fill.indices.extend_from_slice(&[i0 + t[0] as u32, i0 + t[1] as u32, i0 + t[2] as u32]);
         }
         if draw_edges {
+            let lc = Color32::from_white_alpha(if dim { 35 } else { 150 });
             let n = r.len();
             for i in 0..n {
                 let a = uv.corner_uv[r.start + i];
@@ -90,7 +129,6 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
                 }
                 let nrm = egui::vec2(-d.y, d.x) / len * 0.5;
                 let k = lines.vertices.len() as u32;
-                let lc = Color32::from_white_alpha(150);
                 for p in [pa + nrm, pb + nrm, pb - nrm, pa - nrm] {
                     lines.vertices.push(Vertex { pos: p, uv: WHITE_UV, color: lc });
                 }
@@ -98,6 +136,5 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
             }
         }
     }
-    painter.add(Shape::mesh(fill));
-    painter.add(Shape::mesh(lines));
+    (fill, lines)
 }

@@ -1,8 +1,11 @@
-//! Vue 3D : rendu logiciel (algorithme du peintre) dans un `egui::Mesh` texturé par le damier.
+//! Vue 3D : rendu logiciel avec tampon de profondeur (voir `raster`), grille et gizmo.
 
 use crate::scene::Scene;
 use crate::theme;
-use eframe::egui::{self, epaint::Vertex, Color32, Pos2, Rect, Shape, Stroke, TextureId};
+use crate::raster::{self, FaceStyle, Geometry, Line, Mips, View};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use easyuv::math::V3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,23 +104,45 @@ pub fn stretch_color(t: f32) -> Color32 {
     Color32::from_rgb(0xe6, 0x28, 0x1e)
 }
 
-fn shade(c: Color32, k: f32) -> Color32 {
-    let m = |v: u8| ((v as f32) * k).clamp(0.0, 255.0) as u8;
-    Color32::from_rgba_premultiplied(m(c.r()), m(c.g()), m(c.b()), c.a())
+fn rgb(c: Color32) -> [u8; 3] {
+    [c.r(), c.g(), c.b()]
 }
 
-fn push_line(mesh: &mut egui::Mesh, a: Pos2, b: Pos2, width: f32, color: Color32) {
-    let d = b - a;
-    let len = d.length();
-    if len < 1e-3 {
-        return;
+/// Image 3D rendue en dernier + tampon d'identifiants (sélection au clic).
+pub struct RenderCache {
+    tex: Option<TextureHandle>,
+    key: u64,
+    ids: Vec<u32>,
+    w: usize,
+    h: usize,
+    rect: Rect,
+    /// Génération de la texture damier (pour invalider le cache).
+    pub mips_gen: u64,
+}
+
+impl Default for RenderCache {
+    fn default() -> Self {
+        RenderCache { tex: None, key: 0, ids: Vec::new(), w: 0, h: 0, rect: Rect::NOTHING, mips_gen: 0 }
     }
-    let n = egui::vec2(-d.y, d.x) / len * (width * 0.5);
-    let i = mesh.vertices.len() as u32;
-    for p in [a + n, b + n, b - n, a - n] {
-        mesh.vertices.push(Vertex { pos: p, uv: WHITE_UV, color });
+}
+
+impl RenderCache {
+    /// Force un nouveau rendu à la prochaine image.
+    pub fn invalidate(&mut self) {
+        self.key = 0;
+        self.tex = None;
     }
-    mesh.indices.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+
+    /// Objet sous le pointeur, d'après le dernier rendu.
+    pub fn pick(&self, pos: Pos2) -> Option<usize> {
+        if self.w == 0 || !self.rect.contains(pos) {
+            return None;
+        }
+        let x = ((pos.x - self.rect.left()) / self.rect.width() * self.w as f32) as usize;
+        let y = ((pos.y - self.rect.top()) / self.rect.height() * self.h as f32) as usize;
+        let id = *self.ids.get(y.min(self.h - 1) * self.w + x.min(self.w - 1))?;
+        (id > 0).then(|| id as usize - 1)
+    }
 }
 
 pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect: Rect) {
@@ -146,13 +171,14 @@ pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect
     }
 }
 
-pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, opt: &ViewOptions, tex: TextureId) {
+#[allow(clippy::too_many_arguments)]
+pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, opt: &ViewOptions, mips: &Mips, cache: &mut RenderCache) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, theme::BG_VIEWPORT);
     let b = cam.basis();
     let f = (rect.height() as f64 * 0.5) / (cam.fov * 0.5).tan();
     let c = rect.center();
-    let near = cam.dist * 0.01;
+    let near = cam.dist * 0.002;
     let project = |p: V3| -> (Pos2, f64) {
         let d = p - b.eye;
         let z = d.dot(b.fwd);
@@ -160,7 +186,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
         (Pos2::new(c.x + (d.dot(b.right) / zz * f) as f32, c.y - (d.dot(b.up) / zz * f) as f32), z)
     };
 
-    // Grille du sol (plan XY) + axes X / Y
+    // Grille du sol (plan XY) + axes X / Y, sous l'image 3D (fond transparent)
     if opt.grid {
         let size = scene.map(|s| s.radius).unwrap_or(2.0).max(0.1);
         let step = 10f64.powf((size * 0.5).log10().floor());
@@ -193,79 +219,91 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
     }
 
     if let Some(scene) = scene {
-        let m = &scene.model.mesh;
-        let proj: Vec<(Pos2, f64)> = m.positions.iter().map(|&p| project(p)).collect();
-        let nf = m.face_count();
-        let mut order: Vec<(f64, u32)> = Vec::with_capacity(nf);
-        for fi in 0..nf {
-            let vs = m.face(fi);
-            let mut z = 0.0;
-            let mut behind = false;
-            for &v in vs {
-                let pz = proj[v as usize].1;
-                behind |= pz < near;
-                z += pz;
-            }
-            if !behind {
-                order.push((z / vs.len() as f64, fi as u32));
-            }
+        // en mouvement (orbite, zoom, déplacement) : demi-résolution, puis pleine résolution à l'arrêt
+        let moving = ui.input(|i| i.pointer.any_down() || i.smooth_scroll_delta != egui::Vec2::ZERO);
+        if ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
+            // garantit une dernière image (pleine résolution) à la fin du zoom
+            ui.ctx().request_repaint();
         }
-        order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-
-        let has_uv = scene.uv.is_some();
-        let wire = opt.wire && nf < 60_000;
-        let mut mesh = egui::Mesh::with_texture(tex);
-        mesh.vertices.reserve(order.len() * 4);
-        for &(_, fi) in &order {
-            let fi = fi as usize;
-            let r = m.face_range(fi);
-            let n = scene.face_normals[fi];
-            let to_eye = (b.eye - m.face_centroid(fi)).normalized();
-            let ndv = n.dot(to_eye);
-            let front = ndv >= 0.0;
-            let mut k = 0.28 + 0.72 * ndv.abs() as f32;
-            if !front {
-                k *= 0.5;
-            }
-            let (base, textured) = match opt.shading {
-                Shading::Checker if has_uv => (Color32::WHITE, true),
-                Shading::Islands if has_uv => (island_color(scene.uv.as_ref().unwrap().face_chart[fi]), false),
-                Shading::Stretch if has_uv => (stretch_color(scene.face_stretch[fi]), false),
-                _ => (Color32::from_gray(204), false),
-            };
-            let col = shade(base, k);
-            let i0 = mesh.vertices.len() as u32;
-            for ci in r.clone() {
-                let v = m.corners[ci] as usize;
-                let uv = if textured {
-                    let t = scene.uv.as_ref().unwrap().corner_uv[ci];
-                    Pos2::new(t[0] * opt.tiling, 1.0 - t[1] * opt.tiling)
-                } else {
-                    WHITE_UV
-                };
-                mesh.vertices.push(Vertex { pos: proj[v].0, uv, color: col });
-            }
-            for t in m.fan(fi) {
-                mesh.indices.extend_from_slice(&[i0 + t[0] as u32, i0 + t[1] as u32, i0 + t[2] as u32]);
-            }
-            if front && (wire || opt.seams) {
-                let vs = m.face(fi);
-                for i in 0..vs.len() {
-                    let (a, bb) = (vs[i], vs[(i + 1) % vs.len()]);
-                    let key = if a < bb { (a, bb) } else { (bb, a) };
-                    let seam = opt.seams && scene.seam_set.contains(&key);
-                    if seam {
-                        push_line(&mut mesh, proj[a as usize].0, proj[bb as usize].0, 2.2, theme::SEAM_RED);
-                    } else if wire {
-                        push_line(&mut mesh, proj[a as usize].0, proj[bb as usize].0, 1.0, Color32::from_black_alpha(110));
-                    }
-                }
-            }
+        let ppp = ui.ctx().pixels_per_point() * if moving { 0.5 } else { 1.0 };
+        let (w, h) = (((rect.width() * ppp) as usize).max(1), ((rect.height() * ppp) as usize).max(1));
+        // clé du cache : tout ce qui change l'image
+        let mut hs = DefaultHasher::new();
+        for v in [cam.target.x, cam.target.y, cam.target.z, cam.yaw, cam.pitch, cam.dist, cam.fov] {
+            v.to_bits().hash(&mut hs);
         }
-        painter.add(Shape::mesh(mesh));
+        (w, h, scene.generation, scene as *const Scene as usize, cache.mips_gen).hash(&mut hs);
+        (opt.shading as u8, opt.wire, opt.seams, opt.tiling.to_bits()).hash(&mut hs);
+        let key = hs.finish();
+        if key != cache.key || cache.tex.is_none() {
+            let frame = render_scene(scene, &b, f * ppp as f64, near, w, h, opt, mips, ppp);
+            let img = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+            match &mut cache.tex {
+                Some(t) => t.set(img, if moving { TextureOptions::LINEAR } else { TextureOptions::NEAREST }),
+                None => cache.tex = Some(ui.ctx().load_texture("viewport3d", img, TextureOptions::NEAREST)),
+            }
+            cache.ids = frame.ids;
+            cache.w = frame.width;
+            cache.h = frame.height;
+            cache.key = key;
+        }
+        cache.rect = rect;
+        if let Some(t) = &cache.tex {
+            painter.image(t.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+    } else {
+        cache.w = 0;
     }
 
     draw_gizmo(&painter, rect, &b);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: usize, opt: &ViewOptions, mips: &Mips, ppp: f32) -> raster::Frame {
+    let m = &scene.model.mesh;
+    let uv = scene.uv.as_ref();
+    let styles: Vec<Option<FaceStyle>> = (0..m.face_count())
+        .map(|fi| {
+            let o = scene.face_object[fi] as usize;
+            if scene.hidden[o] {
+                return None;
+            }
+            let (color, textured) = match (opt.shading, uv) {
+                (Shading::Checker, Some(_)) => ([255, 255, 255], true),
+                (Shading::Islands, Some(u)) => (rgb(island_color(u.face_chart[fi])), false),
+                (Shading::Stretch, Some(_)) => (rgb(stretch_color(scene.face_stretch[fi])), false),
+                _ => ([204, 204, 204], false),
+            };
+            Some(FaceStyle { color, textured, id: o as u32 + 1 })
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let wire = opt.wire && scene.edges.len() < 400_000;
+    if wire || opt.seams {
+        let lw = ppp.round().max(1.0) as u8;
+        for &(a, bb, o) in &scene.edges {
+            if scene.hidden[o as usize] {
+                continue;
+            }
+            let seam = opt.seams && scene.seam_set.contains(&(a, bb));
+            if seam {
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: { let c = rgb(theme::SEAM_RED); [c[0], c[1], c[2], 255] }, width: lw * 2 });
+            } else if wire {
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: [0, 0, 0, 90], width: lw });
+            }
+        }
+    }
+    let view = View { eye: b.eye, right: b.right, up: b.up, fwd: b.fwd, focal, near, width: w, height: h };
+    let geo = Geometry {
+        positions: &m.positions,
+        corners: &m.corners,
+        face_start: &m.face_start,
+        face_normals: &scene.face_normals,
+        corner_uv: uv.map(|u| u.corner_uv.as_slice()),
+        styles: &styles,
+    };
+    let active = scene.has_selection().then_some(scene.active);
+    raster::render(&view, &geo, &lines, mips, opt.tiling, &scene.selected, active, (1.5 * ppp).round().max(1.0) as usize)
 }
 
 /// Gizmo d'orientation en haut à droite, comme dans Blender.

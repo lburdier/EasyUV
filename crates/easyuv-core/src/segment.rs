@@ -8,6 +8,7 @@ use crate::chart::{build_chart, Chart};
 use crate::math::V2;
 use crate::mesh::{Mesh, Topology};
 use crate::unwrap::{arap, lscm, normalize_scale, quality};
+use crate::regions::{self, ShapePreset};
 use crate::Params;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -35,7 +36,8 @@ pub struct Unwrapped {
 
 const MAX_DEPTH: u32 = 24;
 
-pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_seams: &[bool]) -> (Vec<Unwrapped>, Vec<bool>) {
+pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_seams: &[bool]) -> (Vec<Unwrapped>, Vec<bool>, [usize; 3]) {
+    let mut shapes = [0usize; 3];
     let nf = mesh.face_count();
     let angle = params.angle_deg.to_radians();
     let mut cut: Vec<bool> = topo
@@ -74,7 +76,58 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
                 }
             }
         }
-        work.push((faces, tag, 0));
+        // Stratégie selon la forme du morceau (preset choisi ou détecté)
+        let preset = match params.shape {
+            ShapePreset::Auto => regions::classify(mesh, topo, &faces, &cut),
+            p => p,
+        };
+        let (dev_tol, cone) = match preset {
+            ShapePreset::HardSurface => {
+                shapes[0] += 1;
+                (0.012, 50f64.to_radians())
+            }
+            ShapePreset::Cylindrical => {
+                shapes[1] += 1;
+                (0.03, std::f64::consts::PI)
+            }
+            _ => {
+                shapes[2] += 1;
+                work.push((faces, tag, 0));
+                continue;
+            }
+        };
+        let regs = regions::developable_regions(mesh, topo, &faces, &cut, dev_tol, cone);
+        if regs.len() <= 1 {
+            work.push((faces, tag, 0));
+            continue;
+        }
+        let mut tagged = Vec::with_capacity(regs.len());
+        for (k, r) in regs.into_iter().enumerate() {
+            let t = if k == 0 {
+                tag
+            } else {
+                next_tag += 1;
+                next_tag - 1
+            };
+            for &f in &r {
+                owner[f as usize] = t;
+            }
+            tagged.push((r, t));
+        }
+        // les frontières entre régions deviennent des coutures
+        for &f in &faces {
+            for c in mesh.face_range(f as usize) {
+                let e = topo.corner_edge[c];
+                if let Some(g) = topo.opposite(e, f) {
+                    if owner[g as usize] != owner[f as usize] {
+                        cut[e as usize] = true;
+                    }
+                }
+            }
+        }
+        for (r, t) in tagged {
+            work.push((r, t, 0));
+        }
     }
 
     let solver_iter = 600 + 400 * params.quality as usize;
@@ -85,7 +138,9 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
             done.push(Unwrapped { uv: vec![V2::default(); chart.pos.len()], chart, distortion: 0.0, flipped: 0 });
             continue;
         }
-        if !chart.is_disk() && faces.len() > 1 && depth < MAX_DEPTH {
+        // un anneau plan (couvercle percé…) se déplie tel quel : inutile de le couper
+        let planar = !chart.is_disk() && regions::is_planar(topo, &faces, 1.0);
+        if !chart.is_disk() && !planar && faces.len() > 1 && depth < MAX_DEPTH {
             // Tube (genre 0, plusieurs bords) : une seule couture discrète suffit.
             if chart.genus() == 0 && chart.boundary_loops >= 2 && cut_between_loops(mesh, topo, &chart, &mut cut) {
                 work.push((faces, tag, depth + 1));
@@ -117,7 +172,7 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
         }
         done.push(Unwrapped { chart, uv, distortion: q.distortion, flipped: q.flipped });
     }
-    (done, cut)
+    (done, cut, shapes)
 }
 
 /// Coût de traversée d'une arête : on préfère couper sur les plis (moins visibles).
@@ -130,18 +185,51 @@ fn crease_factor(dihedral: f64) -> f64 {
 /// première boucle de bord aux autres.
 fn cut_between_loops(mesh: &Mesh, topo: &Topology, chart: &Chart, cut: &mut [bool]) -> bool {
     let n = chart.pos.len();
-    let mut adj: Vec<Vec<(u32, f64, u32)>> = vec![Vec::new(); n];
-    for &(a, b, e) in &chart.interior_edges {
-        let ed = &topo.edges[e as usize];
-        let w = ed.length * crease_factor(ed.dihedral);
-        adj[a as usize].push((b, w, e));
-        adj[b as usize].push((a, w, e));
-    }
     let mut loop_id = vec![usize::MAX; n];
     for (li, l) in chart.loops.iter().enumerate() {
         for &v in l {
             loop_id[v as usize] = li;
         }
+    }
+    // 1. « Hauteur » le long du tube : distance (longueur pure) depuis la première boucle.
+    let mut len_adj: Vec<Vec<(u32, f64)>> = vec![Vec::new(); n];
+    for &(a, b, e) in &chart.interior_edges {
+        let l = topo.edges[e as usize].length;
+        len_adj[a as usize].push((b, l));
+        len_adj[b as usize].push((a, l));
+    }
+    let mut height = vec![f64::INFINITY; n];
+    {
+        let mut heap = BinaryHeap::new();
+        for &v in &chart.loops[0] {
+            height[v as usize] = 0.0;
+            heap.push(HeapItem(0.0, v));
+        }
+        while let Some(HeapItem(d, v)) = heap.pop() {
+            if d > height[v as usize] {
+                continue;
+            }
+            for &(w, c) in &len_adj[v as usize] {
+                if d + c < height[w as usize] {
+                    height[w as usize] = d + c;
+                    heap.push(HeapItem(d + c, w));
+                }
+            }
+        }
+    }
+    // 2. Coût d'arête : une arête qui part « de côté » (sans gagner de hauteur) coûte
+    //    beaucoup plus cher. Sans ça, le chemin longeait les rainures horizontales et la
+    //    couture faisait des marches d'escalier. Les plis restent un bonus secondaire.
+    let mut adj: Vec<Vec<(u32, f64, u32)>> = vec![Vec::new(); n];
+    for &(a, b, e) in &chart.interior_edges {
+        let ed = &topo.edges[e as usize];
+        let l = ed.length.max(1e-12);
+        let (ha, hb) = (height[a as usize], height[b as usize]);
+        let climb = if ha.is_finite() && hb.is_finite() { ((hb - ha).abs() / l).clamp(0.0, 1.0) } else { 1.0 };
+        let sideways = 1.0 - climb;
+        let w = l * (1.0 + 8.0 * sideways * sideways) * (0.75 + 0.25 * crease_factor(ed.dihedral));
+        adj[a as usize].push((b, w, e));
+        adj[b as usize].push((a, w, e));
     }
     let mut dist = vec![f64::INFINITY; n];
     let mut prev: Vec<Option<(u32, u32)>> = vec![None; n];
@@ -279,7 +367,39 @@ fn split_geodesic(
     if a == b {
         b = if a == 0 { 1 } else { 0 };
     }
-    let (_, lab) = dijkstra(&[a, b]);
+    let (_, mut lab) = dijkstra(&[a, b]);
+    // Lissage de la frontière (filtre majoritaire sur les voisins par arête) : supprime
+    // les dents de scie du découpage géodésique sur les grilles de quads.
+    let mut edge_nb: Vec<Vec<u32>> = vec![Vec::new(); faces.len()];
+    for (i, &f) in faces.iter().enumerate() {
+        for c in mesh.face_range(f as usize) {
+            let e = topo.corner_edge[c];
+            if cut[e as usize] {
+                continue;
+            }
+            if let Some(g) = topo.opposite(e, f) {
+                if let Some(&j) = local.get(&g) {
+                    edge_nb[i].push(j);
+                }
+            }
+        }
+    }
+    for _ in 0..4 {
+        let mut changed = false;
+        for i in 0..faces.len() {
+            if i as u32 == a || i as u32 == b || lab[i] > 1 {
+                continue;
+            }
+            let other = edge_nb[i].iter().filter(|&&j| lab[j as usize] <= 1 && lab[j as usize] != lab[i]).count();
+            if other * 2 > edge_nb[i].len() {
+                lab[i] = 1 - lab[i];
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut part: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
     for (i, &f) in faces.iter().enumerate() {
         let l = if lab[i] == 1 { 1 } else { 0 };
