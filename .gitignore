@@ -1,0 +1,6 @@
+/target
+/dist
+/blender_addon/easyuv/easyuv.dll
+__pycache__/
+*.pyc
+/tests/models/*_uv.*

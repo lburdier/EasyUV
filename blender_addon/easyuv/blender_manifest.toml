@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "easyuv"
+version = "0.1.0"
+name = "EasyUV"
+tagline = "Depliage UV intelligent en Rust, densite de texels et damier"
+maintainer = "Lucas Burdier"
+website = "https://github.com/lburdier/EasyUV"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["windows-x64"]
+tags = ["UV", "Mesh"]

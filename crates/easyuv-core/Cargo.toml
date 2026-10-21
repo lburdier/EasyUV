@@ -1,0 +1,13 @@
+[package]
+name = "easyuv-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Smart UV unwrapping: segmentation, LSCM + ARAP, packing, texel density, checker"
+
+[lib]
+name = "easyuv"
+# rlib pour l'application, cdylib (easyuv.dll) pour l'addon Blender
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]

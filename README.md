@@ -1,0 +1,113 @@
+# EasyUV
+
+Dépliage UV automatique intelligent, écrit en Rust : **application Windows**, **outil en ligne de commande** et **addon Blender** qui partagent le même moteur.
+
+- Coutures placées automatiquement, dépliage à faible distorsion (LSCM + ARAP).
+- Densité de texels uniforme et contrôlable en px/m.
+- Damier de contrôle.
+- Interface inspirée de Blender.
+- Mises à jour automatiques à chaque release.
+
+## Télécharger
+
+Page des [releases](https://github.com/lburdier/EasyUV/releases/latest) :
+
+| Fichier | Contenu |
+|---|---|
+| `EasyUV-windows-x64.zip` | Application + `easyuv-cli.exe` |
+| `easyuv-blender-<version>.zip` | Extension Blender 4.2+ / 5.x |
+
+### Mises à jour automatiques
+
+- **Application :** au démarrage, EasyUV interroge la dernière release GitHub. Si une version plus récente existe, un bouton orange « Mise à jour disponible » apparaît. L'installation télécharge le nouvel exécutable, **vérifie son empreinte SHA-256**, le remplace et relance l'application. Le menu *Aide > Vérifier les mises à jour* fait la même chose à la demande. Pour désactiver la vérification au démarrage, définissez `EASYUV_NO_UPDATE=1`.
+- **Blender :** *Préférences > Get Extensions > Repositories > `+` > Add Remote Repository*, URL :
+  `https://github.com/lburdier/EasyUV/releases/latest/download/index.json`
+  Cochez *Check for Updates on Startup* : Blender proposera chaque nouvelle version.
+
+## Comment le dépliage décide
+
+1. **Coutures de départ :** arêtes vives (angle dièdre réglable), coutures déjà marquées, géométrie non-manifold.
+2. **Topologie :** chaque îlot doit être un disque.
+   - tube (bras, cylindre) → une seule couture, le long du chemin le plus discret entre ses bords, de préférence dans un pli ;
+   - forme fermée ou trouée (sphère, tore) → partition géodésique dont la frontière suit les plis.
+3. **Dépliage :** LSCM (conforme), puis relaxation **ARAP** (préserve les aires).
+4. **Contrôle qualité :** un îlot trop déformé ou avec des triangles retournés est redécoupé, récursivement.
+5. **Densité de texels :** les îlots sont à l'échelle réelle (espace monde, mètres), donc la densité est la même partout. Deux modes : *Remplir 0-1* ou *Densité cible*.
+6. **Plusieurs objets :** rangement dans une tuile commune (même densité pour tous) ou une tuile par objet.
+7. **Empaquetage :** rotation qui minimise la boîte englobante, puis skyline avec rotation de 90°.
+
+## Formats
+
+| Format | Import | Export |
+|---|---|---|
+| OBJ (multi-objets) | oui | oui |
+| glTF / GLB | oui (quads reconstruits) | GLB |
+| FBX | oui (natif, via [ufbx](https://github.com/ufbx/ufbx)) | oui, via Blender installé |
+
+Les transformations des objets sont appliquées (espace monde). Le FBX et le glTF sont convertis en Z vers le haut et en mètres.
+
+## Application
+
+Raccourcis :
+
+| Touche | Action |
+|---|---|
+| `U` | Déplier |
+| `F` | Cadrer |
+| Molette / clic + glisser | Orbite |
+| Maj + glisser / clic droit | Déplacer la vue |
+| Molette | Zoom |
+| `Ctrl+O` / `Ctrl+I` / `Ctrl+S` | Ouvrir / importer dans la scène / exporter |
+
+Glisser-déposer un fichier pour l'ouvrir, avec `Maj` pour l'ajouter à la scène. Modes d'affichage : Solide, Damier, Îlots, Étirement.
+
+## Ligne de commande
+
+```text
+easyuv-cli modele.fbx                          # -> modele_uv.obj
+easyuv-cli a.glb b.obj -o scene.glb            # une scène, rangement commun
+easyuv-cli dossier\ --format fbx --separate    # traitement par lots
+easyuv-cli x.obj --density 512 --tex 2048      # densité cible 512 px/m
+easyuv-cli --check-update | --self-update
+```
+
+## Blender
+
+Panneau : Vue 3D → barre latérale `N` → onglet **EasyUV** (aussi dans l'éditeur UV). Raccourci `Alt+U` en mode édition, et menu `U` → *Dépliage intelligent*.
+
+Fonctions :
+- dépliage de la sélection, ensemble ou objet par objet ;
+- respect des coutures et arêtes vives existantes ;
+- marquage des coutures calculées ;
+- mesure, copie et application de la densité ;
+- damier activable et désactivable, avec restauration des matériaux d'origine.
+
+## Compiler
+
+Prérequis : Rust stable (MSVC), Python 3.11+, et Blender pour les tests de l'addon.
+
+```powershell
+.\build.ps1                                   # compile et prépare dist\
+cargo test --release --workspace
+blender --background --factory-startup --python tests\blender_test.py
+blender --background --factory-startup --python tests\make_models.py   # modèles de test
+```
+
+| Dossier | Rôle |
+|---|---|
+| `crates/easyuv-core` | Moteur (aucune dépendance) + API C `easyuv.dll` |
+| `crates/easyuv-app` | Application egui, `easyuv-cli`, import/export, mises à jour |
+| `blender_addon/easyuv` | Extension Blender (ctypes → `easyuv.dll`) |
+| `tools/package.py` | Assets de release + index du dépôt d'extensions Blender |
+
+## Publier une version
+
+1. Mettre la même version dans `Cargo.toml`, `blender_addon/easyuv/blender_manifest.toml` et `bl_info`.
+2. Ajouter une section `## [x.y.z]` dans `CHANGELOG.md`.
+3. Lancer `git tag vx.y.z && git push origin vx.y.z`.
+
+GitHub Actions teste, compile et publie la release. L'application et Blender la proposent ensuite automatiquement.
+
+## Licence
+
+[GPL-3.0-or-later](LICENSE), compatible avec l'écosystème Blender.
