@@ -9,7 +9,7 @@ use std::panic::catch_unwind;
 use std::slice;
 
 /// 2 : ajout de `euv_unwrap_learned` (auto-apprentissage).
-pub const EUV_API_VERSION: u32 = 2;
+pub const EUV_API_VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -27,6 +27,8 @@ pub struct EuvParams {
     pub rotate_islands: u32,
     /// Auto-apprentissage : 0 = moins de coutures, 1 = moins de distorsion.
     pub priority: f32,
+    /// Forme : 0 = auto, 1 = hard-surface, 2 = cylindre, 3 = organique (API v3).
+    pub shape: u32,
 }
 
 #[repr(C)]
@@ -115,6 +117,7 @@ pub unsafe extern "C" fn euv_unwrap(
             texture_size: sp.texture_size.max(1),
             quality: sp.quality.min(3),
             rotate_islands: sp.rotate_islands != 0,
+            shape: crate::regions::ShapePreset::from_u32(sp.shape),
         };
         let forced: Vec<(u32, u32)> = if seams.is_null() || nseams == 0 {
             Vec::new()
@@ -299,6 +302,7 @@ fn to_params(sp: &EuvParams) -> Params {
         texture_size: sp.texture_size.max(1),
         quality: sp.quality.min(3),
         rotate_islands: sp.rotate_islands != 0,
+        shape: crate::regions::ShapePreset::from_u32(sp.shape),
     }
 }
 

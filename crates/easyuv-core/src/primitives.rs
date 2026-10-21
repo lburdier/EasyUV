@@ -96,3 +96,61 @@ pub fn blob(radius: f64, seg: u32, rings: u32) -> Mesh {
     }
     m
 }
+
+/// Surface de révolution autour de Z à partir d'un profil (r, z) ; les points r = 0
+/// deviennent des pôles (éventails de triangles).
+pub fn lathe(profile: &[(f64, f64)], seg: u32) -> Mesh {
+    let mut pos = Vec::new();
+    let mut ring_start = Vec::new();
+    for &(r, z) in profile {
+        ring_start.push(pos.len() as u32);
+        if r <= 1e-9 {
+            pos.push(V3::new(0.0, 0.0, z));
+        } else {
+            for s in 0..seg {
+                let a = 2.0 * PI * s as f64 / seg as f64;
+                pos.push(V3::new(r * a.cos(), r * a.sin(), z));
+            }
+        }
+    }
+    let idx = |k: usize, s: u32| -> u32 { if profile[k].0 <= 1e-9 { ring_start[k] } else { ring_start[k] + s % seg } };
+    let mut faces = Vec::new();
+    for k in 0..profile.len() - 1 {
+        let (pole_a, pole_b) = (profile[k].0 <= 1e-9, profile[k + 1].0 <= 1e-9);
+        for s in 0..seg {
+            let (a, b, c, d) = (idx(k, s), idx(k, s + 1), idx(k + 1, s + 1), idx(k + 1, s));
+            match (pole_a, pole_b) {
+                (true, true) => {}
+                (true, false) => faces.push(vec![a, c, d]),
+                (false, true) => faces.push(vec![a, b, d]),
+                _ => faces.push(vec![a, b, c, d]),
+            }
+        }
+    }
+    Mesh::from_faces(pos, &faces)
+}
+
+/// Pot / cylindre aux arêtes arrondies (biseaux sur `bevel_steps` segments) : aucune
+/// arête vive, comme beaucoup de modèles de production.
+pub fn beveled_cylinder(radius: f64, height: f64, bevel: f64, bevel_steps: u32, seg: u32, rows: u32) -> Mesh {
+    let mut prof = vec![(0.0, 0.0)];
+    // fond plat (anneaux concentriques)
+    for i in 1..=3 {
+        prof.push(((radius - bevel) * i as f64 / 3.0, 0.0));
+    }
+    for i in 1..=bevel_steps {
+        let t = 0.5 * PI * i as f64 / bevel_steps as f64;
+        prof.push((radius - bevel + bevel * t.sin(), bevel - bevel * t.cos()));
+    }
+    for i in 1..rows {
+        prof.push((radius, bevel + (height - 2.0 * bevel) * i as f64 / rows as f64));
+    }
+    for i in 0..=bevel_steps {
+        let t = 0.5 * PI * i as f64 / bevel_steps as f64;
+        prof.push((radius - bevel + bevel * t.cos(), height - bevel + bevel * t.sin()));
+    }
+    for i in (0..3).rev() {
+        prof.push(((radius - bevel) * i as f64 / 3.0, height));
+    }
+    lathe(&prof, seg)
+}

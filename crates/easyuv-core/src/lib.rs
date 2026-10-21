@@ -14,6 +14,7 @@ pub mod model;
 pub mod obj;
 pub mod pack;
 pub mod primitives;
+pub mod regions;
 pub mod segment;
 pub mod solver;
 pub mod unwrap;
@@ -45,6 +46,8 @@ pub struct Params {
     /// 0 = rapide, 1 = normal, 2 = haute qualité (itérations du solveur).
     pub quality: u32,
     pub rotate_islands: bool,
+    /// Stratégie selon la forme (Auto : détectée pour chaque morceau connexe).
+    pub shape: regions::ShapePreset,
 }
 
 impl Default for Params {
@@ -58,6 +61,7 @@ impl Default for Params {
             texture_size: 2048,
             quality: 1,
             rotate_islands: true,
+            shape: regions::ShapePreset::Auto,
         }
     }
 }
@@ -78,8 +82,11 @@ pub struct Stats {
     /// Longueur totale des coutures / racine de l'aire (sans unité, comparable entre maillages).
     pub seam_length: f64,
     pub time_ms: f64,
+    /// Morceaux traités par stratégie : [hard-surface, cylindre, organique].
+    pub shapes: [usize; 3],
 }
 
+#[derive(Clone, Debug)]
 pub struct UvResult {
     /// Une coordonnée UV par coin de face (même ordre que `Mesh::corners`).
     pub corner_uv: Vec<[f32; 2]>,
@@ -101,7 +108,7 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
             forced[e as usize] = true;
         }
     }
-    let (mut charts, cut) = segment::segment_and_unwrap(mesh, &topo, params, &forced);
+    let (mut charts, cut, shapes) = segment::segment_and_unwrap(mesh, &topo, params, &forced);
     charts.sort_by_key(|c| c.chart.faces.iter().copied().min().unwrap_or(0));
 
     // Orientation + boîtes
@@ -118,7 +125,7 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
     let mut corner_uv = vec![[0.0f32; 2]; mesh.corners.len()];
     let mut face_chart = vec![u32::MAX; mesh.face_count()];
     let mut uv_area = 0.0;
-    let mut stats = Stats { charts: charts.len(), ..Default::default() };
+    let mut stats = Stats { charts: charts.len(), shapes, ..Default::default() };
     for (ci, c) in charts.iter().enumerate() {
         let pl = packed.placements[ci];
         let (_, h) = rects[ci];
@@ -315,5 +322,24 @@ mod tests {
         let txt = obj::write_obj(&m, Some(&r.corner_uv));
         let m2 = obj::parse_obj(&txt).unwrap();
         assert_eq!(m2.face_count(), 6);
+    }
+
+    #[test]
+    fn beveled_pot_gives_straight_wall_strip() {
+        // aucune arête vive : l'ancien découpage géodésique faisait des escaliers
+        let m = primitives::beveled_cylinder(1.0, 2.0, 0.15, 4, 48, 8);
+        let topo = mesh::Topology::build(&m);
+        assert!(topo.edges.iter().all(|e| e.faces.len() != 2 || e.dihedral < 66f64.to_radians()));
+        let r = check(&m, "pot biseauté");
+        assert_eq!(r.stats.shapes, [0, 1, 0], "doit être détecté comme cylindre");
+        assert!(r.stats.charts <= 9, "{} îlots", r.stats.charts);
+        assert!(r.stats.mean_distortion < 0.05, "distorsion {}", r.stats.mean_distortion);
+        // la paroi (8 rangées x 48 segments, faces 4 sommets à rayon plein) est d'un seul tenant
+        let wall: Vec<usize> = (0..m.face_count())
+            .filter(|&f| m.face(f).len() == 4 && m.face(f).iter().all(|&v| ((m.positions[v as usize].x.powi(2) + m.positions[v as usize].y.powi(2)).sqrt() - 1.0).abs() < 1e-9))
+            .collect();
+        assert_eq!(wall.len(), 48 * 8);
+        let chart = r.face_chart[wall[0]];
+        assert!(wall.iter().all(|&f| r.face_chart[f] == chart), "paroi découpée en plusieurs îlots");
     }
 }
