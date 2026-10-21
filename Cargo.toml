@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/easyuv-core", "crates/easyuv-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[profile.dev]
+opt-level = 2

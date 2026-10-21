@@ -1,0 +1,42 @@
+# Publie une release à chaque tag vX.Y.Z :
+#   git tag v0.2.0 && git push origin v0.2.0
+# L'application (Aide > Vérifier les mises à jour) et Blender (dépôt d'extensions)
+# détectent ensuite la nouvelle version automatiquement.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --release --workspace
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package
+        run: python tools/package.py --tag ${{ github.ref_name }}
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: target/release_notes.md
+          fail_on_unmatched_files: true
