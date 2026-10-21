@@ -269,7 +269,7 @@ pub unsafe extern "C" fn euv_unwrap_learned(
         let mut learner = crate::learn::Learner::load(&path);
         learner.priority = ((*params).priority as f64).clamp(0.0, 1.0);
         let model = crate::model::Model::single("blender", mesh);
-        let res = crate::learn::unwrap_learned_with_seams(&model, &p, true, &mut learner, trials.clamp(1, 64) as usize, &forced);
+        let res = crate::learn::unwrap_learned_with_seams(&model, &p, true, &mut learner, trials.clamp(2, 64) as usize, &forced);
         let _ = learner.save(&path);
         write_result(&res.result, nc, nf, out_uv, out_face_chart, out_seams, out_seams_cap, out_nseams, out_stats);
         if !out_info.is_null() {

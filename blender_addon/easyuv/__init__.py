@@ -228,7 +228,7 @@ class EasyUVSettings(bpy.types.PropertyGroup):
                                          "(modele partage avec l'application EasyUV)")
     priority: FloatProperty(name="Priorite", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
                             description="0 : le moins de coutures et d'ilots possible ; 1 : le moins de distorsion possible")
-    trials: IntProperty(name="Essais", default=6, min=1, max=32,
+    trials: IntProperty(name="Essais", default=6, min=2, max=32,
                         description="Reglages essayes en parallele a chaque depliage")
     pack_together: BoolProperty(name="Ranger ensemble", default=True,
                                 description="Les objets selectionnes partagent la meme tuile UV et la meme densite de texels")

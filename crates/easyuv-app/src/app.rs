@@ -582,7 +582,7 @@ impl EasyUvApp {
                             ui.end_row();
                             if self.auto_learn {
                                 ui.label("Essais par dépliage");
-                                ui.add(egui::Slider::new(&mut self.trials, 1..=16));
+                                ui.add(egui::Slider::new(&mut self.trials, 2..=16)).on_hover_text("Toujours au moins la prédiction et les réglages d'usine :\nle résultat n'est jamais moins bon que sans apprentissage.");
                                 ui.end_row();
                                 ui.label("Priorité");
                                 ui.horizontal(|ui| {
