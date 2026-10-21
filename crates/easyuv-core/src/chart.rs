@@ -179,6 +179,8 @@ pub fn build_chart(mesh: &Mesh, topo: &Topology, faces: &[u32], cut: &[bool], ow
                 }
             }
         }
+        // ordre déterministe (l'ordre d'itération des HashMap est aléatoire)
+        comp.sort_unstable();
         loops.push(comp);
     }
     let mut interior_edges: Vec<(u32, u32, u32)> = edge_count

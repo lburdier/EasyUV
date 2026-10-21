@@ -4,7 +4,7 @@
 bl_info = {
     "name": "EasyUV",
     "author": "Lucas",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "Vue 3D > Barre laterale (N) > EasyUV",
     "description": "Depliage UV intelligent (Rust) : coutures auto, LSCM + ARAP, densite de texels, damier",
@@ -34,6 +34,20 @@ class EuvParams(ctypes.Structure):
         ("target_density", ctypes.c_float),
         ("quality", ctypes.c_uint32),
         ("rotate_islands", ctypes.c_uint32),
+        ("priority", ctypes.c_float),
+    ]
+
+
+class EuvLearnInfo(ctypes.Structure):
+    _fields_ = [
+        ("angle_deg", ctypes.c_float),
+        ("max_distortion", ctypes.c_float),
+        ("relax_iterations", ctypes.c_uint32),
+        ("trials", ctypes.c_uint32),
+        ("score", ctypes.c_float),
+        ("default_score", ctypes.c_float),
+        ("confidence", ctypes.c_float),
+        ("experiences", ctypes.c_uint32),
     ]
 
 
@@ -52,7 +66,7 @@ class EuvStats(ctypes.Structure):
 
 
 _lib = None
-_API_VERSION = 1
+_API_VERSION = 2
 
 
 def lib():
@@ -69,6 +83,12 @@ def lib():
         l.euv_unwrap.argtypes = [
             P(f32), u32, P(u32), u32, P(u32), u32, P(u32), u32,
             P(EuvParams), P(f32), P(u32), P(u32), u32, P(u32), P(EuvStats),
+        ]
+        l.euv_unwrap_learned.restype = ctypes.c_int32
+        l.euv_unwrap_learned.argtypes = [
+            P(f32), u32, P(u32), u32, P(u32), u32, P(u32), u32,
+            P(EuvParams), ctypes.c_char_p, u32,
+            P(f32), P(u32), P(u32), u32, P(u32), P(EuvStats), P(EuvLearnInfo),
         ]
         l.euv_measure_density.restype = f32
         l.euv_measure_density.argtypes = [P(f32), u32, P(u32), u32, P(u32), u32, P(f32), u32]
@@ -203,6 +223,13 @@ class EasyUVSettings(bpy.types.PropertyGroup):
                                 description="Les aretes marquees couture sont toujours coupees")
     respect_sharp: BoolProperty(name="Couper aretes vives", default=False,
                                 description="Les aretes marquees vives (sharp) sont aussi coupees")
+    auto_learn: BoolProperty(name="Auto-apprentissage", default=True,
+                             description="Essaie plusieurs reglages, garde le meilleur et memorise ce qui marche "
+                                         "(modele partage avec l'application EasyUV)")
+    priority: FloatProperty(name="Priorite", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
+                            description="0 : le moins de coutures et d'ilots possible ; 1 : le moins de distorsion possible")
+    trials: IntProperty(name="Essais", default=6, min=1, max=32,
+                        description="Reglages essayes en parallele a chaque depliage")
     pack_together: BoolProperty(name="Ranger ensemble", default=True,
                                 description="Les objets selectionnes partagent la meme tuile UV et la meme densite de texels")
     mark_seams: BoolProperty(name="Marquer les coutures", default=True,
@@ -246,6 +273,7 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
             margin=s.margin, density_mode=1 if s.density_mode == "TARGET" else 0,
             texture_size=tex_size(s), target_density=s.target_density,
             quality=int(s.quality), rotate_islands=1 if s.rotate else 0,
+            priority=s.priority,
         )
         reports = []
         with _ObjectMode(context):
@@ -265,11 +293,14 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
                 return {"CANCELLED"}
             groups = [items] if (s.pack_together and len(items) > 1) else [[it] for it in items]
             for group in groups:
-                res = self.unwrap_group(L, group, p)
+                res = self.unwrap_group(L, group, p, s.trials if s.auto_learn else 0)
                 if res is None:
                     self.report({"ERROR"}, "Echec du depliage : " + ", ".join(it["obj"].name for it in group))
                     continue
-                st, uv_all, seam_pairs = res
+                st, uv_all, seam_pairs, info = res
+                if info is not None:
+                    # les reglages affiches deviennent ceux retenus par le modele
+                    s.angle, s.max_distortion, s.relax = info.angle_deg, info.max_distortion, info.relax_iterations
                 voff = coff = 0
                 for it in group:
                     me = it["obj"].data
@@ -293,6 +324,10 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
                 reports.append("%s : %d ilots, %.0f px/m, distorsion %.3f, %.0f ms%s" % (
                     names, st.charts, st.density_px_per_unit, st.mean_distortion, st.time_ms,
                     " (deborde 0-1 !)" if st.overflow else ""))
+                if info is not None:
+                    reports.append("Appris : %.0f deg, tol. %.2f, ARAP %d | score %+.3f (%+.3f vs defaut), %d essais, %d experiences" % (
+                        info.angle_deg, info.max_distortion, info.relax_iterations, info.score,
+                        info.score - info.default_score, info.trials, info.experiences))
                 s.measured = st.density_px_per_unit
         s.last_report = " | ".join(reports)
         if reports:
@@ -300,7 +335,7 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
         return {"FINISHED"}
 
     @staticmethod
-    def unwrap_group(L, group, p):
+    def unwrap_group(L, group, p, trials=0):
         """Concatène les objets (indices de sommets décalés) et les déplie en un seul appel :
         leurs îlots partagent alors la même tuile UV et la même densité de texels."""
         voff = 0
@@ -322,17 +357,25 @@ class EASYUV_OT_unwrap(bpy.types.Operator):
         out_seams = np.zeros(max(cap, 1) * 2, dtype=np.uint32)
         n_out = ctypes.c_uint32(0)
         st = EuvStats()
-        rc = L.euv_unwrap(
+        common = (
             _ptr(pos, ctypes.c_float), len(pos) // 3, _ptr(sizes, ctypes.c_uint32), nf,
             _ptr(corners, ctypes.c_uint32), nc,
             _ptr(seams, ctypes.c_uint32) if len(seams) else None, len(seams) // 2,
-            ctypes.byref(p), _ptr(out_uv, ctypes.c_float), _ptr(out_chart, ctypes.c_uint32),
-            _ptr(out_seams, ctypes.c_uint32), cap, ctypes.byref(n_out), ctypes.byref(st),
+            ctypes.byref(p),
         )
+        outs = (_ptr(out_uv, ctypes.c_float), _ptr(out_chart, ctypes.c_uint32),
+                _ptr(out_seams, ctypes.c_uint32), cap, ctypes.byref(n_out), ctypes.byref(st))
+        info = None
+        if trials > 0:
+            info = EuvLearnInfo()
+            path = os.environ.get("EASYUV_LEARN_FILE", "").encode("utf-8") or None
+            rc = L.euv_unwrap_learned(*common, path, trials, *outs, ctypes.byref(info))
+        else:
+            rc = L.euv_unwrap(*common, *outs)
         if rc != 0:
             return None
         n = min(n_out.value, cap)
-        return st, out_uv, out_seams[: n * 2].reshape(-1, 2).astype(np.int64)
+        return st, out_uv, out_seams[: n * 2].reshape(-1, 2).astype(np.int64), info
 
 class EASYUV_OT_measure(bpy.types.Operator):
     bl_idname = "easyuv.measure_density"
@@ -508,6 +551,11 @@ def draw_ui(layout, context):
     col = layout.column(heading="Options")
     col.prop(s, "rotate")
     col.prop(s, "pack_together")
+    col.prop(s, "auto_learn")
+    if s.auto_learn:
+        col.prop(s, "trials")
+        row = col.row()
+        row.prop(s, "priority", text="Coutures <> Distorsion")
     col.prop(s, "respect_seams")
     col.prop(s, "respect_sharp")
     col.prop(s, "mark_seams")

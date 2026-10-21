@@ -4,3 +4,4 @@
 __pycache__/
 *.pyc
 /tests/models/*_uv.*
+/tests/corpus/

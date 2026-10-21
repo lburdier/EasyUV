@@ -117,6 +117,7 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
         out.stats.charts += s.charts;
         out.stats.flipped += s.flipped;
         out.stats.seams += s.seams;
+        out.stats.seam_length += s.seam_length * a.sqrt();
         out.stats.overflow |= s.overflow;
         out.stats.max_distortion = out.stats.max_distortion.max(s.max_distortion);
         area_sum += a;
@@ -128,6 +129,7 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
     if area_sum > 0.0 {
         out.stats.mean_distortion = dist_sum / area_sum;
         out.stats.density_px_per_unit = dens_sum / area_sum;
+        out.stats.seam_length /= area_sum.sqrt();
     }
     out.stats.coverage = cov_sum / n;
     out.stats.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -212,7 +214,7 @@ pub fn tris_to_quads(mesh: &Mesh) -> Mesh {
         }
         candidates.push((d, f, g, key));
     }
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let mut used = vec![false; nf];
     let mut quads: Vec<(usize, Vec<u32>)> = Vec::new();
     for (_, f, g, (a, b)) in candidates {

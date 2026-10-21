@@ -8,6 +8,14 @@ import numpy as np
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, "..", "blender_addon"))
+import tempfile  # noqa: E402
+
+# modele d'apprentissage isole pour le test
+LEARN = os.path.join(tempfile.gettempdir(), "easyuv-blender-test-learn.txt")
+if os.path.exists(LEARN):
+    os.remove(LEARN)
+os.environ["EASYUV_LEARN_FILE"] = LEARN
+
 import easyuv  # noqa: E402
 
 easyuv.register()
@@ -88,6 +96,16 @@ bpy.ops.easyuv.unwrap()
 da2, db2 = easyuv.measure(a, 2048), easyuv.measure(b, 2048)
 print("separe : cube %.1f px/m, tore %.1f px/m" % (da2, db2))
 assert da2 > da * 1.2
+
+# auto-apprentissage : l'experience est ecrite et le rapport la mentionne
+assert s.auto_learn
+assert os.path.isfile(LEARN), "fichier d'apprentissage absent"
+n_lines = sum(1 for _ in open(LEARN, encoding="utf-8"))
+assert "Appris" in s.last_report, s.last_report
+print("apprentissage :", n_lines - 1, "experiences ;", s.last_report.split(" | ")[-1])
+s.auto_learn = False
+bpy.ops.easyuv.unwrap()
+assert sum(1 for _ in open(LEARN, encoding="utf-8")) == n_lines, "sans auto-apprentissage, rien ne doit etre appris"
 
 easyuv.unregister()
 print("TOUS LES TESTS BLENDER OK")
