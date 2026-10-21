@@ -99,7 +99,7 @@ fn run() -> Result<(), String> {
             "--margin" => p.margin = num(args.next(), "--margin")?,
             "--quality" => p.quality = (num(args.next(), "--quality")? as u32).min(3),
             "--auto" => auto = true,
-            "--trials" => trials = (num(args.next(), "--trials")? as usize).clamp(1, 64),
+            "--trials" => trials = (num(args.next(), "--trials")? as usize).clamp(2, 64),
             "--rounds" => rounds = (num(args.next(), "--rounds")? as usize).max(1),
             "--train" => mode = Mode::Train,
             "--eval" => mode = Mode::Eval,

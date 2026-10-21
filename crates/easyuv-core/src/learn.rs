@@ -404,6 +404,10 @@ pub fn default_path() -> PathBuf {
 /// Déplie `model` en essayant `trials` réglages (en parallèle), garde le meilleur et
 /// enregistre toutes les expériences dans `learner`. Marge, densité, texture et rotation
 /// de `base` sont conservées ; seuls angle, tolérance et ARAP sont appris.
+///
+/// Avec `trials >= 2`, les réglages d'usine font toujours partie des essais : le résultat
+/// n'est donc jamais moins bon qu'un dépliage sans apprentissage. `trials = 1` (prédiction
+/// seule, sans filet) ne sert qu'à mesurer le modèle (`easyuv-cli --eval`).
 pub fn unwrap_learned(model: &Model, base: &Params, together: bool, learner: &mut Learner, trials: usize) -> LearnedUnwrap {
     unwrap_learned_with_seams(model, base, together, learner, trials, &[])
 }
