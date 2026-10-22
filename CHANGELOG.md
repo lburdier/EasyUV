@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] - 2026-10-23
+
+### Interface
+- **Séparateur déplaçable** entre la vue 3D et l'éditeur UV : glisser pour agrandir l'une ou l'autre (chaque vue garde au moins 220 px), double-clic pour revenir au partage par défaut. Réglage propre aux espaces Layout et UV Editing.
+- Dans une vue 3D étroite, le titre s'efface au profit des boutons d'affichage.
+
+### Rendre droit
+- **Bandes courbes redressées proprement** même quand la grille de quads ne couvre pas tout l'îlot (triangles, n-gones, jonctions en T, bout de bande irrégulier) : un arc de cône est déroulé autour de son centre (coordonnées polaires), au lieu de laisser le bout écrasé ou replié.
+- Chaque résultat est contrôlé (faces retournées ou écrasées) et le plus propre est retenu. Si le redressement devait abîmer l'îlot (couvercle, disque entouré d'anneaux), l'îlot reste tel quel et la barre d'état le signale.
+
 ## [0.2.0] - 2026-10-22
 
 ### Objets tournés
