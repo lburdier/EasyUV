@@ -526,6 +526,33 @@ impl Scene {
         self.touch();
     }
 
+    /// Îlots sélectionnés et visibles.
+    pub fn selected_island_ids(&self) -> Vec<usize> {
+        (0..self.island_selected.len()).filter(|&i| self.island_selected[i] && self.island_visible(i)).collect()
+    }
+
+    /// Îlots touchés par un pinceau : la sélection s'il y en a une, sinon tout ce qui est visible.
+    pub fn brush_islands(&self) -> Vec<usize> {
+        let sel = self.selected_island_ids();
+        if !sel.is_empty() {
+            return sel;
+        }
+        (0..self.island_selected.len()).filter(|&i| self.island_visible(i)).collect()
+    }
+
+    /// Outil d'îlots (aligner, répartir, empiler…) appliqué aux îlots sélectionnés.
+    /// Renvoie le nombre d'îlots traités.
+    pub fn island_tool(&mut self, texture_size: u32, op: impl FnOnce(&easyuv::mesh::Mesh, &mut [[f32; 2]], &[u32], &[usize])) -> usize {
+        let ids = self.selected_island_ids();
+        let Some(uv) = &mut self.uv else { return 0 };
+        if ids.is_empty() {
+            return 0;
+        }
+        op(&self.model.mesh, &mut uv.corner_uv, &self.face_island, &ids);
+        self.refresh(texture_size);
+        ids.len()
+    }
+
     /// Coins des îlots sélectionnés.
     pub fn selected_corners(&self) -> Vec<u32> {
         (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).flat_map(|i| self.island_corners[i].iter().copied()).collect()

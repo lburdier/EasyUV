@@ -4,6 +4,8 @@
 use crate::scene::Scene;
 use crate::theme;
 use crate::viewport::{island_color, stretch_color, Shading, WHITE_UV};
+use easyuv::math::V2;
+use easyuv::uvtools::{self, Brush, Islands, UvGraph};
 use eframe::egui::{self, epaint::Vertex, Color32, Pos2, Rect, Shape, Stroke, TextureId};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -79,8 +81,80 @@ struct Modal {
     info: String,
 }
 
+/// Outil actif de l'éditeur UV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UvTool {
+    /// Sélection et transformation des îlots (G / R / S).
+    #[default]
+    Select,
+    Grab,
+    Relax,
+    Straighten,
+    Pinch,
+    /// Dessiner le rectangle dans lequel aplatir l'îlot.
+    Rect,
+}
+
+impl UvTool {
+    pub const ALL: [UvTool; 6] = [UvTool::Select, UvTool::Grab, UvTool::Relax, UvTool::Straighten, UvTool::Pinch, UvTool::Rect];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UvTool::Select => "Sélection",
+            UvTool::Grab => "Déplacer",
+            UvTool::Relax => "Détendre",
+            UvTool::Straighten => "Redresser",
+            UvTool::Pinch => "Pincer",
+            UvTool::Rect => "Rectangle",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            UvTool::Select => "Q",
+            UvTool::Grab => "1",
+            UvTool::Relax => "2",
+            UvTool::Straighten => "3",
+            UvTool::Pinch => "4",
+            UvTool::Rect => "5",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            UvTool::Select => "Clic, Maj+clic ou rectangle : îlots · glisser : déplacer · G R S : transformer",
+            UvTool::Grab => "Glisser : tirer les UV sous le pinceau, l'effet s'atténue vers le bord",
+            UvTool::Relax => "Peindre : les arêtes reprennent leur longueur 3D (moins d'étirement)",
+            UvTool::Straighten => "Peindre : les arêtes s'alignent sur l'horizontale ou la verticale la plus proche",
+            UvTool::Pinch => "Peindre : resserre les UV vers le centre · Maj : les écarte",
+            UvTool::Rect => "Dessiner un rectangle : l'îlot sélectionné y est rendu droit et étiré pour le remplir",
+        }
+    }
+
+    pub fn brush(self) -> Option<Brush> {
+        match self {
+            UvTool::Grab => Some(Brush::Grab),
+            UvTool::Relax => Some(Brush::Relax),
+            UvTool::Straighten => Some(Brush::Straighten),
+            UvTool::Pinch => Some(Brush::Pinch),
+            _ => None,
+        }
+    }
+}
+
+/// Coup de pinceau en cours.
+struct BrushStroke {
+    /// UV d'avant le geste (Échap, Ctrl+Z).
+    orig: Vec<[f32; 2]>,
+    graph: UvGraph,
+    start: Vec<V2>,
+    pts: Vec<V2>,
+    /// Poids figés au début du geste (pinceau Déplacer).
+    weights: Vec<f64>,
+    start_uv: V2,
+}
+
 /// État de l'outil d'édition UV.
-#[derive(Default)]
 pub struct UvEditor {
     modal: Option<Modal>,
     /// Sélection au rectangle : (origine écran, mode 0 / 1 / -1).
@@ -88,6 +162,20 @@ pub struct UvEditor {
     /// Ignore le clic qui termine une transformation (il ne doit pas resélectionner).
     swallow_primary: bool,
     swallow_secondary: bool,
+    pub tool: UvTool,
+    /// Rayon du pinceau, en pixels d'écran.
+    pub radius: f32,
+    /// Force du pinceau (0-1).
+    pub strength: f32,
+    stroke: Option<BrushStroke>,
+    /// Outil Rectangle : origine écran du rectangle en cours de tracé.
+    rect: Option<Pos2>,
+}
+
+impl Default for UvEditor {
+    fn default() -> Self {
+        UvEditor { modal: None, boxsel: None, swallow_primary: false, swallow_secondary: false, tool: UvTool::Select, radius: 60.0, strength: 0.5, stroke: None, rect: None }
+    }
 }
 
 /// Ce que l'application doit faire après l'interaction.
@@ -97,11 +185,13 @@ pub enum UvEvent {
     Status(String),
     /// Maj+W : rendre droits les îlots sélectionnés.
     Straighten,
+    /// Outil Rectangle : aplatir les îlots sélectionnés dans [lo, hi] (UV).
+    FlattenRect([f32; 2], [f32; 2]),
 }
 
 impl UvEditor {
     pub fn busy(&self) -> bool {
-        self.modal.is_some()
+        self.modal.is_some() || self.stroke.is_some() || self.rect.is_some()
     }
 
     /// Texte d'aide de la transformation en cours.
@@ -148,13 +238,48 @@ fn camera_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
 
 /// Interaction avec l'éditeur UV : vue, sélection et transformations des îlots.
 pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: Rect, scene: Option<&mut Scene>, ed: &mut UvEditor) -> Option<UvEvent> {
-    camera_input(ui, resp, cam, rect);
+    // pinceau : Ctrl+molette règle le rayon au lieu du zoom
+    let zoom = ui.input(|i| i.zoom_delta());
+    if ed.tool.brush().is_some() && resp.hovered() && zoom != 1.0 {
+        ed.radius = (ed.radius * zoom).clamp(4.0, 600.0);
+    } else {
+        camera_input(ui, resp, cam, rect);
+    }
     let view = View::new(rect, cam);
     let scene = scene?;
     scene.uv.as_ref()?;
     let (pointer, shift, ctrl, alt) = ui.input(|i| (i.pointer.latest_pos(), i.modifiers.shift, i.modifiers.command, i.modifiers.alt));
-    let keys = !ui.ctx().egui_wants_keyboard_input() && (resp.hovered() || ed.modal.is_some());
+    let keys = !ui.ctx().egui_wants_keyboard_input() && (resp.hovered() || ed.modal.is_some() || ed.stroke.is_some());
     let key = |k: egui::Key| keys && ui.input(|i| i.key_pressed(k));
+
+    // --- choix de l'outil (Q, 1 à 5) et rayon du pinceau ([ ]) ---
+    if ed.modal.is_none() && ed.stroke.is_none() && !ctrl {
+        for (k, t) in [(egui::Key::Q, UvTool::Select), (egui::Key::Num1, UvTool::Grab), (egui::Key::Num2, UvTool::Relax), (egui::Key::Num3, UvTool::Straighten), (egui::Key::Num4, UvTool::Pinch), (egui::Key::Num5, UvTool::Rect)] {
+            if key(k) {
+                ed.tool = t;
+                ed.rect = None;
+            }
+        }
+    }
+    if key(egui::Key::OpenBracket) {
+        ed.radius = (ed.radius / 1.15).max(4.0);
+    }
+    if key(egui::Key::CloseBracket) {
+        ed.radius = (ed.radius * 1.15).min(600.0);
+    }
+    if ed.tool != UvTool::Select {
+        if let Some(ev) = tool_interact(ui, resp, view, scene, ed, pointer, shift, &key) {
+            return Some(ev);
+        }
+        // un simple clic choisit l'îlot visé (pour limiter le pinceau à cet îlot)
+        if resp.clicked() && ed.stroke.is_none() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let hit = scene.pick_island(view.to_uv(p));
+                scene.click_island(hit, shift);
+            }
+        }
+        return None;
+    }
     let (primary_pressed, secondary_pressed, primary_released, secondary_released) = ui.input(|i| {
         (i.pointer.primary_pressed(), i.pointer.secondary_pressed(), i.pointer.primary_released(), i.pointer.button_released(egui::PointerButton::Secondary))
     });
@@ -303,6 +428,85 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     None
 }
 
+fn v2(p: [f32; 2]) -> V2 {
+    V2::new(p[0] as f64, p[1] as f64)
+}
+
+/// Pinceaux et outil Rectangle.
+#[allow(clippy::too_many_arguments)]
+fn tool_interact(ui: &egui::Ui, resp: &egui::Response, view: View, scene: &mut Scene, ed: &mut UvEditor, pointer: Option<Pos2>, shift: bool, key: &dyn Fn(egui::Key) -> bool) -> Option<UvEvent> {
+    let origin = ui.input(|i| i.pointer.press_origin());
+    // --- outil Rectangle ---
+    if ed.tool == UvTool::Rect {
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            ed.rect = origin;
+        }
+        if let Some(o) = ed.rect {
+            if key(egui::Key::Escape) {
+                ed.rect = None;
+                return None;
+            }
+            if !resp.dragged_by(egui::PointerButton::Primary) {
+                ed.rect = None;
+                let p = pointer?;
+                if (p - o).length() < 6.0 {
+                    return None;
+                }
+                let (a, b) = (view.to_uv(o), view.to_uv(p));
+                let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
+                if !scene.has_island_selection() {
+                    // sans sélection : l'îlot sous le rectangle (centre, puis départ du geste)
+                    let hit = scene.pick_island([(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5]).or_else(|| scene.pick_island(a));
+                    match hit {
+                        Some(i) => scene.click_island(Some(i), false),
+                        None => return Some(UvEvent::Status("Sélectionnez l'îlot à aplatir (clic), puis dessinez le rectangle".into())),
+                    }
+                }
+                return Some(UvEvent::FlattenRect(lo, hi));
+            }
+            ui.ctx().request_repaint();
+        }
+        return None;
+    }
+    // --- pinceaux ---
+    let brush = ed.tool.brush()?;
+    let radius_uv = (ed.radius / view.side) as f64;
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        let ids = scene.brush_islands();
+        if ids.is_empty() {
+            return Some(UvEvent::Status("Aucun îlot visible à modifier".into()));
+        }
+        let uv = &scene.uv.as_ref()?.corner_uv;
+        let isl = Islands::new(&scene.model.mesh, &scene.face_island, &ids);
+        let graph = UvGraph::build(&scene.model.mesh, uv, &isl);
+        let pts = graph.positions(uv);
+        let start_uv = v2(view.to_uv(origin.or(pointer)?));
+        let weights = uvtools::brush_weights(&pts, start_uv, radius_uv);
+        ed.stroke = Some(BrushStroke { orig: uv.clone(), graph, start: pts.clone(), pts, weights, start_uv });
+    }
+    let st = ed.stroke.as_mut()?;
+    if key(egui::Key::Escape) {
+        let st = ed.stroke.take()?;
+        scene.uv.as_mut()?.corner_uv = st.orig;
+        scene.touch();
+        return Some(UvEvent::Status("Coup de pinceau annulé".into()));
+    }
+    if resp.dragged_by(egui::PointerButton::Primary) {
+        let c = v2(view.to_uv(pointer?));
+        match brush {
+            Brush::Grab => uvtools::brush_grab(&mut st.pts, &st.start, &st.weights, c - st.start_uv),
+            b => uvtools::brush_step(&st.graph, &mut st.pts, b, c, radius_uv, ed.strength as f64 * 0.35, shift),
+        }
+        st.graph.write(&st.pts, &mut scene.uv.as_mut()?.corner_uv);
+        scene.touch();
+        // le pinceau agit tant que le bouton est enfoncé, même sans bouger
+        ui.ctx().request_repaint();
+        return None;
+    }
+    let st = ed.stroke.take()?;
+    Some(UvEvent::Commit(st.orig))
+}
+
 /// Le menu contextuel ne doit pas s'ouvrir sur le clic droit qui annule une transformation.
 pub fn context_menu_allowed(ed: &UvEditor) -> bool {
     ed.modal.is_none() && !ed.swallow_secondary
@@ -362,6 +566,39 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
         let col = if mode < 0 { theme::SEAM_RED } else { Color32::WHITE };
         painter.rect_filled(r, 0.0, Color32::from_white_alpha(10));
         painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
+    }
+    // Outil Rectangle : le rectangle en cours de tracé
+    if let (Some(o), Some(p)) = (ed.rect, ui.input(|i| i.pointer.latest_pos())) {
+        let r = Rect::from_two_pos(o, p);
+        painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0xff, 0xa0, 0x28, 24));
+        painter.rect_stroke(r, 0.0, Stroke::new(1.5, theme::ACCENT_ORANGE), egui::StrokeKind::Inside);
+    }
+    // Pinceau : cercle d'influence sous le pointeur
+    if ed.tool.brush().is_some() {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p)) {
+            let col = if ed.stroke.is_some() { theme::ACCENT_ORANGE } else { Color32::from_white_alpha(200) };
+            painter.circle_stroke(p, ed.radius, Stroke::new(1.5, col));
+            painter.circle_stroke(p, ed.radius * 0.5, Stroke::new(1.0, Color32::from_white_alpha(60)));
+            painter.circle_filled(p, 1.5, col);
+        }
+    }
+    // Aide de l'outil actif (hors sélection)
+    if ed.tool != UvTool::Select && ed.info().is_none() {
+        let txt = match ed.tool.brush() {
+            Some(_) => format!(
+                "{}  ·  rayon {:.0} px  ·  force {:.0} %   —   {}   ·   [ ] ou Ctrl+molette : rayon   ·   clic : limiter à un îlot   ·   Échap : annuler",
+                ed.tool.label(),
+                ed.radius,
+                ed.strength * 100.0,
+                ed.tool.hint()
+            ),
+            None => format!("{}   —   {}   ·   Échap : annuler", ed.tool.label(), ed.tool.hint()),
+        };
+        let pos = rect.left_bottom() + egui::vec2(10.0, -10.0);
+        let galley = painter.layout(txt, egui::FontId::proportional(12.0), theme::TEXT, rect.width() - 30.0);
+        let bg = Rect::from_min_size(pos - egui::vec2(6.0, galley.size().y + 4.0), galley.size() + egui::vec2(12.0, 8.0));
+        painter.rect_filled(bg, 4.0, Color32::from_black_alpha(170));
+        painter.galley(pos - egui::vec2(0.0, galley.size().y), galley, theme::TEXT);
     }
     // Aide de la transformation en cours
     if let Some(info) = ed.info() {

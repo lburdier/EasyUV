@@ -79,6 +79,23 @@ Raccourcis :
 
 Glisser-déposer un fichier pour l'ouvrir, avec `Maj` pour l'ajouter à la scène. Modes d'affichage : Solide, Damier, Îlots, Étirement.
 
+### Outils UV
+
+Panneau « Outils UV », menu UV et clic droit dans l'éditeur UV, dans l'esprit du UV Toolkit de Maya et de RizomUV.
+
+| Outil (touche dans l'éditeur UV) | Effet |
+|---|---|
+| Sélection `Q` | clic, `Maj`+clic, rectangle ; glisser, `G` `R` `S` pour transformer |
+| Pinceau Déplacer `1` | tire les UV sous le pinceau, l'effet s'atténue vers le bord |
+| Pinceau Détendre `2` | les arêtes reprennent leur longueur 3D (moins d'étirement) |
+| Pinceau Redresser `3` | les arêtes s'alignent sur l'horizontale ou la verticale la plus proche : rend droite la zone peinte |
+| Pinceau Pincer `4` | resserre les UV vers le centre, `Maj` pour les écarter |
+| Rectangle `5` | dessinez un rectangle : l'îlot sélectionné y est rendu droit puis étiré pour le remplir |
+
+Rayon du pinceau : `[` `]` ou `Ctrl`+molette. Les pinceaux agissent sur les îlots sélectionnés, ou sur tous si rien n'est sélectionné ; `Échap` annule le coup de pinceau, `Ctrl+Z` après.
+
+Outils d'îlots (sur la sélection) : aligner (gauche, centre, droite, haut, bas), répartir en U ou en V, pivoter d'un angle, miroir, échelle, empiler, égaliser la densité, remplir la tuile, rendre droit, orienter, optimiser (ARAP), redéplier.
+
 ## Ligne de commande
 
 ```text
