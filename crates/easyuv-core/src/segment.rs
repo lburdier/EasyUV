@@ -77,10 +77,12 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
             }
         }
         // Stratégie selon la forme du morceau (preset choisi ou détecté)
+        let t_cls = std::time::Instant::now();
         let preset = match params.shape {
             ShapePreset::Auto => regions::classify(mesh, topo, &faces, &cut),
             p => p,
         };
+        prof("classification", t_cls);
         let (dev_tol, cone) = match preset {
             ShapePreset::HardSurface => {
                 shapes[0] += 1;
@@ -96,7 +98,9 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
                 continue;
             }
         };
+        let t_reg = std::time::Instant::now();
         let regs = regions::developable_regions(mesh, topo, &faces, &cut, dev_tol, cone);
+        prof("regions", t_reg);
         if regs.len() <= 1 {
             work.push((faces, tag, 0));
             continue;
@@ -130,51 +134,117 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
         }
     }
 
-    let solver_iter = 600 + 400 * params.quality as usize;
     let mut done: Vec<Unwrapped> = Vec::new();
-    while let Some((faces, tag, depth)) = work.pop() {
-        let chart = build_chart(mesh, topo, &faces, &cut, &owner, tag);
-        if chart.tris.is_empty() {
-            done.push(Unwrapped { uv: vec![V2::default(); chart.pos.len()], chart, distortion: 0.0, flipped: 0 });
-            continue;
-        }
-        // un anneau plan (couvercle percé…) se déplie tel quel : inutile de le couper
-        let planar = !chart.is_disk() && regions::is_planar(topo, &faces, 1.0);
-        if !chart.is_disk() && !planar && faces.len() > 1 && depth < MAX_DEPTH {
-            // Tube (genre 0, plusieurs bords) : une seule couture discrète suffit.
-            if chart.genus() == 0 && chart.boundary_loops >= 2 && cut_between_loops(mesh, topo, &chart, &mut cut) {
-                work.push((faces, tag, depth + 1));
+    // Traitement par vagues : la topologie (coutures, partitions) est modifiée séquentiellement,
+    // puis tous les îlots-disques de la vague sont dépliés en parallèle.
+    while !work.is_empty() {
+        let batch: Vec<(Vec<u32>, u32, u32)> = std::mem::take(&mut work);
+        let mut ready: Vec<(Chart, Vec<u32>, u32)> = Vec::new(); // (îlot, faces, profondeur)
+        for (faces, tag, depth) in batch {
+            let chart = build_chart(mesh, topo, &faces, &cut, &owner, tag);
+            if chart.tris.is_empty() {
+                done.push(Unwrapped { uv: vec![V2::default(); chart.pos.len()], chart, distortion: 0.0, flipped: 0 });
                 continue;
             }
-            split_geodesic(mesh, topo, &faces, &mut cut, &mut owner, &mut next_tag, depth, &mut work);
-            continue;
-        }
-        let mut uv = lscm(&chart, solver_iter);
-        normalize_scale(&chart, &mut uv);
-        let q_lscm = quality(&chart, &uv);
-        let mut q = q_lscm;
-        if params.relax_iterations > 0 {
-            let backup = uv.clone();
-            arap(&chart, &mut uv, params.relax_iterations as usize, 300 + 200 * params.quality as usize);
-            normalize_scale(&chart, &mut uv);
-            let q_arap = quality(&chart, &uv);
-            // On garde ARAP seulement s'il n'introduit pas de retournements
-            if q_arap.flipped > q.flipped || !q_arap.distortion.is_finite() {
-                uv = backup;
-            } else {
-                q = q_arap;
+            // un anneau plan (couvercle percé…) se déplie tel quel : inutile de le couper
+            let planar = !chart.is_disk() && regions::is_planar(topo, &faces, 1.0);
+            if !chart.is_disk() && !planar && faces.len() > 1 && depth < MAX_DEPTH {
+                // Tube (genre 0, plusieurs bords) : une seule couture discrète suffit.
+                // Au-delà de quelques trous, relier les bords un à un épuiserait la profondeur
+                // (une couture par passe) : on scinde plutôt l'îlot, ce qui répartit les trous.
+                if chart.genus() == 0 && (2..=4).contains(&chart.boundary_loops) && cut_between_loops(mesh, topo, &chart, &mut cut) {
+                    work.push((faces, tag, depth + 1));
+                    continue;
+                }
+                split_geodesic(mesh, topo, &faces, &mut cut, &mut owner, &mut next_tag, depth, &mut work);
+                continue;
             }
+            ready.push((chart, faces, depth));
         }
-        let bad = q.flipped > 0 || q.distortion > params.max_distortion;
-        if bad && faces.len() > 1 && depth < MAX_DEPTH {
-            split_geodesic(mesh, topo, &faces, &mut cut, &mut owner, &mut next_tag, depth, &mut work);
-            continue;
+        let t_un = std::time::Instant::now();
+        let results = parallel_map(&ready, |(chart, _, _)| unwrap_one(chart, params));
+        prof("unwrap (vague)", t_un);
+        for ((chart, faces, depth), (uv, q, overlap)) in ready.into_iter().zip(results) {
+            // îlot refusé : triangles retournés, distorsion excessive ou îlot replié sur lui-même
+            let bad = q.flipped > 0 || q.distortion > params.max_distortion || overlap > OVERLAP_TOL;
+            if bad && faces.len() > 1 && depth < MAX_DEPTH {
+                split_geodesic(mesh, topo, &faces, &mut cut, &mut owner, &mut next_tag, depth, &mut work);
+                continue;
+            }
+            if std::env::var_os("EASYUV_PROFILE").is_some() && (bad || q.distortion > 0.2) {
+                eprintln!("  [îlot] faces={} prof={depth} disque={} dist={:.3} retournés={} chevauch={:.4} accepté={}", faces.len(), chart.is_disk(), q.distortion, q.flipped, overlap, !bad);
+            }
+            done.push(Unwrapped { chart, uv, distortion: q.distortion, flipped: q.flipped });
         }
-        done.push(Unwrapped { chart, uv, distortion: q.distortion, flipped: q.flipped });
     }
     (done, cut, shapes)
 }
 
+/// Profilage optionnel (variable d'environnement EASYUV_PROFILE).
+pub(crate) fn prof(what: &str, t: std::time::Instant) {
+    if std::env::var_os("EASYUV_PROFILE").is_some() {
+        eprintln!("  [profil] {what:<16} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// Part de chevauchement tolérée dans un îlot (au-delà, il est redécoupé).
+const OVERLAP_TOL: f64 = 0.002;
+
+/// Dépliage d'un îlot-disque : LSCM puis ARAP (si elle n'introduit pas de retournements).
+/// Retourne les UV, leur qualité et la part de l'îlot qui se chevauche elle-même.
+fn unwrap_one(chart: &Chart, params: &Params) -> (Vec<V2>, crate::unwrap::UnwrapQuality, f64) {
+    // la convergence des solveurs itératifs croît avec la taille de l'îlot
+    let n = chart.pos.len() as f64;
+    let solver_iter = 600 + 400 * params.quality as usize + (12.0 * n.sqrt()) as usize;
+    let t = std::time::Instant::now();
+    let mut uv = lscm(chart, solver_iter);
+    prof("  lscm", t);
+    normalize_scale(chart, &mut uv);
+    let mut q = quality(chart, &uv);
+    if params.relax_iterations > 0 {
+        let backup = uv.clone();
+        let t = std::time::Instant::now();
+        arap(chart, &mut uv, params.relax_iterations as usize, 300 + 200 * params.quality as usize + (8.0 * n.sqrt()) as usize);
+        prof("  arap", t);
+        normalize_scale(chart, &mut uv);
+        let q_arap = quality(chart, &uv);
+        if q_arap.flipped > q.flipped || !q_arap.distortion.is_finite() {
+            uv = backup;
+        } else {
+            q = q_arap;
+        }
+    }
+    let t = std::time::Instant::now();
+    let overlap = crate::metrics::chart_self_overlap(&chart.tris, &uv, 256);
+    prof("  chevauchement", t);
+    (uv, q, overlap)
+}
+
+/// Applique `f` à chaque élément en parallèle (ordre des résultats conservé).
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AO};
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(items.len()).max(1);
+    if threads == 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    let slots: Vec<std::sync::Mutex<&mut Option<R>>> = out.iter_mut().map(std::sync::Mutex::new).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, AO::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                let r = f(&items[i]);
+                **slots[i].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    drop(slots);
+    out.into_iter().map(|r| r.expect("résultat manquant")).collect()
+}
 /// Coût de traversée d'une arête : on préfère couper sur les plis (moins visibles).
 fn crease_factor(dihedral: f64) -> f64 {
     let s = (dihedral / std::f64::consts::PI).clamp(0.0, 1.0);

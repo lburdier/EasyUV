@@ -125,7 +125,12 @@ pub fn lscm(chart: &Chart, max_iter: usize) -> Vec<V2> {
             x[free_idx[i] as usize] = v;
         }
     }
-    cgls(&a, &rhs, &mut x, max_iter, 1e-10);
+    // grands îlots : équations normales + IC(0), beaucoup moins d'itérations que CGLS
+    if nfree > 4000 {
+        crate::solver::normal_pcg(&a, &rhs, &mut x, max_iter, 1e-4);
+    } else {
+        cgls(&a, &rhs, &mut x, max_iter, 1e-6);
+    }
     let get = |i: usize| fixed[i].unwrap_or_else(|| x[free_idx[i] as usize]);
     let mut uv: Vec<V2> = (0..n).map(|i| V2::new(get(i), get(n + i))).collect();
     orient_positive(chart, &mut uv);
@@ -233,8 +238,8 @@ pub fn arap(chart: &Chart, uv: &mut [V2], iterations: usize, max_cg: usize) {
         }
         bu[anchor] += lam * xu[anchor];
         bv[anchor] += lam * xv[anchor];
-        pcg(&lap, &bu, &mut xu, max_cg, 1e-8);
-        pcg(&lap, &bv, &mut xv, max_cg, 1e-8);
+        pcg(&lap, &bu, &mut xu, max_cg, 1e-5);
+        pcg(&lap, &bv, &mut xv, max_cg, 1e-5);
     }
     for i in 0..n {
         uv[i] = V2::new(xu[i], xv[i]);

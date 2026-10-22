@@ -55,6 +55,7 @@ enum Mode {
     Process,
     Train,
     Eval,
+    Bench,
 }
 
 fn main() -> ExitCode {
@@ -108,6 +109,7 @@ fn run() -> Result<(), String> {
             "--rounds" => rounds = (num(args.next(), "--rounds")? as usize).max(1),
             "--train" => mode = Mode::Train,
             "--eval" => mode = Mode::Eval,
+            "--bench" => mode = Mode::Bench,
             "--learn-file" => learn_file = PathBuf::from(args.next().ok_or("--learn-file : chemin manquant")?),
             "--no-base" => use_base = false,
             "--priority" => priority = num(args.next(), "--priority")?.clamp(0.0, 1.0),
@@ -198,6 +200,44 @@ fn run() -> Result<(), String> {
                 l.save(&learn_file).map_err(|e| e.to_string())?;
             }
             println!("modèle enregistré : {} ({} expériences locales)", learn_file.display(), l.local_len());
+        }
+        Mode::Bench => {
+            // banc d'essai : réglages fixes, mesures indépendantes de l'algorithme
+            println!("{:<26} {:>7} {:>6} {:>9} {:>8} {:>8} {:>9} {:>8}", "maillage", "faces", "îlots", "couvert.", "distors.", "retourn.", "chevauch.", "temps");
+            let (mut n, mut cov, mut dist, mut ov, mut ms, mut flips) = (0.0, 0.0, 0.0, 0.0, 0.0, 0usize);
+            for f in &files {
+                let Ok(m) = io::import(f) else { continue };
+                let r = unwrap_model(&m, &p, together);
+                let s = &r.stats;
+                let o = easyuv::metrics::overlap_ratio(&m.mesh, &r.corner_uv, 1024);
+                println!(
+                    "{:<26} {:>7} {:>6} {:>8.1}% {:>8.3} {:>8} {:>8.2}% {:>6.0}ms",
+                    f.file_name().unwrap_or_default().to_string_lossy(),
+                    m.mesh.face_count(),
+                    s.charts,
+                    s.coverage * 100.0,
+                    s.mean_distortion,
+                    s.flipped,
+                    o * 100.0,
+                    s.time_ms
+                );
+                n += 1.0;
+                cov += s.coverage;
+                dist += s.mean_distortion;
+                ov += o;
+                ms += s.time_ms;
+                flips += s.flipped;
+            }
+            if n > 0.0 {
+                println!(
+                    "MOYENNE : couverture {:.1}%  distorsion {:.4}  chevauchement {:.3}%  retournés {}  temps {:.0} ms",
+                    cov / n * 100.0,
+                    dist / n,
+                    ov / n * 100.0,
+                    flips,
+                    ms / n
+                );
+            }
         }
         Mode::Eval => {
             let l = load();
