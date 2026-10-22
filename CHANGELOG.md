@@ -1,8 +1,8 @@
 # Changelog
 
-## [Non publié]
+## [0.2.0] - 2026-10-22
 
-### Dépliage
+### Objets tournés
 - **Objets tournés détectés en Auto** (pots, couvercles, bouteilles, tuyaux biseautés) : EasyUV cherche l'axe que toutes les normales coupent (surface de révolution) et vérifie que le profil a des portions droites (paroi, cône, disque). Ces objets étaient classés « organique » dès que leurs arêtes étaient arrondies ; ils sont maintenant dépliés en bandes droites + couvercles. Sur un pot de crème biseauté : distorsion 0,064 -> 0,007. Les sphères (axe non unique) et les tores (profil entièrement courbe) restent en organique.
 
 ### Interface
@@ -11,8 +11,7 @@
 - **F** cadre la sélection dans la vue sous le pointeur : les îlots sélectionnés dans l'éditeur UV, les objets sélectionnés dans la vue 3D. **Origine** cadre tout.
 - La barre d'état affiche les raccourcis de la vue survolée (éditeur UV ou vue 3D).
 - Le curseur « Priorité » ne déborde plus du panneau.
-
-## [0.2.0] - 2026-10-21
+- **Numéro de version** dans la barre de titre et la barre de menus, et fenêtre **Aide > Nouveautés** qui liste les changements de chaque version. Elle s'ouvre d'elle-même au premier lancement après une mise à jour.
 
 ### Édition UV et rangement (layout)
 - **Mode rangement** (Ctrl+P, panneau « Rangement ») : range les UV actuelles dans la tuile sans redéplier, par exemple pour réunir des objets dépliés séparément. Les îlots sélectionnés vont dans la place libre, sans recouvrir les autres. Option « Égaliser la densité ».
@@ -34,6 +33,7 @@
 ### Corrections
 - Dépliage entièrement déterministe : l'ordre aléatoire des tables de hachage influençait le choix des boucles de bord.
 - `easyuv-cli --self-update` met à jour `EasyUV.exe` placé à côté du CLI, au lieu de remplacer le CLI lui-même.
+
 ## [0.1.0] - 2026-10-21
 
 Première version publique.

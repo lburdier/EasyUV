@@ -86,6 +86,8 @@ pub struct EasyUvApp {
     confirm_reset: bool,
     update: UpdateState,
     show_update: bool,
+    /// Fenêtre « Nouveautés » (ouverte d'elle-même après une mise à jour).
+    show_news: bool,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -133,6 +135,7 @@ impl EasyUvApp {
             confirm_reset: false,
             update: UpdateState::Idle,
             show_update: false,
+            show_news: crate::news::first_run_of_version(),
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -948,6 +951,10 @@ impl EasyUvApp {
                         self.uv_menu_items(ui, ctx);
                     });
                     ui.menu_button("Aide", |ui| {
+                        if ui.button("Nouveautés…").clicked() {
+                            ui.close();
+                            self.show_news = true;
+                        }
                         if ui.button("Vérifier les mises à jour").clicked() {
                             ui.close();
                             self.check_updates(ctx, true);
@@ -969,15 +976,20 @@ impl EasyUvApp {
                             self.workspace = ws;
                         }
                     }
-                    if let UpdateState::Available(rel) = &self.update {
-                        let txt = format!("Mise à jour {} disponible", rel.version);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // numéro de version, à droite : un clic ouvre les nouveautés
+                        let v = egui::Button::new(RichText::new(format!("v{}", update::current_version())).small().color(theme::TEXT_DIM)).frame(false);
+                        if ui.add(v).on_hover_text("Nouveautés de cette version").clicked() {
+                            self.show_news = true;
+                        }
+                        if let UpdateState::Available(rel) = &self.update {
+                            let txt = format!("Mise à jour {} disponible", rel.version);
                             let b = egui::Button::new(RichText::new(txt).color(Color32::BLACK).strong()).fill(theme::ACCENT_ORANGE);
                             if ui.add(b).clicked() {
                                 self.show_update = true;
                             }
-                        });
-                    }
+                        }
+                    });
                 });
             });
     }
@@ -1681,6 +1693,13 @@ impl eframe::App for EasyUvApp {
             });
         }
         self.confirm_delete_popup(ctx);
+        let mut check = false;
+        crate::news::window(ctx, &mut self.show_news, &mut check);
+        if check {
+            self.show_news = false;
+            self.check_updates(ctx, true);
+            self.show_update = true;
+        }
         self.update_window(ctx);
         if self.job.is_some() || matches!(self.update, UpdateState::Checking(..) | UpdateState::Installing(_)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
