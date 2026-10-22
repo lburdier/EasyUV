@@ -982,12 +982,23 @@ impl EasyUvApp {
             });
     }
 
+    /// Le pointeur est-il au-dessus de l'éditeur UV (zone de l'image précédente) ?
+    fn pointer_over_uv(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.pointer.hover_pos()).zip(self.uv_rect).is_some_and(|(p, r)| r.contains(p))
+    }
+
     fn status_bar(&mut self, root: &mut egui::Ui) {
+        // aide contextuelle, comme la barre d'état de Blender : elle suit la vue sous le pointeur
+        let hints = if self.pointer_over_uv(root.ctx()) {
+            "Clic / Maj+clic / rectangle : îlots   Glisser : déplacer   G R S : transformer   A : tout   F : cadrer la sélection   Molette : zoom   Clic molette : vue"
+        } else {
+            "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   U : déplier   F : cadrer la sélection"
+        };
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(8, 3)))
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   U : déplier   F : cadrer").color(theme::TEXT_DIM).small());
+                    ui.label(RichText::new(hints).color(theme::TEXT_DIM).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).small());
                     });
@@ -1161,6 +1172,10 @@ impl EasyUvApp {
                                 ui.label("Priorité");
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("coutures").small().color(theme::TEXT_DIM));
+                                    // le curseur prend la place restante : « distorsion » ne doit pas sortir du panneau
+                                    let font = egui::TextStyle::Small.resolve(ui.style());
+                                    let right = ui.painter().layout_no_wrap("distorsion".into(), font, theme::TEXT_DIM).size().x + 2.0 * ui.spacing().item_spacing.x;
+                                    ui.spacing_mut().slider_width = (ui.available_width() - right).clamp(40.0, 150.0);
                                     ui.add(egui::Slider::new(&mut self.priority, 0.0..=1.0).show_value(false)).on_hover_text(
                                         "Gauche : le moins de coutures et d'îlots possible.\nDroite : le moins de distorsion possible.\nS'applique immédiatement à ce que le modèle a déjà appris.",
                                     );
@@ -1512,10 +1527,11 @@ impl eframe::App for EasyUvApp {
             self.open_file(p, shift || k > 0);
         }
         // Raccourcis
-        let (u, f, o, s, imp, pk) = ctx.input(|i| {
+        let (u, f, home, o, s, imp, pk) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::U),
-                i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::Home),
                 i.modifiers.command && i.key_pressed(egui::Key::O),
                 i.modifiers.command && i.key_pressed(egui::Key::S),
                 i.modifiers.command && i.key_pressed(egui::Key::I),
@@ -1529,12 +1545,20 @@ impl eframe::App for EasyUvApp {
             if u {
                 self.start_unwrap(ctx);
             }
-            if f {
-                if let Some(s) = &self.scene {
-                    let (lo, hi) = s.model.mesh.bounds();
-                    self.cam.frame(lo, hi);
+            // comme Blender : F cadre la sélection, Origine tout, dans la vue sous le pointeur
+            if f || home {
+                let over_uv = self.pointer_over_uv(ctx);
+                match (&self.scene, over_uv) {
+                    (Some(s), true) => match s.corners_bounds(&s.selected_corners()).filter(|_| f) {
+                        Some((lo, hi)) => self.uv_cam.frame(lo, hi),
+                        None => self.uv_cam = UvCamera::default(),
+                    },
+                    (Some(s), false) => {
+                        let (lo, hi) = if f { s.focus_bounds() } else { s.model.mesh.bounds() };
+                        self.cam.frame(lo, hi);
+                    }
+                    (None, _) => self.uv_cam = UvCamera::default(),
                 }
-                self.uv_cam = UvCamera::default();
             }
         }
         if o {
@@ -1630,7 +1654,15 @@ impl eframe::App for EasyUvApp {
                     if uvview::context_menu_allowed(&self.uv_edit) {
                         resp.context_menu(|ui| self.uv_menu_items(ui, ctx));
                     }
-                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling, &mut self.uv_cache, &self.uv_edit);
+                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling, &mut self.uv_cache, &self.uv_edit, busy);
+                    if busy {
+                        // calcul en cours : l'éditeur est figé (les îlots vont changer)
+                        let p = ui.painter_at(body);
+                        p.rect_filled(body, 4.0, Color32::from_black_alpha(90));
+                        let c = body.center();
+                        ui.put(egui::Rect::from_center_size(c - egui::vec2(0.0, 26.0), egui::vec2(24.0, 24.0)), egui::Spinner::new().size(24.0));
+                        uvview::overlay_text(&p, c + egui::vec2(0.0, 10.0), if self.job_layout { "Rangement des îlots…" } else { "Dépliage en cours…" });
+                    }
                     let title = match self.scene.as_ref().filter(|s| s.uv.is_some()) {
                         Some(s) => format!("Éditeur UV · {:.0} px/m @ {}px", s.density, self.params.texture_size),
                         None => "Éditeur UV".to_string(),
