@@ -10,6 +10,7 @@ pub mod glb;
 pub mod learn;
 pub mod math;
 pub mod mesh;
+pub mod metrics;
 pub mod model;
 pub mod obj;
 pub mod pack;
@@ -108,7 +109,11 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
             forced[e as usize] = true;
         }
     }
+    segment::prof("topologie", t0);
+    let t_seg = Instant::now();
     let (mut charts, cut, shapes) = segment::segment_and_unwrap(mesh, &topo, params, &forced);
+    segment::prof("segmentation", t_seg);
+    let t_pack = Instant::now();
     charts.sort_by_key(|c| c.chart.faces.iter().copied().min().unwrap_or(0));
 
     // Orientation + boîtes
@@ -121,6 +126,7 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
         DensityMode::Target(px) => Some(px / params.texture_size.max(1) as f64),
     };
     let packed = pack::pack(&rects, params.margin, fixed, params.rotate_islands);
+    segment::prof("empaquetage", t_pack);
 
     let mut corner_uv = vec![[0.0f32; 2]; mesh.corners.len()];
     let mut face_chart = vec![u32::MAX; mesh.face_count()];
