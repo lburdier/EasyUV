@@ -177,6 +177,9 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
             done.push(Unwrapped { chart, uv, distortion: q.distortion, flipped: q.flipped });
         }
     }
+    let t_merge = std::time::Instant::now();
+    merge_small_charts(mesh, topo, params, forced_seams, &mut done, &mut cut, &mut owner);
+    prof("fusion", t_merge);
     (done, cut, shapes)
 }
 
@@ -184,6 +187,135 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
 pub(crate) fn prof(what: &str, t: std::time::Instant) {
     if std::env::var_os("EASYUV_PROFILE").is_some() {
         eprintln!("  [profil] {what:<16} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// Fusion des petits îlots avec leur voisin de plus longue frontière commune, tant que
+/// l'îlot fusionné reste un disque bien déplié (ni retournement, ni repli, distorsion tolérée).
+/// Réduit le nombre d'îlots et de coutures sur les maillages très plissés.
+fn merge_small_charts(
+    mesh: &Mesh,
+    topo: &Topology,
+    params: &Params,
+    forced: &[bool],
+    done: &mut Vec<Unwrapped>,
+    cut: &mut [bool],
+    owner: &mut [u32],
+) {
+    if done.len() < 2 {
+        return;
+    }
+    let total_area: f64 = topo.face_areas.iter().sum::<f64>().max(1e-300);
+    for _round in 0..8 {
+        // îlot de chaque face
+        let mut face_chart = vec![usize::MAX; mesh.face_count()];
+        for (ci, c) in done.iter().enumerate() {
+            for &f in &c.chart.faces {
+                face_chart[f as usize] = ci;
+            }
+        }
+        let area: Vec<f64> = done.iter().map(|c| c.chart.faces.iter().map(|&f| topo.face_areas[f as usize]).sum()).collect();
+        // longueur de frontière commune entre îlots (coutures non imposées, arêtes manifold)
+        let mut shared: Vec<std::collections::HashMap<usize, f64>> = vec![Default::default(); done.len()];
+        for (e, ed) in topo.edges.iter().enumerate() {
+            if ed.faces.len() != 2 || forced.get(e).copied().unwrap_or(false) {
+                continue;
+            }
+            let (a, b) = (face_chart[ed.faces[0].face as usize], face_chart[ed.faces[1].face as usize]);
+            if a != b && a != usize::MAX && b != usize::MAX {
+                *shared[a].entry(b).or_insert(0.0) += ed.length;
+                *shared[b].entry(a).or_insert(0.0) += ed.length;
+            }
+        }
+        // petits îlots d'abord ; paires disjointes
+        // seules les miettes (< 1 % de la surface) sont fusionnées : les grands îlots plats (faces de
+        // boîte) restent séparés, ils se rangent mieux ainsi
+        let mut order: Vec<usize> = (0..done.len()).filter(|&c| area[c] < 0.01 * total_area).collect();
+        order.sort_by(|&a, &b| area[a].partial_cmp(&area[b]).unwrap().then(a.cmp(&b)));
+        let mut used = vec![false; done.len()];
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for c in order {
+            if used[c] {
+                continue;
+            }
+            let best = shared[c].iter().filter(|(n, _)| !used[**n]).max_by(|a, b| a.1.partial_cmp(b.1).unwrap().then(b.0.cmp(a.0)));
+            if let Some((&n, _)) = best {
+                used[c] = true;
+                used[n] = true;
+                pairs.push((c, n));
+            }
+        }
+        if pairs.is_empty() {
+            break;
+        }
+        // préparation séquentielle : coutures communes rouvertes, faces réétiquetées
+        struct Trial {
+            c: usize,
+            n: usize,
+            reopened: Vec<usize>,
+            old_tag: u32,
+            chart: Chart,
+        }
+        let mut trials: Vec<Trial> = Vec::new();
+        for &(c, n) in &pairs {
+            let tag_n = owner[done[n].chart.faces[0] as usize];
+            let old_tag = owner[done[c].chart.faces[0] as usize];
+            for &f in &done[c].chart.faces {
+                owner[f as usize] = tag_n;
+            }
+            let mut reopened = Vec::new();
+            for &f in &done[c].chart.faces {
+                for k in mesh.face_range(f as usize) {
+                    let e = topo.corner_edge[k] as usize;
+                    let ed = &topo.edges[e];
+                    if cut[e] && ed.faces.len() == 2 && !forced.get(e).copied().unwrap_or(false) {
+                        let (a, b) = (face_chart[ed.faces[0].face as usize], face_chart[ed.faces[1].face as usize]);
+                        if (a == c && b == n) || (a == n && b == c) {
+                            cut[e] = false;
+                            reopened.push(e);
+                        }
+                    }
+                }
+            }
+            let mut faces = done[n].chart.faces.clone();
+            faces.extend_from_slice(&done[c].chart.faces);
+            let chart = build_chart(mesh, topo, &faces, cut, owner, tag_n);
+            trials.push(Trial { c, n, reopened, old_tag, chart });
+        }
+        let results = parallel_map(&trials, |tr| if tr.chart.is_disk() && !tr.chart.tris.is_empty() { Some(unwrap_one(&tr.chart, params)) } else { None });
+        let mut remove = Vec::new();
+        let mut merged_any = false;
+        for (tr, res) in trials.into_iter().zip(results) {
+            // la fusion ne doit presque pas dégrader la qualité : distorsion fusionnée au plus la
+            // moyenne des deux îlots + une petite marge (plus large pour les miettes, qui coûtent
+            // plus en coutures et en place qu'elles n'apportent)
+            let (ac, an) = (area[tr.c], area[tr.n]);
+            let before = (done[tr.c].distortion * ac + done[tr.n].distortion * an) / (ac + an).max(1e-300);
+            let slack = if ac < 0.005 * total_area { 0.04 } else { 0.01 };
+            let ok = matches!(&res, Some((_, q, ov)) if q.flipped == 0 && *ov <= OVERLAP_TOL
+                && q.distortion <= params.max_distortion && q.distortion <= before + slack);
+            if ok {
+                let (uv, q, _) = res.unwrap();
+                done[tr.n] = Unwrapped { chart: tr.chart, uv, distortion: q.distortion, flipped: q.flipped };
+                remove.push(tr.c);
+                merged_any = true;
+            } else {
+                // échec : on rétablit coutures et étiquettes
+                for e in tr.reopened {
+                    cut[e] = true;
+                }
+                for &f in &done[tr.c].chart.faces {
+                    owner[f as usize] = tr.old_tag;
+                }
+            }
+        }
+        remove.sort_unstable_by(|a, b| b.cmp(a));
+        for c in remove {
+            done.swap_remove(c);
+        }
+        if !merged_any {
+            break;
+        }
     }
 }
 
