@@ -71,7 +71,7 @@ Raccourcis :
 | Touche | Action |
 |---|---|
 | `U` | Déplier |
-| `F` | Cadrer |
+| `F` / `Origine` | Cadrer la sélection / tout (dans la vue sous le pointeur) |
 | Molette / clic + glisser | Orbite |
 | Maj + glisser / clic droit | Déplacer la vue |
 | Molette | Zoom |

@@ -1,5 +1,17 @@
 # Changelog
 
+## [Non publié]
+
+### Dépliage
+- **Objets tournés détectés en Auto** (pots, couvercles, bouteilles, tuyaux biseautés) : EasyUV cherche l'axe que toutes les normales coupent (surface de révolution) et vérifie que le profil a des portions droites (paroi, cône, disque). Ces objets étaient classés « organique » dès que leurs arêtes étaient arrondies ; ils sont maintenant dépliés en bandes droites + couvercles. Sur un pot de crème biseauté : distorsion 0,064 -> 0,007. Les sphères (axe non unique) et les tores (profil entièrement courbe) restent en organique.
+
+### Interface
+- Messages de l'éditeur UV lisibles sur le damier (fond sombre).
+- Pendant un dépliage ou un rangement, l'éditeur UV affiche « Dépliage en cours… » avec un indicateur.
+- **F** cadre la sélection dans la vue sous le pointeur : les îlots sélectionnés dans l'éditeur UV, les objets sélectionnés dans la vue 3D. **Origine** cadre tout.
+- La barre d'état affiche les raccourcis de la vue survolée (éditeur UV ou vue 3D).
+- Le curseur « Priorité » ne déborde plus du panneau.
+
 ## [0.2.0] - 2026-10-21
 
 ### Édition UV et rangement (layout)

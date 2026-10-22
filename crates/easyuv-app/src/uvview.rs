@@ -20,6 +20,23 @@ impl Default for UvCamera {
     }
 }
 
+impl UvCamera {
+    /// Cadre une boîte UV (îlots sélectionnés), avec un peu de marge.
+    pub fn frame(&mut self, lo: [f32; 2], hi: [f32; 2]) {
+        let ext = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-4);
+        self.center = egui::vec2((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5);
+        self.zoom = (0.88 / ext).clamp(0.05, 200.0);
+    }
+}
+
+/// Message posé sur l'éditeur, sur un fond sombre pour rester lisible au-dessus du damier.
+pub fn overlay_text(painter: &egui::Painter, pos: Pos2, text: &str) {
+    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), theme::TEXT);
+    let bg = Rect::from_center_size(pos, galley.size() + egui::vec2(20.0, 10.0));
+    painter.rect_filled(bg, 6.0, Color32::from_black_alpha(190));
+    painter.galley(pos - galley.size() * 0.5, galley, theme::TEXT);
+}
+
 /// Conversion écran <-> UV pour une zone et une caméra.
 #[derive(Clone, Copy)]
 struct View {
@@ -292,7 +309,7 @@ pub fn context_menu_allowed(ed: &UvEditor) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera, shading: Shading, tex: TextureId, tiling: f32, cache: &mut UvCache, ed: &UvEditor) {
+pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera, shading: Shading, tex: TextureId, tiling: f32, cache: &mut UvCache, ed: &UvEditor, busy: bool) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, theme::BG_UV);
     let view = View::new(rect, cam);
@@ -312,11 +329,14 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
     }
 
     let Some(scene) = scene else {
-        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Aucun objet", egui::FontId::proportional(14.0), theme::TEXT_DIM);
+        overlay_text(&painter, rect.center(), "Aucun objet — Fichier > Ouvrir (Ctrl+O) ou glisser un fichier");
         return;
     };
     let Some(uv) = &scene.uv else {
-        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Pas encore d'UV — appuyez sur U", egui::FontId::proportional(14.0), theme::TEXT_DIM);
+        // pendant le premier dépliage, l'application affiche sa propre progression
+        if !busy {
+            overlay_text(&painter, rect.center(), "Pas encore d'UV — appuyez sur U");
+        }
         return;
     };
     // Les maillages de l'éditeur ne sont reconstruits que si la vue ou les UV changent :
