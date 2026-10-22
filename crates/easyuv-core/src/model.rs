@@ -81,6 +81,37 @@ impl Model {
             *p = *p + d;
         }
     }
+
+    /// Fait pivoter un objet d'un quart de tour autour de l'axe `axis` (0 = X, 1 = Y, 2 = Z),
+    /// sens direct si `positive`, autour du centre de sa boîte. Son point le plus bas reste à
+    /// la même hauteur (l'objet reste posé). Sert à redresser un import couché.
+    pub fn rotate_object_quarter(&mut self, i: usize, axis: usize, positive: bool) {
+        let o = &self.objects[i];
+        let ps = &mut self.mesh.positions[o.vert_start..o.vert_end];
+        if ps.is_empty() {
+            return;
+        }
+        let bounds = |ps: &[V3]| {
+            ps.iter().fold((V3::new(f64::MAX, f64::MAX, f64::MAX), V3::new(f64::MIN, f64::MIN, f64::MIN)), |(lo, hi), p| {
+                (V3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)), V3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)))
+            })
+        };
+        let (lo, hi) = bounds(ps);
+        let c = (lo + hi) * 0.5;
+        let s = if positive { 1.0 } else { -1.0 };
+        for p in ps.iter_mut() {
+            let d = *p - c;
+            let r = match axis {
+                0 => V3::new(d.x, -s * d.z, s * d.y),
+                1 => V3::new(s * d.z, d.y, -s * d.x),
+                _ => V3::new(-s * d.y, s * d.x, d.z),
+            };
+            *p = c + r;
+        }
+        let (lo2, _) = bounds(ps);
+        let dz = lo.z - lo2.z;
+        ps.iter_mut().for_each(|p| p.z += dz);
+    }
 }
 
 /// Dépliage d'une scène. `together` : tous les îlots partagent la même tuile 0-1
@@ -89,6 +120,20 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
     if together || model.objects.len() <= 1 {
         return smart_unwrap(&model.mesh, params, &[]);
     }
+    per_object(model, |_, sub| smart_unwrap(sub, params, &[]))
+}
+
+/// Rangement seul (sans redéplier) des UV existantes `corner_uv` d'une scène, ensemble ou
+/// objet par objet comme [`unwrap_model`].
+pub fn pack_model(model: &Model, corner_uv: &[[f32; 2]], params: &Params, together: bool, equalize: bool) -> UvResult {
+    if together || model.objects.len() <= 1 {
+        return crate::layout::pack_existing(&model.mesh, corner_uv, params, equalize);
+    }
+    per_object(model, |i, sub| crate::layout::pack_existing(sub, &corner_uv[model.corner_range(i)], params, equalize))
+}
+
+/// Applique `run` à chaque objet séparément (chacun sa tuile) et assemble les résultats.
+fn per_object(model: &Model, run: impl Fn(usize, &Mesh) -> UvResult) -> UvResult {
     let t0 = std::time::Instant::now();
     let mut out = UvResult {
         corner_uv: vec![[0.0; 2]; model.mesh.corners.len()],
@@ -104,7 +149,7 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
         if sub.face_count() == 0 {
             continue;
         }
-        let r = smart_unwrap(&sub, params, &[]);
+        let r = run(i, &sub);
         let cr = model.corner_range(i);
         out.corner_uv[cr].copy_from_slice(&r.corner_uv);
         for (k, &c) in r.face_chart.iter().enumerate() {

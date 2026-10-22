@@ -1,6 +1,7 @@
 //! Lecture / écriture Wavefront OBJ multi-objets (polygones conservés).
-//! Convention du fichier : Y vers le haut (standard OBJ, export Blender par défaut) ;
-//! en mémoire : Z vers le haut, comme Blender.
+//! Convention du fichier : Y vers le haut (standard OBJ, export Blender par défaut), sauf si
+//! la géométrie montre clairement un fichier Z vers le haut ; en mémoire : Z vers le haut,
+//! comme Blender.
 
 use crate::math::V3;
 use crate::mesh::Mesh;
@@ -13,6 +14,28 @@ fn from_y_up(x: f64, y: f64, z: f64) -> V3 {
 }
 fn to_y_up(p: V3) -> (f64, f64, f64) {
     (p.x, p.z, -p.y)
+}
+
+/// L'OBJ ne déclare pas son axe vertical. Les objets posés au sol ont leur point le plus bas
+/// à hauteur 0 : si c'est le cas en Z mais pas en Y, le fichier est en Z vers le haut
+/// (export de Blender avec « Up : Z », 3ds Max, ZBrush…).
+fn looks_z_up(raw: &[V3]) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in raw {
+        for (k, v) in [p.x, p.y, p.z].into_iter().enumerate() {
+            lo[k] = lo[k].min(v);
+            hi[k] = hi[k].max(v);
+        }
+    }
+    let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max);
+    if ext <= 0.0 {
+        return false;
+    }
+    let on_floor = |k: usize| lo[k].abs() <= 0.01 * ext && hi[k] - lo[k] > 0.05 * ext;
+    on_floor(2) && !on_floor(1)
 }
 
 /// Lit un OBJ ; chaque `o` (ou à défaut `g`) devient un objet.
@@ -30,7 +53,7 @@ pub fn parse_obj_model(text: &str, default_name: &str) -> Result<Model, String> 
                 if c.len() < 3 {
                     return Err(format!("ligne {}: sommet incomplet", ln + 1));
                 }
-                positions.push(from_y_up(c[0], c[1], c[2]));
+                positions.push(V3::new(c[0], c[1], c[2]));
             }
             Some(tag @ ("o" | "g")) if (tag == "o") == has_o => {
                 let name = it.collect::<Vec<_>>().join(" ");
@@ -58,6 +81,12 @@ pub fn parse_obj_model(text: &str, default_name: &str) -> Result<Model, String> 
                 }
             }
             _ => {}
+        }
+    }
+    let z_up = looks_z_up(&positions);
+    for p in positions.iter_mut() {
+        if !z_up {
+            *p = from_y_up(p.x, p.y, p.z);
         }
     }
     let mut model = Model::new();

@@ -2,7 +2,7 @@ use crate::io;
 use crate::scene::Scene;
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
-use crate::uvview::{self, UvCache, UvCamera};
+use crate::uvview::{self, UvCache, UvCamera, UvEditor, UvEvent};
 use crate::raster::Mips;
 use crate::viewport::{self, Camera, RenderCache, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
@@ -70,6 +70,13 @@ pub struct EasyUvApp {
     job: Option<Receiver<(UvResult, Option<LearnInfo>)>>,
     /// Objets visés par le dépliage en cours.
     job_targets: Vec<usize>,
+    /// Le calcul en cours est un rangement (layout) et non un dépliage.
+    job_layout: bool,
+    /// Rangement : remettre tous les îlots à la même densité de texels.
+    pack_equalize: bool,
+    uv_edit: UvEditor,
+    /// Zone de l'éditeur UV (image précédente) : les raccourcis y visent les îlots.
+    uv_rect: Option<egui::Rect>,
     learner: Arc<Mutex<Learner>>,
     auto_learn: bool,
     trials: usize,
@@ -114,6 +121,10 @@ impl EasyUvApp {
             workspace: Workspace::Layout,
             job: None,
             job_targets: Vec::new(),
+            job_layout: false,
+            pack_equalize: true,
+            uv_edit: UvEditor::default(),
+            uv_rect: None,
             learner: Arc::new(Mutex::new(Learner::load(&learn::default_path()))),
             auto_learn: true,
             trials: 6,
@@ -239,6 +250,56 @@ impl EasyUvApp {
         self.status = if all { "Dépliage de tous les objets…".into() } else { format!("Dépliage de {n_targets} objet(s) sélectionné(s)…") };
     }
 
+    /// Mode rangement : range les UV existantes sans redéplier. Les îlots sélectionnés dans
+    /// l'éditeur UV s'il y en a, sinon tous les îlots des objets visés.
+    fn start_layout(&mut self, ctx: &egui::Context) {
+        let Some(scene) = &self.scene else { return };
+        if self.job.is_some() {
+            return;
+        }
+        if scene.uv.is_none() {
+            self.status = "Aucune UV à ranger : dépliez d'abord (U)".into();
+            return;
+        }
+        let params = self.effective_params();
+        let together = self.pack_together;
+        let equalize = self.pack_equalize;
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        if scene.has_island_selection() {
+            let mesh = scene.model.mesh.clone();
+            let uv = scene.uv.clone().unwrap();
+            let face_island = scene.face_island.clone();
+            let which = scene.island_selected.clone();
+            let n = which.iter().filter(|&&w| w).count();
+            self.job_targets = (0..scene.len()).collect();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                let mut uv = uv;
+                let rep = easyuv::layout::layout_islands(&mesh, &mut uv.corner_uv, &face_island, Some(&which), &params, equalize);
+                uv.stats = easyuv::Stats { charts: rep.islands, coverage: rep.coverage, overflow: rep.overflow, time_ms: t0.elapsed().as_secs_f64() * 1000.0, ..Default::default() };
+                let _ = tx.send((uv, None));
+                ctx2.request_repaint();
+            });
+            self.status = format!("Rangement de {n} îlot(s) sélectionné(s)…");
+        } else {
+            let targets = scene.unwrap_targets();
+            let model = scene.sub_model(&targets);
+            let full = &scene.uv.as_ref().unwrap().corner_uv;
+            let sub_uv: Vec<[f32; 2]> = targets.iter().flat_map(|&i| full[scene.model.corner_range(i)].iter().copied()).collect();
+            let all = targets.len() == scene.len();
+            self.status = if all { "Rangement de tous les îlots…".into() } else { format!("Rangement des îlots de {} objet(s)…", targets.len()) };
+            self.job_targets = targets;
+            std::thread::spawn(move || {
+                let r = easyuv::model::pack_model(&model, &sub_uv, &params, together, equalize);
+                let _ = tx.send((r, None));
+                ctx2.request_repaint();
+            });
+        }
+        self.job_layout = true;
+        self.job = Some(rx);
+    }
+
     fn poll_job(&mut self) {
         let Some(rx) = &self.job else { return };
         if let Ok((r, info)) = rx.try_recv() {
@@ -248,16 +309,28 @@ impl EasyUvApp {
                 self.params.max_distortion = i.params.max_distortion;
                 self.params.relax_iterations = i.params.relax_iterations;
             }
-            self.last_learn = info;
+            if !self.job_layout {
+                self.last_learn = info;
+            }
             let s = &r.stats;
-            self.status = format!(
+            self.status = if self.job_layout {
+                format!(
+                    "Rangement : {} îlots, couverture {:.1} %, {:.0} ms{}",
+                    s.charts,
+                    s.coverage * 100.0,
+                    s.time_ms,
+                    if s.overflow { " — la densité cible dépasse la tuile 0-1 (UDIM)" } else { "" }
+                )
+            } else {
+                format!(
                 "Dépliage : {} îlots, {} coutures, distorsion {:.3}, {:.0} ms{}",
                 s.charts,
                 s.seams,
                 s.mean_distortion,
                 s.time_ms,
-                if s.overflow { " — ATTENTION : la densité cible dépasse la tuile 0-1" } else { "" }
-            );
+                    if s.overflow { " — ATTENTION : la densité cible dépasse la tuile 0-1" } else { "" }
+                )
+            };
             // la scène a pu changer pendant le calcul (objet supprimé, ajouté…)
             let targets = std::mem::take(&mut self.job_targets);
             let fits = self.scene.as_ref().is_some_and(|s| s.fits_partial(&targets, &r));
@@ -265,16 +338,23 @@ impl EasyUvApp {
                 self.snapshot();
                 let ts = self.params.texture_size;
                 if let Some(scene) = &mut self.scene {
+                    // la sélection d'îlots survit au rangement (mêmes îlots, autre place)
+                    let sel = std::mem::take(&mut scene.island_selected);
                     if targets.len() == scene.len() {
                         scene.set_uv(r, ts);
                     } else {
                         scene.merge_partial_uv(&targets, r, ts);
+                    }
+                    if self.job_layout && sel.len() == scene.island_selected.len() {
+                        scene.island_selected = sel;
+                        scene.touch();
                     }
                 }
             } else {
                 self.status = "La scène a changé pendant le dépliage : résultat ignoré, relancez U".into();
             }
             self.job = None;
+            self.job_layout = false;
         }
     }
 
@@ -603,11 +683,120 @@ impl EasyUvApp {
             ui.close();
             self.frame_selection();
         }
+        ui.menu_button("Pivoter de 90° (redresser)", |ui| {
+            for (label, axis, pos) in [("X +90°", 0, true), ("X −90°", 0, false), ("Y +90°", 1, true), ("Y −90°", 1, false), ("Z +90°", 2, true), ("Z −90°", 2, false)] {
+                if ui.button(label).clicked() {
+                    ui.close();
+                    self.rotate_objects(axis, pos);
+                }
+            }
+        });
         ui.separator();
         if item(ui, has_sel, "Supprimer", "X / Suppr") {
             ui.close();
             self.delete_selected();
         }
+    }
+
+    fn rotate_objects(&mut self, axis: usize, positive: bool) {
+        if self.scene.is_none() {
+            return;
+        }
+        self.snapshot();
+        let n = self.scene.as_mut().unwrap().rotate_objects_quarter(axis, positive);
+        self.render.invalidate();
+        self.status = format!("{n} objet(s) pivoté(s) de 90° — Ctrl+Z pour annuler");
+    }
+
+    /// Opérations UV communes au menu UV et au clic droit de l'éditeur UV.
+    fn uv_menu_items(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let has_uv = self.scene.as_ref().is_some_and(|s| s.uv.is_some());
+        let has_isl = self.scene.as_ref().is_some_and(|s| s.has_island_selection());
+        let item = |ui: &mut egui::Ui, enabled: bool, label: &str, key: &str| ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(key)).clicked();
+        if item(ui, self.scene.is_some(), "Dépliage intelligent", "U") {
+            ui.close();
+            self.start_unwrap(ctx);
+        }
+        if item(ui, has_uv, if has_isl { "Ranger les îlots sélectionnés" } else { "Ranger les îlots (layout)" }, "Ctrl+P") {
+            ui.close();
+            self.start_layout(ctx);
+        }
+        if item(ui, has_uv, "Appliquer la densité cible", "") {
+            ui.close();
+            self.apply_density();
+        }
+        ui.separator();
+        if item(ui, has_uv, "Tout sélectionner (îlots)", "A") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.select_all_islands(true);
+            }
+        }
+        if item(ui, has_isl, "Tout désélectionner", "Alt+A") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.select_all_islands(false);
+            }
+        }
+        if item(ui, has_uv, "Inverser la sélection", "Ctrl+I") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                s.invert_islands();
+            }
+        }
+        ui.separator();
+        let ops: [(&str, fn([f32; 2]) -> [f32; 2]); 4] = [
+            ("Pivoter de 90° (gauche)", |p| [-p[1], p[0]]),
+            ("Pivoter de 90° (droite)", |p| [p[1], -p[0]]),
+            ("Miroir horizontal", |p| [-p[0], p[1]]),
+            ("Miroir vertical", |p| [p[0], -p[1]]),
+        ];
+        for (label, f) in ops {
+            if item(ui, has_isl, label, "") {
+                ui.close();
+                self.island_op(|s, ts| s.per_island(f, ts), label);
+            }
+        }
+        if item(ui, has_isl, "Rendre droit (bandes de quads)", "Maj+W") {
+            ui.close();
+            self.straighten_strips();
+        }
+        if item(ui, has_isl, "Aligner sur les axes", "") {
+            ui.close();
+            self.island_op(|s, ts| s.straighten_islands(ts), "Aligner");
+        }
+        ui.separator();
+        ui.label(RichText::new("Déplacer G · Pivoter R · Échelle S · X / Y : axe").small().color(theme::TEXT_DIM));
+    }
+
+    /// Rend droites les bandes courbes sélectionnées (grille de quads régulière).
+    fn straighten_strips(&mut self) {
+        if !self.scene.as_ref().is_some_and(|s| s.has_island_selection()) {
+            self.status = "Sélectionnez d'abord les îlots à rendre droits".into();
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        let (done, skipped) = self.scene.as_mut().unwrap().straighten_strips(ts);
+        if done == 0 {
+            self.undo.pop();
+        }
+        self.status = match (done, skipped) {
+            (0, _) => "Rien à rendre droit : il faut des îlots faits de quads en grille (bandes, anneaux ouverts)".into(),
+            (d, 0) => format!("{d} îlot(s) rendu(s) droit(s) — Ctrl+P pour ranger"),
+            (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) (pas une grille de quads)"),
+        };
+    }
+
+    /// Opération sur les îlots sélectionnés, annulable.
+    fn island_op(&mut self, op: impl FnOnce(&mut Scene, u32) -> usize, label: &str) {
+        if !self.scene.as_ref().is_some_and(|s| s.has_island_selection()) {
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        let n = op(self.scene.as_mut().unwrap(), ts);
+        self.status = format!("{label} : {n} îlot(s)");
     }
 
     /// Raccourcis clavier de type Blender (ignorés pendant la saisie de texte).
@@ -632,6 +821,9 @@ impl EasyUvApp {
                 i.pointer.hover_pos(),
             )
         });
+        if self.uv_edit.busy() {
+            return;
+        }
         if cmd && k_z && !shift {
             self.undo();
         } else if (cmd && k_z && shift) || (cmd && k_y) {
@@ -643,6 +835,10 @@ impl EasyUvApp {
             }
         }
         if cmd {
+            return;
+        }
+        // au-dessus de l'éditeur UV, les touches visent les îlots (comme dans Blender)
+        if self.uv_edit.busy() || pointer.zip(self.uv_rect).is_some_and(|(p, r)| r.contains(p)) {
             return;
         }
         if k_a {
@@ -749,14 +945,7 @@ impl EasyUvApp {
                         self.object_menu_items(ui);
                     });
                     ui.menu_button("UV", |ui| {
-                        if ui.button("Dépliage intelligent   U").clicked() {
-                            ui.close();
-                            self.start_unwrap(ctx);
-                        }
-                        if ui.button("Appliquer la densité cible").clicked() {
-                            ui.close();
-                            self.apply_density();
-                        }
+                        self.uv_menu_items(ui, ctx);
                     });
                     ui.menu_button("Aide", |ui| {
                         if ui.button("Vérifier les mises à jour").clicked() {
@@ -1041,6 +1230,62 @@ impl EasyUvApp {
                         }
                     });
 
+                    section(ui, "Rangement (layout)", true, |ui| {
+                        ui.label(
+                            RichText::new("Range les UV actuelles dans la tuile sans redéplier : après une retouche, ou pour réunir des objets dépliés séparément.")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        egui::Grid::new("layout").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            ui.label("Égaliser la densité");
+                            ui.checkbox(&mut self.pack_equalize, "").on_hover_text(
+                                "Coché : chaque îlot reprend la même densité de texels (taille réelle).\nDécoché : les tailles relatives actuelles sont conservées (îlots agrandis à la main).",
+                            );
+                            ui.end_row();
+                            ui.label("Pivoter les îlots");
+                            ui.checkbox(&mut self.params.rotate_islands, "").on_hover_text("Autorise les rotations pour mieux remplir la tuile.");
+                            ui.end_row();
+                            ui.label("Marge");
+                            ui.add(egui::Slider::new(&mut self.params.margin, 0.0..=0.05).fixed_decimals(3));
+                            ui.end_row();
+                            ui.label("Ranger ensemble");
+                            ui.checkbox(&mut self.pack_together, "").on_hover_text("Coché : une tuile commune.\nDécoché : une tuile par objet.");
+                            ui.end_row();
+                        });
+                        ui.add_space(4.0);
+                        let (has_uv, n_isl, n_obj) = self.scene.as_ref().map_or((false, 0, 0), |s| (s.uv.is_some(), s.island_selected.iter().filter(|&&x| x).count(), s.selection().len()));
+                        let label = if n_isl > 0 {
+                            format!("Ranger les îlots sélectionnés ({n_isl})  (Ctrl+P)")
+                        } else if n_obj > 0 {
+                            format!("Ranger la sélection ({n_obj})  (Ctrl+P)")
+                        } else {
+                            "Ranger tout  (Ctrl+P)".to_string()
+                        };
+                        ui.add_enabled_ui(has_uv && self.job.is_none(), |ui| {
+                            if primary_button(ui, &label).clicked() {
+                                self.start_layout(ui.ctx());
+                            }
+                        });
+                        ui.add_enabled_ui(n_isl > 0, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Rendre droit").on_hover_text("Bande courbe -> rectangle droit (quads en grille). Maj+W").clicked() {
+                                    self.straighten_strips();
+                                }
+                                if ui.button("Aligner").on_hover_text("Pivote chaque îlot sur sa boîte minimale").clicked() {
+                                    self.island_op(|s, ts| s.straighten_islands(ts), "Aligner");
+                                }
+                                if ui.button("Miroir").clicked() {
+                                    self.island_op(|s, ts| s.per_island(|p| [-p[0], p[1]], ts), "Miroir");
+                                }
+                            });
+                        });
+                        ui.label(
+                            RichText::new("Éditeur UV : clic / Maj+clic / rectangle pour choisir des îlots, glisser pour déplacer, G R S, X / Y pour l'axe, clic droit : menu.")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+
                     section(ui, "Densité de texels", true, |ui| {
                         egui::Grid::new("td").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                             ui.label("Texture");
@@ -1267,16 +1512,20 @@ impl eframe::App for EasyUvApp {
             self.open_file(p, shift || k > 0);
         }
         // Raccourcis
-        let (u, f, o, s, imp) = ctx.input(|i| {
+        let (u, f, o, s, imp, pk) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::U),
                 i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::Home),
                 i.modifiers.command && i.key_pressed(egui::Key::O),
                 i.modifiers.command && i.key_pressed(egui::Key::S),
                 i.modifiers.command && i.key_pressed(egui::Key::I),
+                i.modifiers.command && i.key_pressed(egui::Key::P),
             )
         });
-        if !ctx.egui_wants_keyboard_input() {
+        if pk && !ctx.egui_wants_keyboard_input() {
+            self.start_layout(ctx);
+        }
+        if !ctx.egui_wants_keyboard_input() && !self.uv_edit.busy() {
             if u {
                 self.start_unwrap(ctx);
             }
@@ -1345,11 +1594,43 @@ impl eframe::App for EasyUvApp {
                     viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, &self.mips, &mut self.render);
                     Self::editor_header(ui, r, "Vue 3D · Perspective", &mut self.view, true);
                 }
+                if ruv.is_none() {
+                    self.uv_rect = None;
+                }
                 if let Some(r) = ruv {
                     let body = egui::Rect::from_min_max(r.min + egui::vec2(0.0, 26.0), r.max);
                     let resp = ui.interact(body, ui.scope_id().with("uv2d"), egui::Sense::click_and_drag());
-                    uvview::handle_input(ui, &resp, &mut self.uv_cam, body);
-                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling, &mut self.uv_cache);
+                    self.uv_rect = Some(body);
+                    let busy = self.job.is_some();
+                    let ev = uvview::interact(ui, &resp, &mut self.uv_cam, body, if busy { None } else { self.scene.as_mut() }, &mut self.uv_edit);
+                    match ev {
+                        Some(UvEvent::Commit(orig)) => {
+                            // historique : l'état d'avant la transformation
+                            if let Some(s) = &self.scene {
+                                let mut prev = s.clone();
+                                if let Some(u) = &mut prev.uv {
+                                    u.corner_uv = orig;
+                                }
+                                self.undo.push(prev);
+                                if self.undo.len() > UNDO_LEVELS {
+                                    self.undo.remove(0);
+                                }
+                                self.redo.clear();
+                            }
+                            let ts = self.params.texture_size;
+                            if let Some(s) = &mut self.scene {
+                                s.refresh(ts);
+                            }
+                            self.status = "Transformation appliquée — Ctrl+Z pour annuler".into();
+                        }
+                        Some(UvEvent::Status(t)) => self.status = t,
+                        Some(UvEvent::Straighten) => self.straighten_strips(),
+                        None => {}
+                    }
+                    if uvview::context_menu_allowed(&self.uv_edit) {
+                        resp.context_menu(|ui| self.uv_menu_items(ui, ctx));
+                    }
+                    uvview::draw(ui, body, self.scene.as_ref(), &self.uv_cam, self.view.shading, tex, self.view.tiling, &mut self.uv_cache, &self.uv_edit);
                     let title = match self.scene.as_ref().filter(|s| s.uv.is_some()) {
                         Some(s) => format!("Éditeur UV · {:.0} px/m @ {}px", s.density, self.params.texture_size),
                         None => "Éditeur UV".to_string(),

@@ -74,6 +74,11 @@ pub fn orient_min_box(uv: &mut [V2]) -> (f64, f64) {
     (w, h)
 }
 
+/// Ramène l'îlot à l'origine sans le tourner. Retourne (largeur, hauteur).
+pub fn to_origin(uv: &mut [V2]) -> (f64, f64) {
+    bounds_to_origin(uv)
+}
+
 fn bounds_to_origin(uv: &mut [V2]) -> (f64, f64) {
     let (mut lo, mut hi) = (V2::new(f64::MAX, f64::MAX), V2::new(f64::MIN, f64::MIN));
     for p in uv.iter() {

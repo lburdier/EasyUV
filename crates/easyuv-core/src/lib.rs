@@ -7,6 +7,7 @@ pub mod chart;
 pub mod checker;
 pub mod ffi;
 pub mod glb;
+pub mod layout;
 pub mod learn;
 pub mod math;
 pub mod mesh;
@@ -120,59 +121,10 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
     let t_pack = Instant::now();
     charts.sort_by_key(|c| c.chart.faces.iter().copied().min().unwrap_or(0));
 
-    // Orientation + boîtes
-    let mut rects = Vec::with_capacity(charts.len());
-    for c in charts.iter_mut() {
-        rects.push(pack::orient_min_box(&mut c.uv));
-    }
-    let fixed = match params.density {
-        DensityMode::Fit => None,
-        DensityMode::Target(px) => Some(px / params.texture_size.max(1) as f64),
-    };
-    // Empaquetage par forme ; à défaut (cas extrêmes), par boîtes englobantes.
-    let islands: Vec<shapepack::Island> = charts.iter().map(|c| shapepack::Island { uv: &c.uv, tris: &c.chart.tris }).collect();
-    // résolution adaptée au nombre d'îlots (coût de la recherche)
-    let res = std::env::var("EASYUV_PACK_RES").ok().and_then(|v| v.parse().ok()).unwrap_or(if charts.len() <= 64 {
-        1024
-    } else if charts.len() <= 200 {
-        768
-    } else {
-        PACK_RES
-    });
-    // Deux méthodes : boîtes (skyline, rapide) puis formes, gardée seulement si elle fait mieux.
-    // En densité cible, la méthode par formes est utilisée pour passer en UDIM sans chevauchement.
-    let packed = pack::pack(&rects, params.margin, fixed, params.rotate_islands);
-    let shape = if fixed.is_some() && !packed.overflow {
-        None
-    } else {
-        let floor = if fixed.is_some() { 0.0 } else { packed.scale };
-        shapepack::pack_shapes(&islands, params.margin, fixed, params.rotate_islands, res, floor)
-    };
-    drop(islands);
-    let (placed, pack_scale, overflow): (Vec<Vec<V2>>, f64, bool) = match shape {
-        Some(sp) => (
-            charts.iter().zip(&sp.xforms).map(|(c, xf)| c.uv.iter().map(|&p| xf.apply(p, sp.scale)).collect()).collect(),
-            sp.scale,
-            sp.tiles > 1,
-        ),
-        None => {
-            let uvs = charts
-                .iter()
-                .enumerate()
-                .map(|(ci, c)| {
-                    let pl = packed.placements[ci];
-                    let (_, h) = rects[ci];
-                    c.uv.iter()
-                        .map(|&p| {
-                            let q = if pl.rotated { V2::new(h - p.y, p.x) } else { p };
-                            (q + V2::new(pl.x, pl.y)) * packed.scale
-                        })
-                        .collect()
-                })
-                .collect();
-            (uvs, packed.scale, packed.overflow)
-        }
-    };
+    let mut uvs: Vec<Vec<V2>> = charts.iter_mut().map(|c| std::mem::take(&mut c.uv)).collect();
+    let tri_refs: Vec<&[[u32; 3]]> = charts.iter().map(|c| c.chart.tris.as_slice()).collect();
+    let (placed, pack_scale, overflow) = place_islands(&mut uvs, &tri_refs, params, true);
+    drop(tri_refs);
     segment::prof("empaquetage", t_pack);
 
     let mut corner_uv = vec![[0.0f32; 2]; mesh.corners.len()];
@@ -230,6 +182,59 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
     }
     stats.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
     UvResult { corner_uv, face_chart, seams, stats }
+}
+
+/// Range des îlots (UV en unités monde) dans la tuile 0-1 : orientation (si `orient`), puis
+/// empaquetage par boîtes et par formes, la meilleure des deux. Retourne les UV placées,
+/// l'échelle monde -> UV et le débordement (UDIM).
+pub(crate) fn place_islands(uvs: &mut [Vec<V2>], tris: &[&[[u32; 3]]], params: &Params, orient: bool) -> (Vec<Vec<V2>>, f64, bool) {
+    // Orientation + boîtes
+    let rects: Vec<(f64, f64)> = uvs.iter_mut().map(|uv| if orient { pack::orient_min_box(uv) } else { pack::to_origin(uv) }).collect();
+    let fixed = match params.density {
+        DensityMode::Fit => None,
+        DensityMode::Target(px) => Some(px / params.texture_size.max(1) as f64),
+    };
+    // Empaquetage par forme ; à défaut (cas extrêmes), par boîtes englobantes.
+    let islands: Vec<shapepack::Island> = uvs.iter().zip(tris).map(|(uv, t)| shapepack::Island { uv, tris: t }).collect();
+    // résolution adaptée au nombre d'îlots (coût de la recherche)
+    let n = uvs.len();
+    let res = std::env::var("EASYUV_PACK_RES").ok().and_then(|v| v.parse().ok()).unwrap_or(if n <= 64 {
+        1024
+    } else if n <= 200 {
+        768
+    } else {
+        PACK_RES
+    });
+    // Deux méthodes : boîtes (skyline, rapide) puis formes, gardée seulement si elle fait mieux.
+    // En densité cible, la méthode par formes est utilisée pour passer en UDIM sans chevauchement.
+    let packed = pack::pack(&rects, params.margin, fixed, params.rotate_islands);
+    let shape = if fixed.is_some() && !packed.overflow {
+        None
+    } else {
+        let floor = if fixed.is_some() { 0.0 } else { packed.scale };
+        shapepack::pack_shapes(&islands, params.margin, fixed, params.rotate_islands, res, floor)
+    };
+    drop(islands);
+    match shape {
+        Some(sp) => (uvs.iter().zip(&sp.xforms).map(|(uv, xf)| uv.iter().map(|&p| xf.apply(p, sp.scale)).collect()).collect(), sp.scale, sp.tiles > 1),
+        None => {
+            let placed = uvs
+                .iter()
+                .enumerate()
+                .map(|(ci, uv)| {
+                    let pl = packed.placements[ci];
+                    let (_, h) = rects[ci];
+                    uv.iter()
+                        .map(|&p| {
+                            let q = if pl.rotated { V2::new(h - p.y, p.x) } else { p };
+                            (q + V2::new(pl.x, pl.y)) * packed.scale
+                        })
+                        .collect()
+                })
+                .collect();
+            (placed, packed.scale, packed.overflow)
+        }
+    }
 }
 
 /// Densité de texels moyenne (px / unité monde) d'UV existantes.
@@ -360,6 +365,19 @@ mod tests {
         let glb = glb::write_glb(&m, Some(&r.corner_uv));
         assert_eq!(&glb[0..4], b"glTF");
         assert_eq!(u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize, glb.len());
+    }
+
+    #[test]
+    fn obj_z_up_detected() {
+        // pot posé au sol, écrit en Z vers le haut (hauteur 0..2 en z) : doit rester debout
+        let txt = "o Pot\nv -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nv -1 -1 2\nv 1 -1 2\nv 1 1 2\nv -1 1 2\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
+        let m = obj::parse_obj_model(txt, "x").unwrap();
+        let (lo, hi) = m.mesh.bounds();
+        assert!((lo.z - 0.0).abs() < 1e-9 && (hi.z - 2.0).abs() < 1e-9, "{lo:?} {hi:?}");
+        // le même pot en Y vers le haut (standard OBJ)
+        let txt_y = "o Pot\nv -1 0 -1\nv 1 0 -1\nv 1 0 1\nv -1 0 1\nv -1 2 -1\nv 1 2 -1\nv 1 2 1\nv -1 2 1\nf 1 2 6 5\nf 2 3 7 6\nf 3 4 8 7\nf 4 1 5 8\n";
+        let (lo, hi) = obj::parse_obj_model(txt_y, "x").unwrap().mesh.bounds();
+        assert!((lo.z - 0.0).abs() < 1e-9 && (hi.z - 2.0).abs() < 1e-9, "{lo:?} {hi:?}");
     }
 
     #[test]

@@ -197,6 +197,7 @@ fn rasterize(isl: &Island, rot: u8, k: f64, dil: usize) -> Mask {
 }
 
 /// Carte d'occupation `n`×`n` en bitsets.
+#[derive(Clone)]
 struct Board {
     n: usize,
     words: usize,
@@ -286,6 +287,31 @@ impl Board {
         }
     }
 
+    /// Tamponne un masque à une position quelconque (obstacle), en ignorant ce qui sort.
+    fn stamp_clipped(&mut self, m: &Mask, x0: i64, y0: i64) {
+        let n = self.n as i64;
+        for r in 0..m.h {
+            let y = y0 + r as i64;
+            if y < 0 || y >= n {
+                continue;
+            }
+            for c in 0..m.w {
+                if m.stamp[r * m.words + c / 64] >> (c % 64) & 1 == 0 {
+                    continue;
+                }
+                let x = x0 + c as i64;
+                if x >= 0 && x < n {
+                    self.rows[y as usize * self.words + x as usize / 64] |= 1u64 << (x as usize % 64);
+                }
+            }
+            self.update_runs(y as usize);
+        }
+        self.first_free = 0;
+        while self.first_free < self.n && (0..self.words).all(|k| self.rows[self.first_free * self.words + k] == !0u64) {
+            self.first_free += 1;
+        }
+    }
+
     /// Position la plus basse puis la plus à gauche où le masque tient.
     fn find(&self, m: &Mask) -> Option<(usize, usize)> {
         if m.w > self.n || m.h > self.n {
@@ -306,10 +332,11 @@ impl Board {
 
 /// Une tentative à l'échelle `s` (UV par unité monde). Retourne les placements, ou None
 /// si un îlot ne tient pas et que `udim` est faux.
-fn attempt(islands: &[Island], order: &[usize], s: f64, res: usize, margin: f64, rotations: u8, udim: bool) -> Option<(Vec<Xform>, usize)> {
+#[allow(clippy::too_many_arguments)]
+fn attempt(islands: &[Island], order: &[usize], s: f64, res: usize, margin: f64, rotations: u8, udim: bool, start: Option<&Board>) -> Option<(Vec<Xform>, usize)> {
     let k = s * res as f64;
     let dil = (margin * res as f64).ceil() as usize;
-    let mut boards = vec![Board::new(res)];
+    let mut boards = vec![start.cloned().unwrap_or_else(|| Board::new(res))];
     let mut out = vec![Xform::default(); islands.len()];
     for &i in order {
         let masks: Vec<Mask> = (0..rotations).map(|r| rasterize(&islands[i], r, k, dil)).collect();
@@ -380,7 +407,7 @@ pub fn pack_shapes(islands: &[Island], margin: f64, fixed_scale: Option<f64>, al
     order.sort_by(|&a, &b| keys[b].partial_cmp(&keys[a]).unwrap().then(a.cmp(&b)));
 
     if let Some(s) = fixed_scale {
-        let (xf, tiles) = attempt(islands, &order, s, res, margin, rotations, true)?;
+        let (xf, tiles) = attempt(islands, &order, s, res, margin, rotations, true, None)?;
         return Some(ShapePack { xforms: xf, scale: s, tiles });
     }
     // recherche de l'échelle maximale : bornes [hi·0.25, hi], hi = couverture de 100 %
@@ -393,7 +420,7 @@ pub fn pack_shapes(islands: &[Island], margin: f64, fixed_scale: Option<f64>, al
         let results: Vec<Option<Vec<Xform>>> = std::thread::scope(|sc| {
             let hs: Vec<_> = scales.iter().map(|&s| {
                 let order = &order;
-                sc.spawn(move || attempt(islands, order, s, res, margin, rotations, false).map(|r| r.0))
+                sc.spawn(move || attempt(islands, order, s, res, margin, rotations, false, None).map(|r| r.0))
             }).collect();
             hs.into_iter().map(|h| h.join().ok().flatten()).collect()
         });
@@ -423,4 +450,48 @@ pub fn pack_shapes(islands: &[Island], margin: f64, fixed_scale: Option<f64>, al
         return None;
     }
     Some(ShapePack { xforms, scale, tiles: 1 })
+}
+
+/// Range `islands` dans l'espace laissé libre par `obstacles` (îlots déjà placés, en
+/// coordonnées de la tuile 0-1), à l'échelle `scale` si possible, sinon à la plus grande
+/// échelle inférieure qui tient. None s'il n'y a pas de place.
+pub fn pack_into_free(islands: &[Island], obstacles: &[Island], margin: f64, allow_rot: bool, res: usize, scale: f64) -> Option<ShapePack> {
+    if islands.is_empty() {
+        return None;
+    }
+    let rotations = if allow_rot { 4 } else { 1 };
+    let mut board = Board::new(res);
+    for o in obstacles {
+        let m = rasterize(o, 0, res as f64, 0);
+        board.stamp_clipped(&m, m.qmin.0, m.qmin.1);
+    }
+    let bbox_area = |isl: &Island| {
+        let (mut a, mut b) = (V2::new(f64::MAX, f64::MAX), V2::new(f64::MIN, f64::MIN));
+        for p in isl.uv {
+            a = V2::new(a.x.min(p.x), a.y.min(p.y));
+            b = V2::new(b.x.max(p.x), b.y.max(p.y));
+        }
+        (b.x - a.x) * (b.y - a.y)
+    };
+    let keys: Vec<f64> = islands.iter().map(bbox_area).collect();
+    let mut order: Vec<usize> = (0..islands.len()).collect();
+    order.sort_by(|&a, &b| keys[b].partial_cmp(&keys[a]).unwrap().then(a.cmp(&b)));
+    let run = |s: f64| attempt(islands, &order, s, res, margin, rotations, false, Some(&board)).map(|r| r.0);
+    if let Some(xf) = run(scale) {
+        return Some(ShapePack { xforms: xf, scale, tiles: 1 });
+    }
+    // dichotomie sur l'échelle
+    let (mut lo, mut hi) = (0.0, scale);
+    let mut best = None;
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        match run(mid) {
+            Some(xf) => {
+                best = Some((xf, mid));
+                lo = mid;
+            }
+            None => hi = mid,
+        }
+    }
+    best.map(|(xforms, scale)| ShapePack { xforms, scale, tiles: 1 })
 }

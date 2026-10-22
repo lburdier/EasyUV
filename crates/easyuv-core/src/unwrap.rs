@@ -75,6 +75,15 @@ pub fn lscm(chart: &Chart, max_iter: usize) -> Vec<V2> {
     fixed[n + pa as usize] = Some(init[pa as usize].y);
     fixed[pb as usize] = Some(init[pb as usize].x);
     fixed[n + pb as usize] = Some(init[pb as usize].y);
+    let mut uv = lscm_pinned(&chart.pos, &chart.tris, &fixed, &init, max_iter);
+    orient_positive(chart, &mut uv);
+    uv
+}
+
+/// LSCM avec épingles quelconques : `fixed[i]` (u) et `fixed[n + i]` (v) fixent le sommet i.
+/// `init` sert de point de départ au solveur. Il faut au moins deux sommets épinglés.
+pub fn lscm_pinned(pos: &[V3], tris: &[[u32; 3]], fixed: &[Option<f64>], init: &[V2], max_iter: usize) -> Vec<V2> {
+    let n = pos.len();
     let mut free_idx = vec![u32::MAX; 2 * n];
     let mut nfree = 0usize;
     for i in 0..2 * n {
@@ -84,9 +93,9 @@ pub fn lscm(chart: &Chart, max_iter: usize) -> Vec<V2> {
         }
     }
     let mut a = CsrBuilder::new(nfree);
-    let mut rhs = Vec::with_capacity(chart.tris.len() * 2);
-    for t in &chart.tris {
-        let p = [chart.pos[t[0] as usize], chart.pos[t[1] as usize], chart.pos[t[2] as usize]];
+    let mut rhs = Vec::with_capacity(tris.len() * 2);
+    for t in tris {
+        let p = [pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]];
         let Some(x) = local_frame(p[0], p[1], p[2]) else { continue };
         let area2 = (x[1] - x[0]).cross(x[2] - x[0]);
         if area2 <= 0.0 {
@@ -132,9 +141,7 @@ pub fn lscm(chart: &Chart, max_iter: usize) -> Vec<V2> {
         cgls(&a, &rhs, &mut x, max_iter, 1e-6);
     }
     let get = |i: usize| fixed[i].unwrap_or_else(|| x[free_idx[i] as usize]);
-    let mut uv: Vec<V2> = (0..n).map(|i| V2::new(get(i), get(n + i))).collect();
-    orient_positive(chart, &mut uv);
-    uv
+    (0..n).map(|i| V2::new(get(i), get(n + i))).collect()
 }
 
 /// Corrige un dépliage miroir (aire signée totale négative).
