@@ -88,6 +88,8 @@ pub struct EasyUvApp {
     show_update: bool,
     /// Fenêtre « Nouveautés » (ouverte d'elle-même après une mise à jour).
     show_news: bool,
+    /// Part de la vue 3D dans les espaces Layout et UV Editing (séparateur déplaçable).
+    split: [f32; 2],
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -103,6 +105,8 @@ pub struct EasyUvApp {
 }
 
 const UNDO_LEVELS: usize = 32;
+/// Part de la vue 3D par défaut : Layout, UV Editing.
+const SPLIT_DEFAULT: [f32; 2] = [0.58, 0.4];
 
 impl EasyUvApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -136,6 +140,7 @@ impl EasyUvApp {
             update: UpdateState::Idle,
             show_update: false,
             show_news: crate::news::first_run_of_version(),
+            split: SPLIT_DEFAULT,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -785,9 +790,9 @@ impl EasyUvApp {
             self.undo.pop();
         }
         self.status = match (done, skipped) {
-            (0, _) => "Rien à rendre droit : il faut des îlots faits de quads en grille (bandes, anneaux ouverts)".into(),
+            (0, _) => "Rien à rendre droit : il faut des bandes (quads en grille ou arcs), pas des couvercles. Un îlot qui serait abîmé n'est pas modifié".into(),
             (d, 0) => format!("{d} îlot(s) rendu(s) droit(s) — Ctrl+P pour ranger"),
-            (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) (pas une grille de quads)"),
+            (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) : pas une bande, ou le redressement l'aurait abîmé"),
         };
     }
 
@@ -1510,7 +1515,10 @@ impl EasyUvApp {
         ui.painter().rect_filled(header, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, theme::BG_PANEL);
         ui.scope_builder(egui::UiBuilder::new().max_rect(header.shrink2(egui::vec2(8.0, 3.0))), |ui| {
             ui.horizontal_centered(|ui| {
-                ui.label(RichText::new(title).color(theme::TEXT_DIM));
+                // vue étroite (séparateur déplacé) : les boutons passent avant le titre
+                if !show_shading || rect.width() > 540.0 {
+                    ui.label(RichText::new(title).color(theme::TEXT_DIM));
+                }
                 if show_shading {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         for (s, n) in [(Shading::Stretch, "Étirement"), (Shading::Islands, "Îlots"), (Shading::Checker, "Damier"), (Shading::Solid, "Solide")] {
@@ -1601,10 +1609,15 @@ impl eframe::App for EasyUvApp {
                         Some(egui::Rect::from_min_max(egui::pos2(full.left() + w + 1.0, full.top()), full.max)),
                     )
                 };
-                let (r3d, ruv) = match self.workspace {
-                    Workspace::Viewport => (Some(full), None),
-                    Workspace::Layout => split(0.58),
-                    Workspace::UvEditing => split(0.4),
+                // part de la vue 3D, réglable en glissant le séparateur (une par espace de travail)
+                let ratio = match self.workspace {
+                    Workspace::Viewport => None,
+                    Workspace::Layout => Some(self.split[0]),
+                    Workspace::UvEditing => Some(self.split[1]),
+                };
+                let (r3d, ruv) = match ratio {
+                    None => (Some(full), None),
+                    Some(k) => split(k),
                 };
                 if let Some(r) = r3d {
                     let body = egui::Rect::from_min_max(r.min + egui::vec2(0.0, 26.0), r.max);
@@ -1681,6 +1694,27 @@ impl eframe::App for EasyUvApp {
                     };
                     let mut dummy = ViewOptions { shading: self.view.shading, wire: false, seams: false, grid: false, tiling: 1.0 };
                     Self::editor_header(ui, r, &title, &mut dummy, false);
+                }
+                // séparateur entre les deux vues, déclaré après elles pour passer devant ;
+                // double-clic : partage par défaut
+                if let Some(k) = ratio {
+                    let i = if self.workspace == Workspace::Layout { 0 } else { 1 };
+                    let x = full.left() + full.width() * k;
+                    let handle = egui::Rect::from_min_max(egui::pos2(x - 4.0, full.top()), egui::pos2(x + 4.0, full.bottom()));
+                    let resp = ui.interact(handle, ui.scope_id().with("split"), egui::Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                    if resp.dragged() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            // chaque vue garde au moins 220 px
+                            let min = (220.0 / full.width()).min(0.45);
+                            self.split[i] = ((p.x - full.left()) / full.width()).clamp(min, 1.0 - min);
+                        }
+                    }
+                    if resp.double_clicked() {
+                        self.split[i] = SPLIT_DEFAULT[i];
+                    }
+                    if resp.hovered() || resp.dragged() {
+                        ui.painter().rect_filled(egui::Rect::from_center_size(egui::pos2(x, full.center().y), egui::vec2(2.0, full.height())), 0.0, theme::ACCENT_BLUE);
+                    }
                 }
             });
 

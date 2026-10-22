@@ -269,6 +269,43 @@ fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize]) -> Resu
         }
     }
 
+    // candidats : grille de quads (exacte quand elle couvre l'îlot) et déroulé polaire
+    // (arc de cône, quelle que soit la topologie) ; on garde le moins abîmé
+    let before = damaged(&fv, &pos3, &orig);
+    let mut cands: Vec<(usize, u8, Vec<V2>)> = Vec::new();
+    let mut why = "pas une bande";
+    match grid_straight(&fv, &pos3, &edge_faces) {
+        Ok((uv, full)) => {
+            if let Some(uv) = finalize(&fv, &orig, uv) {
+                cands.push((damaged(&fv, &pos3, &uv), if full { 0 } else { 2 }, uv));
+            }
+        }
+        Err(e) => why = e,
+    }
+    if let Some(uv) = polar_straight(&fv, &orig).and_then(|uv| finalize(&fv, &orig, uv)) {
+        cands.push((damaged(&fv, &pos3, &uv), 1, uv));
+    }
+    if std::env::var_os("EASYUV_PROFILE").is_some() {
+        eprintln!("rendre droit : {} faces, abîmées avant {before}, candidats (genre, abîmées) {:?}", fv.len(), cands.iter().map(|c| (c.1, c.0)).collect::<Vec<_>>());
+    }
+    let Some((dmg, _, uv)) = cands.into_iter().min_by_key(|c| (c.0, c.1)) else { return Err(why) };
+    // aucun résultat propre : l'îlot reste tel quel plutôt que d'être abîmé. Petite marge :
+    // le triangle d'une jonction en T devient forcément un trait sur une grille droite
+    if dmg > before + (fv.len() / 50).max(1) {
+        return Err("le redressement abîmerait des faces");
+    }
+    for &(c, v) in &corner_ids {
+        corner_uv[c] = [uv[v].x as f32, uv[v].y as f32];
+    }
+    Ok(())
+}
+
+type EdgeFaces = HashMap<(usize, usize), Vec<usize>>;
+
+/// Plus grande grille de quads de l'îlot, dépliée droite ; le reste suit par LSCM. Renvoie
+/// les UV (avant mise à l'échelle) et vrai si la grille couvre tout l'îlot.
+fn grid_straight(fv: &[Vec<usize>], pos3: &[crate::math::V3], edge_faces: &EdgeFaces) -> Result<(Vec<V2>, bool), &'static str> {
+    let nv = pos3.len();
     // --- plus grande grille de quads cohérente (plusieurs départs, la plus grande gagne) ---
     let grow = |seed: usize| -> (Vec<Option<(i64, i64)>>, Vec<bool>) {
         let mut grid: Vec<Option<(i64, i64)>> = vec![None; nv];
@@ -427,22 +464,10 @@ fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize]) -> Resu
     };
     let (xs, ys) = (cum(&wsum, &wcnt), cum(&hsum, &hcnt));
     let mut uv: Vec<V2> = (0..nv).map(|v| if in_v[v] { V2::new(xs[(g[v].0 - xmin) as usize], ys[(g[v].1 - ymin) as usize]) } else { V2::new(0.0, 0.0) }).collect();
-    // même sens de parcours que l'îlot d'origine : pas de miroir
-    let signed = |pts: &[V2]| -> f64 {
-        fv.iter().enumerate().filter(|(fi, _)| inside[*fi]).map(|(_, q)| (pts[q[1]] - pts[q[0]]).cross(pts[q[2]] - pts[q[0]])).sum()
-    };
-    if signed(&orig) * signed(&uv) < 0.0 {
-        uv.iter_mut().for_each(|p| p.x = -p.x);
-    }
-    // côté long de la bande horizontal
-    if ys[ny] > xs[nx] {
-        uv.iter_mut().for_each(|p| *p = V2::new(-p.y, p.x));
-    }
-
     // --- le reste de l'îlot (couvercles, n-gones…) suit la bande : LSCM épinglé ---
     if in_v.iter().any(|&x| !x) {
         let mut tris: Vec<[u32; 3]> = Vec::new();
-        for q in &fv {
+        for q in fv {
             for k in 1..q.len() - 1 {
                 tris.push([q[0] as u32, q[k] as u32, q[k + 1] as u32]);
             }
@@ -461,29 +486,171 @@ fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize]) -> Resu
         uv = solved;
     }
 
-    // --- surface et centre conservés ---
-    let area = |pts: &[V2]| -> f64 {
-        fv.iter()
-            .map(|q| (1..q.len() - 1).map(|k| 0.5 * (pts[q[k]] - pts[q[0]]).cross(pts[q[k + 1]] - pts[q[0]]).abs()).sum::<f64>())
-            .sum()
-    };
-    let (ao, an) = (area(&orig), area(&uv));
+    Ok((uv, n_in == fv.len()))
+}
+
+/// Déroulé polaire : une bande courbe dépliée (arc de cône) est un secteur d'anneau. On
+/// ajuste son cercle ; l'angle devient l'abscisse, le rayon l'ordonnée. Marche avec des
+/// triangles, des n-gones et des jonctions en T, là où la grille de quads s'arrête.
+fn polar_straight(fv: &[Vec<usize>], orig: &[V2]) -> Option<Vec<V2>> {
+    let n = orig.len();
+    if n < 4 {
+        return None;
+    }
+    let mean = orig.iter().fold(V2::new(0.0, 0.0), |s, p| s + *p) * (1.0 / n as f64);
+    let (lo, hi) = bounds2(orig);
+    let ext = (hi - lo).x.hypot((hi - lo).y).max(1e-12);
+    // cercle algébrique (Kåsa) : x² + y² + D x + E y + F = 0, en coordonnées centrées réduites
+    let mut m = [[0.0f64; 3]; 3];
+    let mut r = [0.0f64; 3];
+    for p in orig {
+        let (x, y) = ((p.x - mean.x) / ext, (p.y - mean.y) / ext);
+        let row = [x, y, 1.0];
+        let z = -(x * x + y * y);
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] += row[i] * row[j];
+            }
+            r[i] += row[i] * z;
+        }
+    }
+    let sol = solve3(m, r)?;
+    let c = V2::new(-sol[0] / 2.0, -sol[1] / 2.0);
+    let rad2 = c.x * c.x + c.y * c.y - sol[2];
+    // presque droite (rayon immense) : rien à dérouler
+    if !rad2.is_finite() || rad2 <= 0.0 || rad2.sqrt() > 20.0 {
+        return None;
+    }
+    let mut c = mean + c * ext;
+    // affinage géométrique (Gauss-Newton sur |p - c| - R) : l'ajustement algébrique est
+    // biaisé quand les points remplissent un anneau au lieu d'un cercle
+    for _ in 0..30 {
+        let d: Vec<(V2, f64)> = orig.iter().map(|p| (*p - c, (*p - c).x.hypot((*p - c).y).max(1e-300))).collect();
+        let rm = d.iter().map(|x| x.1).sum::<f64>() / n as f64;
+        // gradient de Σ (|p - c| - rm)² par rapport à c
+        let (mut gx, mut gy, mut jj) = (0.0, 0.0, [[0.0f64; 2]; 2]);
+        for (v, l) in &d {
+            let (ux, uy) = (-v.x / l, -v.y / l);
+            let e = l - rm;
+            gx += ux * e;
+            gy += uy * e;
+            jj[0][0] += ux * ux;
+            jj[0][1] += ux * uy;
+            jj[1][1] += uy * uy;
+        }
+        let det = jj[0][0] * jj[1][1] - jj[0][1] * jj[0][1];
+        if det.abs() < 1e-18 {
+            break;
+        }
+        let step = V2::new((jj[1][1] * gx - jj[0][1] * gy) / det, (jj[0][0] * gy - jj[0][1] * gx) / det);
+        c = c - step;
+        if step.x.hypot(step.y) < 1e-9 * ext {
+            break;
+        }
+    }
+    if !c.x.is_finite() || (c - mean).x.hypot((c - mean).y) > 20.0 * ext {
+        return None;
+    }
+    let dir = (mean - c).y.atan2((mean - c).x);
+    let polar: Vec<(f64, f64)> = orig
+        .iter()
+        .map(|p| {
+            let d = *p - c;
+            let mut t = d.y.atan2(d.x) - dir;
+            while t > std::f64::consts::PI {
+                t -= std::f64::consts::TAU;
+            }
+            while t < -std::f64::consts::PI {
+                t += std::f64::consts::TAU;
+            }
+            (t, d.x.hypot(d.y))
+        })
+        .collect();
+    let (tmin, tmax) = polar.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
+    let (rmin, rmax) = polar.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
+    // anneau presque fermé ou disque (couvercle) : pas une bande à dérouler
+    if tmax - tmin > 1.75 * std::f64::consts::PI || rmin < 0.05 * rmax {
+        return None;
+    }
+    // une face à cheval sur la coupure de l'angle : l'îlot fait le tour du centre
+    if fv.iter().any(|q| q.iter().any(|&a| q.iter().any(|&b| (polar[a].0 - polar[b].0).abs() > std::f64::consts::PI))) {
+        return None;
+    }
+    let r_ref = polar.iter().map(|p| p.1).sum::<f64>() / n as f64;
+    Some(polar.iter().map(|&(t, rr)| V2::new(t * r_ref, rr)).collect())
+}
+
+/// Système 3x3 par la règle de Cramer.
+fn solve3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |a: [[f64; 3]; 3]| a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    let d = det(m);
+    if d.abs() < 1e-18 {
+        return None;
+    }
+    let mut out = [0.0; 3];
+    for (k, o) in out.iter_mut().enumerate() {
+        let mut a = m;
+        for (row, &rv) in a.iter_mut().zip(&r) {
+            row[k] = rv;
+        }
+        *o = det(a) / d;
+    }
+    Some(out)
+}
+
+fn bounds2(pts: &[V2]) -> (V2, V2) {
+    pts.iter().fold((V2::new(f64::MAX, f64::MAX), V2::new(f64::MIN, f64::MIN)), |(lo, hi), p| (V2::new(lo.x.min(p.x), lo.y.min(p.y)), V2::new(hi.x.max(p.x), hi.y.max(p.y))))
+}
+
+/// Aire UV signée d'une face (sommets locaux).
+fn face_area(q: &[usize], pts: &[V2]) -> f64 {
+    (1..q.len() - 1).map(|k| 0.5 * (pts[q[k]] - pts[q[0]]).cross(pts[q[k + 1]] - pts[q[0]])).sum()
+}
+
+/// Même sens que l'îlot d'origine (pas de miroir), côté long horizontal, surface et centre
+/// de l'îlot d'origine.
+fn finalize(fv: &[Vec<usize>], orig: &[V2], mut uv: Vec<V2>) -> Option<Vec<V2>> {
+    if uv.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return None;
+    }
+    let signed = |pts: &[V2]| -> f64 { fv.iter().map(|q| face_area(q, pts)).sum() };
+    if signed(orig) * signed(&uv) < 0.0 {
+        uv.iter_mut().for_each(|p| p.x = -p.x);
+    }
+    let (lo, hi) = bounds2(&uv);
+    if hi.y - lo.y > hi.x - lo.x {
+        uv.iter_mut().for_each(|p| *p = V2::new(-p.y, p.x));
+    }
+    let area = |pts: &[V2]| -> f64 { fv.iter().map(|q| face_area(q, pts).abs()).sum() };
+    let (ao, an) = (area(orig), area(&uv));
     if an <= 0.0 || ao <= 0.0 {
-        return Err("surface nulle");
+        return None;
     }
     let k = (ao / an).sqrt();
-    let bounds = |pts: &[V2]| {
-        pts.iter().fold((V2::new(f64::MAX, f64::MAX), V2::new(f64::MIN, f64::MIN)), |(lo, hi), p| (V2::new(lo.x.min(p.x), lo.y.min(p.y)), V2::new(hi.x.max(p.x), hi.y.max(p.y))))
-    };
-    let (olo, ohi) = bounds(&orig);
+    let (olo, ohi) = bounds2(orig);
     uv.iter_mut().for_each(|p| *p = *p * k);
-    let (nlo, nhi) = bounds(&uv);
+    let (nlo, nhi) = bounds2(&uv);
     let shift = (olo + ohi) * 0.5 - (nlo + nhi) * 0.5;
-    for &(c, v) in &corner_ids {
-        let p = uv[v] + shift;
-        corner_uv[c] = [p.x as f32, p.y as f32];
+    uv.iter_mut().for_each(|p| *p = *p + shift);
+    Some(uv)
+}
+
+/// Faces abîmées : retournées, ou écrasées (aire UV rapportée à l'aire 3D très sous la
+/// médiane de l'îlot). Les faces presque nulles en 3D (fines jonctions en T) ne comptent pas.
+fn damaged(fv: &[Vec<usize>], pos3: &[crate::math::V3], uv: &[V2]) -> usize {
+    let a3: Vec<f64> = fv.iter().map(|q| (1..q.len() - 1).map(|k| 0.5 * (pos3[q[k]] - pos3[q[0]]).cross(pos3[q[k + 1]] - pos3[q[0]]).length()).sum()).collect();
+    let mut sorted = a3.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med3 = sorted[sorted.len() / 2];
+    let sign = fv.iter().map(|q| face_area(q, uv)).sum::<f64>().signum();
+    let ratio: Vec<f64> = fv.iter().zip(&a3).map(|(q, &a)| face_area(q, uv) * sign / a.max(1e-30)).collect();
+    let mut rs: Vec<f64> = ratio.iter().zip(&a3).filter(|(_, &a)| a > 0.05 * med3).map(|(r, _)| *r).collect();
+    if rs.is_empty() {
+        return 0;
     }
-    Ok(())
+    rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = rs[rs.len() / 2];
+    ratio.iter().zip(&a3).filter(|(r, &a)| a > 0.05 * med3 && **r < 0.15 * med).count()
 }
 
 /// Range toutes les UV existantes d'un maillage (sans redéplier) et calcule les
@@ -584,6 +751,54 @@ mod tests {
         layout_islands(&model.mesh, &mut uv, &fi, Some(&which), &p, true);
         assert!(uv.iter().all(|c| c[0] >= -1e-4 && c[1] >= -1e-4 && c[0] <= 1.0001 && c[1] <= 1.0001));
         assert!(metrics::overlap_ratio(&model.mesh, &uv, 256) < 0.002);
+    }
+
+    #[test]
+    fn straighten_strip_with_triangles() {
+        // arc de cône ouvert dont les 3 premières colonnes sont en triangles : la grille de
+        // quads s'arrête avant le bout, le reste ne doit être ni écrasé ni retourné
+        let (seg, rings) = (20usize, 4usize);
+        let mut pos = Vec::new();
+        for j in 0..=rings {
+            let r = 1.0 + 0.6 * j as f64 / rings as f64;
+            for i in 0..=seg {
+                let a = i as f64 / seg as f64 * 3.5;
+                pos.push(crate::math::V3::new(r * a.cos(), r * a.sin(), j as f64 * 0.15));
+            }
+        }
+        let w = seg as u32 + 1;
+        let mut faces = Vec::new();
+        for j in 0..rings as u32 {
+            for i in 0..seg as u32 {
+                let (a, b, c, d) = (j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i);
+                if i < 3 {
+                    faces.push(vec![a, b, c]);
+                    faces.push(vec![a, c, d]);
+                } else {
+                    faces.push(vec![a, b, c, d]);
+                }
+            }
+        }
+        let m = Mesh::from_faces(pos, &faces);
+        let mut p = Params::default();
+        p.shape = crate::regions::ShapePreset::Cylindrical;
+        let r = smart_unwrap(&m, &p, &[]);
+        let (fi, n) = uv_islands(&m, &r.corner_uv);
+        assert_eq!(n, 1);
+        let mut uv = r.corner_uv.clone();
+        assert_eq!(straighten_grid(&m, &mut uv, &fi, &[true]), (1, 0));
+        // chaque rangée de sommets est sur une même horizontale
+        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); rings + 1];
+        for f in 0..m.face_count() {
+            for c in m.face_range(f) {
+                rows[m.corners[c] as usize / w as usize].push(uv[c][1]);
+            }
+        }
+        let height = uv.iter().map(|c| c[1]).fold(f32::MIN, f32::max) - uv.iter().map(|c| c[1]).fold(f32::MAX, f32::min);
+        for (j, row) in rows.iter().enumerate() {
+            let spread = row.iter().fold(f32::MIN, |a, &b| a.max(b)) - row.iter().fold(f32::MAX, |a, &b| a.min(b));
+            assert!(spread < 0.05 * height, "rangée {j} pas droite : écart {spread} pour une hauteur {height}");
+        }
     }
 
     #[test]
