@@ -17,6 +17,7 @@ pub mod pack;
 pub mod primitives;
 pub mod regions;
 pub mod segment;
+pub mod shapepack;
 pub mod solver;
 pub mod unwrap;
 
@@ -98,6 +99,9 @@ pub struct UvResult {
     pub stats: Stats,
 }
 
+/// Résolution de la grille d'empaquetage par forme (cellules par côté de tuile).
+const PACK_RES: usize = 256;
+
 /// Dépliage complet. `forced_seams` : paires de sommets à couper obligatoirement
 /// (coutures / arêtes vives marquées dans Blender).
 pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -> UvResult {
@@ -125,7 +129,50 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
         DensityMode::Fit => None,
         DensityMode::Target(px) => Some(px / params.texture_size.max(1) as f64),
     };
+    // Empaquetage par forme ; à défaut (cas extrêmes), par boîtes englobantes.
+    let islands: Vec<shapepack::Island> = charts.iter().map(|c| shapepack::Island { uv: &c.uv, tris: &c.chart.tris }).collect();
+    // résolution adaptée au nombre d'îlots (coût de la recherche)
+    let res = std::env::var("EASYUV_PACK_RES").ok().and_then(|v| v.parse().ok()).unwrap_or(if charts.len() <= 64 {
+        1024
+    } else if charts.len() <= 200 {
+        768
+    } else {
+        PACK_RES
+    });
+    // Deux méthodes : boîtes (skyline, rapide) puis formes, gardée seulement si elle fait mieux.
+    // En densité cible, la méthode par formes est utilisée pour passer en UDIM sans chevauchement.
     let packed = pack::pack(&rects, params.margin, fixed, params.rotate_islands);
+    let shape = if fixed.is_some() && !packed.overflow {
+        None
+    } else {
+        let floor = if fixed.is_some() { 0.0 } else { packed.scale };
+        shapepack::pack_shapes(&islands, params.margin, fixed, params.rotate_islands, res, floor)
+    };
+    drop(islands);
+    let (placed, pack_scale, overflow): (Vec<Vec<V2>>, f64, bool) = match shape {
+        Some(sp) => (
+            charts.iter().zip(&sp.xforms).map(|(c, xf)| c.uv.iter().map(|&p| xf.apply(p, sp.scale)).collect()).collect(),
+            sp.scale,
+            sp.tiles > 1,
+        ),
+        None => {
+            let uvs = charts
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| {
+                    let pl = packed.placements[ci];
+                    let (_, h) = rects[ci];
+                    c.uv.iter()
+                        .map(|&p| {
+                            let q = if pl.rotated { V2::new(h - p.y, p.x) } else { p };
+                            (q + V2::new(pl.x, pl.y)) * packed.scale
+                        })
+                        .collect()
+                })
+                .collect();
+            (uvs, packed.scale, packed.overflow)
+        }
+    };
     segment::prof("empaquetage", t_pack);
 
     let mut corner_uv = vec![[0.0f32; 2]; mesh.corners.len()];
@@ -133,13 +180,7 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
     let mut uv_area = 0.0;
     let mut stats = Stats { charts: charts.len(), shapes, ..Default::default() };
     for (ci, c) in charts.iter().enumerate() {
-        let pl = packed.placements[ci];
-        let (_, h) = rects[ci];
-        let place = |p: V2| -> V2 {
-            let q = if pl.rotated { V2::new(h - p.y, p.x) } else { p };
-            (q + V2::new(pl.x, pl.y)) * packed.scale
-        };
-        let uv: Vec<V2> = c.uv.iter().map(|&p| place(p)).collect();
+        let uv = &placed[ci];
         for &(corner, local) in &c.chart.corner_local {
             let p = uv[local as usize];
             corner_uv[corner as usize] = [p.x as f32, p.y as f32];
@@ -164,9 +205,9 @@ pub fn smart_unwrap(mesh: &Mesh, params: &Params, forced_seams: &[(u32, u32)]) -
             *fc = charts.len() as u32;
         }
     }
-    stats.density_px_per_unit = packed.scale * params.texture_size as f64;
+    stats.density_px_per_unit = pack_scale * params.texture_size as f64;
     stats.coverage = uv_area;
-    stats.overflow = packed.overflow;
+    stats.overflow = overflow;
 
     // Coutures : arêtes coupées, ou entre deux îlots différents
     let mut seams = Vec::new();
