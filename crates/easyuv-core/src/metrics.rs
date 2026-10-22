@@ -57,11 +57,11 @@ pub fn chart_self_overlap(tris: &[[u32; 3]], uv: &[V2], res: usize) -> f64 {
     }
 }
 
-/// Part (0..1) de la surface UV couverte au moins deux fois, mesurée sur une grille
-/// `res`×`res` (centres de cellules). 0 = aucun chevauchement, ni entre îlots ni à l'intérieur
-/// d'un îlot qui se replie sur lui-même. Les UV hors de la tuile 0-1 sont ramenées par modulo.
+/// Part (0..1) de la surface UV couverte au moins deux fois, mesurée sur une grille de `res`
+/// cellules par tuile (centres de cellules). 0 = aucun chevauchement, ni entre îlots ni à
+/// l'intérieur d'un îlot replié. Chaque tuile UDIM est comptée séparément.
 pub fn overlap_ratio(mesh: &Mesh, corner_uv: &[[f32; 2]], res: usize) -> f64 {
-    let mut count = vec![0u8; res * res];
+    let mut count: std::collections::HashMap<(i64, i64), u8> = std::collections::HashMap::new();
     let r = res as f64;
     for f in 0..mesh.face_count() {
         let range = mesh.face_range(f);
@@ -83,16 +83,15 @@ pub fn overlap_ratio(mesh: &Mesh, corner_uv: &[[f32; 2]], res: usize) -> f64 {
                     let (e0, e1, e2) = (edge(p[0], p[1], x, y), edge(p[1], p[2], x, y), edge(p[2], p[0], x, y));
                     let inside = if area > 0.0 { e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0 } else { e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0 };
                     if inside {
-                        let (ix, iy) = (cx.rem_euclid(res as i64) as usize, cy.rem_euclid(res as i64) as usize);
-                        let c = &mut count[iy * res + ix];
+                        let c = count.entry((cx, cy)).or_insert(0);
                         *c = c.saturating_add(1);
                     }
                 }
             }
         }
     }
-    let covered = count.iter().filter(|&&c| c >= 1).count();
-    let twice = count.iter().filter(|&&c| c >= 2).count();
+    let covered = count.len();
+    let twice = count.values().filter(|&&c| c >= 2).count();
     if covered == 0 {
         0.0
     } else {
