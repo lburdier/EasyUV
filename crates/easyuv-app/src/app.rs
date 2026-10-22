@@ -2,11 +2,12 @@ use crate::io;
 use crate::scene::Scene;
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
-use crate::uvview::{self, UvCache, UvCamera, UvEditor, UvEvent};
+use crate::uvview::{self, UvCache, UvCamera, UvEditor, UvEvent, UvTool};
 use crate::raster::Mips;
 use crate::viewport::{self, Camera, RenderCache, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
 use easyuv::learn::{self, Learner};
+use easyuv::uvtools;
 use easyuv::math::V3;
 use easyuv::mesh::Mesh;
 use easyuv::model::Model;
@@ -90,6 +91,9 @@ pub struct EasyUvApp {
     show_news: bool,
     /// Part de la vue 3D dans les espaces Layout et UV Editing (séparateur déplaçable).
     split: [f32; 2],
+    /// Outils UV : angle de « Pivoter » et passes de « Optimiser ».
+    rot_angle: f64,
+    optimize_iters: usize,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -103,6 +107,9 @@ pub struct EasyUvApp {
     /// Menu « Supprimer ? » ouvert par X, à la position du pointeur (comme Blender).
     confirm_delete: Option<egui::Pos2>,
 }
+
+/// Outil d'îlots : (maillage, UV des coins, îlot de chaque face, îlots visés).
+type UvOp = Box<dyn Fn(&easyuv::mesh::Mesh, &mut [[f32; 2]], &[u32], &[usize])>;
 
 const UNDO_LEVELS: usize = 32;
 /// Part de la vue 3D par défaut : Layout, UV Editing.
@@ -141,6 +148,8 @@ impl EasyUvApp {
             show_update: false,
             show_news: crate::news::first_run_of_version(),
             split: SPLIT_DEFAULT,
+            rot_angle: 45.0,
+            optimize_iters: 10,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -765,15 +774,58 @@ impl EasyUvApp {
                 self.island_op(|s, ts| s.per_island(f, ts), label);
             }
         }
-        if item(ui, has_isl, "Rendre droit (bandes de quads)", "Maj+W") {
+        if item(ui, has_isl, "Rendre droit (bandes, arcs)", "Maj+W") {
             ui.close();
             self.straighten_strips();
         }
-        if item(ui, has_isl, "Aligner sur les axes", "") {
+        if item(ui, has_isl, "Orienter sur les axes", "") {
             ui.close();
-            self.island_op(|s, ts| s.straighten_islands(ts), "Aligner");
+            self.island_op(|s, ts| s.straighten_islands(ts), "Orienter");
+        }
+        {
+            use uvtools::{Align, Islands};
+            ui.add_enabled_ui(has_isl, |ui| {
+                ui.menu_button("Aligner", |ui| {
+                    for (label, mode) in [("À gauche", Align::Left), ("Au centre (U)", Align::CenterU), ("À droite", Align::Right), ("En haut", Align::Top), ("Au centre (V)", Align::CenterV), ("En bas", Align::Bottom)] {
+                        if ui.button(label).clicked() {
+                            ui.close();
+                            self.uv_tool_op("Aligner", move |m, uv, fi, ids| uvtools::align(uv, &Islands::new(m, fi, ids), mode));
+                        }
+                    }
+                });
+                ui.menu_button("Répartir", |ui| {
+                    for (label, axis) in [("En U (horizontalement)", 0), ("En V (verticalement)", 1)] {
+                        if ui.button(label).clicked() {
+                            ui.close();
+                            self.uv_tool_op("Répartir", move |m, uv, fi, ids| uvtools::distribute(uv, &Islands::new(m, fi, ids), axis));
+                        }
+                    }
+                });
+            });
+            let it = self.optimize_iters;
+            let tools: [(&str, &str, UvOp); 5] = [
+                ("Empiler", "", Box::new(|m, uv, fi, ids| uvtools::stack(uv, &Islands::new(m, fi, ids)))),
+                ("Égaliser la densité", "", Box::new(|m, uv, fi, ids| uvtools::equalize_density(m, uv, &Islands::new(m, fi, ids)))),
+                ("Remplir la tuile", "", Box::new(|m, uv, fi, ids| uvtools::fit_to_tile(uv, &Islands::new(m, fi, ids)))),
+                ("Optimiser (ARAP)", "", Box::new(move |m, uv, fi, ids| uvtools::optimize(m, uv, &Islands::new(m, fi, ids), it))),
+                ("Redéplier", "", Box::new(|m, uv, fi, ids| uvtools::reunwrap(m, uv, &Islands::new(m, fi, ids)))),
+            ];
+            for (label, key, op) in tools {
+                if item(ui, has_isl, label, key) {
+                    ui.close();
+                    self.uv_tool_op(label, op);
+                }
+            }
         }
         ui.separator();
+        ui.menu_button("Outil actif", |ui| {
+            for t in UvTool::ALL {
+                if ui.add(egui::Button::selectable(self.uv_edit.tool == t, t.label()).shortcut_text(t.key())).clicked() {
+                    ui.close();
+                    self.uv_edit.tool = t;
+                }
+            }
+        });
         ui.label(RichText::new("Déplacer G · Pivoter R · Échelle S · X / Y : axe").small().color(theme::TEXT_DIM));
     }
 
@@ -794,6 +846,131 @@ impl EasyUvApp {
             (d, 0) => format!("{d} îlot(s) rendu(s) droit(s) — Ctrl+P pour ranger"),
             (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) : pas une bande, ou le redressement l'aurait abîmé"),
         };
+    }
+
+    /// Outil d'îlots de `easyuv::uvtools` sur la sélection, annulable.
+    fn uv_tool_op(&mut self, label: &str, op: impl FnOnce(&easyuv::mesh::Mesh, &mut [[f32; 2]], &[u32], &[usize])) {
+        if !self.scene.as_ref().is_some_and(|s| s.has_island_selection()) {
+            self.status = format!("{label} : sélectionnez d'abord des îlots (clic, A ou rectangle)");
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        let n = self.scene.as_mut().unwrap().island_tool(ts, op);
+        self.status = format!("{label} : {n} îlot(s) — Ctrl+Z pour annuler");
+    }
+
+    /// Panneau et menus : outils d'îlots façon Maya UV Toolkit / RizomUV.
+    fn uv_toolkit(&mut self, ui: &mut egui::Ui) {
+        use uvtools::{Align, Islands};
+        let has_isl = self.scene.as_ref().is_some_and(|s| s.has_island_selection());
+        ui.label(RichText::new("Pinceaux et outils (Q, 1 à 5 dans l'éditeur UV)").small().color(theme::TEXT_DIM));
+        ui.horizontal_wrapped(|ui| {
+            for t in UvTool::ALL {
+                ui.selectable_value(&mut self.uv_edit.tool, t, t.label()).on_hover_text(format!("{}\n{}", t.key(), t.hint()));
+            }
+        });
+        if self.uv_edit.tool.brush().is_some() {
+            egui::Grid::new("brush").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Rayon");
+                ui.add(egui::Slider::new(&mut self.uv_edit.radius, 4.0..=600.0).logarithmic(true).suffix(" px"));
+                ui.end_row();
+                ui.label("Force");
+                ui.add(egui::Slider::new(&mut self.uv_edit.strength, 0.05..=1.0).fixed_decimals(2));
+                ui.end_row();
+            });
+        }
+        ui.label(RichText::new(self.uv_edit.tool.hint()).small().color(theme::TEXT_DIM));
+        ui.add_space(4.0);
+        ui.add_enabled_ui(has_isl, |ui| {
+            egui::Grid::new("toolkit").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Aligner");
+                ui.horizontal_wrapped(|ui| {
+                    for (label, mode) in [("Gauche", Align::Left), ("Centre U", Align::CenterU), ("Droite", Align::Right), ("Haut", Align::Top), ("Centre V", Align::CenterV), ("Bas", Align::Bottom)] {
+                        if ui.small_button(label).clicked() {
+                            self.uv_tool_op("Aligner", move |m, uv, fi, ids| uvtools::align(uv, &Islands::new(m, fi, ids), mode));
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Répartir");
+                ui.horizontal(|ui| {
+                    for (label, axis) in [("En U", 0), ("En V", 1)] {
+                        if ui.small_button(label).on_hover_text("Écarts égaux entre les îlots (au moins 3)").clicked() {
+                            self.uv_tool_op("Répartir", move |m, uv, fi, ids| uvtools::distribute(uv, &Islands::new(m, fi, ids), axis));
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Pivoter");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.rot_angle).range(-360.0..=360.0).speed(1.0).suffix("°"));
+                    if ui.small_button("Appliquer").clicked() {
+                        let (s, c) = (self.rot_angle as f32).to_radians().sin_cos();
+                        self.island_op(move |sc, ts| sc.per_island(move |p| [c * p[0] - s * p[1], s * p[0] + c * p[1]], ts), "Pivoter");
+                    }
+                    for (label, a) in [("-90", -90f32), ("+90", 90.0), ("180", 180.0)] {
+                        if ui.small_button(label).clicked() {
+                            let (s, c) = a.to_radians().sin_cos();
+                            self.island_op(move |sc, ts| sc.per_island(move |p| [c * p[0] - s * p[1], s * p[0] + c * p[1]], ts), "Pivoter");
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Miroir / échelle");
+                ui.horizontal(|ui| {
+                    if ui.small_button("Miroir U").clicked() {
+                        self.island_op(|s, ts| s.per_island(|p| [-p[0], p[1]], ts), "Miroir");
+                    }
+                    if ui.small_button("Miroir V").clicked() {
+                        self.island_op(|s, ts| s.per_island(|p| [p[0], -p[1]], ts), "Miroir");
+                    }
+                    if ui.small_button("×2").clicked() {
+                        self.island_op(|s, ts| s.per_island(|p| [p[0] * 2.0, p[1] * 2.0], ts), "Échelle");
+                    }
+                    if ui.small_button("×½").clicked() {
+                        self.island_op(|s, ts| s.per_island(|p| [p[0] * 0.5, p[1] * 0.5], ts), "Échelle");
+                    }
+                });
+                ui.end_row();
+                ui.label("Îlots");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Empiler").on_hover_text("Superpose les îlots sur le premier (zones de texture partagées)").clicked() {
+                        self.uv_tool_op("Empiler", |m, uv, fi, ids| uvtools::stack(uv, &Islands::new(m, fi, ids)));
+                    }
+                    if ui.small_button("Égaliser la densité").on_hover_text("Même densité de texels pour tous les îlots sélectionnés").clicked() {
+                        self.uv_tool_op("Égaliser la densité", |m, uv, fi, ids| uvtools::equalize_density(m, uv, &Islands::new(m, fi, ids)));
+                    }
+                    if ui.small_button("Remplir la tuile").on_hover_text("La sélection tient dans la tuile 0-1, proportions gardées").clicked() {
+                        self.uv_tool_op("Remplir la tuile", |m, uv, fi, ids| uvtools::fit_to_tile(uv, &Islands::new(m, fi, ids)));
+                    }
+                });
+                ui.end_row();
+                ui.label("Forme");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Rendre droit").on_hover_text("Bande courbe -> rectangle droit. Maj+W").clicked() {
+                        self.straighten_strips();
+                    }
+                    if ui.small_button("Orienter").on_hover_text("Pivote chaque îlot sur sa boîte minimale").clicked() {
+                        self.island_op(|s, ts| s.straighten_islands(ts), "Orienter");
+                    }
+                    let it = self.optimize_iters;
+                    if ui.small_button("Optimiser").on_hover_text("Relaxation ARAP : moins d'étirement, même place et même orientation (Optimize de RizomUV)").clicked() {
+                        self.uv_tool_op("Optimiser", move |m, uv, fi, ids| uvtools::optimize(m, uv, &Islands::new(m, fi, ids), it));
+                    }
+                    if ui.small_button("Redéplier").on_hover_text("Repart de la forme 3D (LSCM + ARAP) : efface les retouches de l'îlot").clicked() {
+                        self.uv_tool_op("Redéplier", |m, uv, fi, ids| uvtools::reunwrap(m, uv, &Islands::new(m, fi, ids)));
+                    }
+                });
+                ui.end_row();
+                ui.label("Passes d'optimisation");
+                ui.add(egui::Slider::new(&mut self.optimize_iters, 1..=50));
+                ui.end_row();
+            });
+        });
+        if !has_isl {
+            ui.label(RichText::new("Sélectionnez des îlots dans l'éditeur UV pour les outils d'îlots.").small().color(theme::TEXT_DIM));
+        }
     }
 
     /// Opération sur les îlots sélectionnés, annulable.
@@ -1007,7 +1184,7 @@ impl EasyUvApp {
     fn status_bar(&mut self, root: &mut egui::Ui) {
         // aide contextuelle, comme la barre d'état de Blender : elle suit la vue sous le pointeur
         let hints = if self.pointer_over_uv(root.ctx()) {
-            "Clic / Maj+clic / rectangle : îlots   Glisser : déplacer   G R S : transformer   A : tout   F : cadrer la sélection   Molette : zoom   Clic molette : vue"
+            "Clic / Maj+clic / rectangle : îlots   Glisser : déplacer   G R S : transformer   A : tout   F : cadrer   Q, 1 à 5 : outils et pinceaux   [ ] : rayon   Molette : zoom   Clic molette : vue"
         } else {
             "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   U : déplier   F : cadrer la sélection"
         };
@@ -1262,6 +1439,8 @@ impl EasyUvApp {
                         }
                     });
 
+                    section(ui, "Outils UV", true, |ui| self.uv_toolkit(ui));
+
                     section(ui, "Rangement (layout)", true, |ui| {
                         ui.label(
                             RichText::new("Range les UV actuelles dans la tuile sans redéplier : après une retouche, ou pour réunir des objets dépliés séparément.")
@@ -1297,19 +1476,6 @@ impl EasyUvApp {
                             if primary_button(ui, &label).clicked() {
                                 self.start_layout(ui.ctx());
                             }
-                        });
-                        ui.add_enabled_ui(n_isl > 0, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.button("Rendre droit").on_hover_text("Bande courbe -> rectangle droit (quads en grille). Maj+W").clicked() {
-                                    self.straighten_strips();
-                                }
-                                if ui.button("Aligner").on_hover_text("Pivote chaque îlot sur sa boîte minimale").clicked() {
-                                    self.island_op(|s, ts| s.straighten_islands(ts), "Aligner");
-                                }
-                                if ui.button("Miroir").clicked() {
-                                    self.island_op(|s, ts| s.per_island(|p| [-p[0], p[1]], ts), "Miroir");
-                                }
-                            });
                         });
                         ui.label(
                             RichText::new("Éditeur UV : clic / Maj+clic / rectangle pour choisir des îlots, glisser pour déplacer, G R S, X / Y pour l'axe, clic droit : menu.")
@@ -1674,6 +1840,12 @@ impl eframe::App for EasyUvApp {
                         }
                         Some(UvEvent::Status(t)) => self.status = t,
                         Some(UvEvent::Straighten) => self.straighten_strips(),
+                        Some(UvEvent::FlattenRect(lo, hi)) => {
+                            let (lo, hi) = (easyuv::math::V2::new(lo[0] as f64, lo[1] as f64), easyuv::math::V2::new(hi[0] as f64, hi[1] as f64));
+                            self.uv_tool_op("Aplatir dans le rectangle", move |m, uv, fi, ids| {
+                                uvtools::flatten_into_rect(m, uv, fi, ids, lo, hi);
+                            });
+                        }
                         None => {}
                     }
                     if uvview::context_menu_allowed(&self.uv_edit) {

@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0] - 2026-10-23
+
+### Pinceaux UV
+- Nouveaux outils dans l'éditeur UV (touches `Q`, `1` à `5`, ou panneau « Outils UV ») :
+  - **Déplacer** : tire les UV sous le pinceau, avec une atténuation douce vers le bord.
+  - **Détendre** : les arêtes reprennent leur longueur 3D, l'étirement disparaît là où l'on peint.
+  - **Redresser** : les arêtes s'alignent sur l'horizontale ou la verticale la plus proche ; la zone peinte devient droite.
+  - **Pincer** : resserre les UV vers le centre du pinceau (`Maj` : les écarte).
+- Cercle d'influence sous le pointeur, rayon avec `[` `]` ou `Ctrl`+molette, force réglable. Le pinceau agit sur les îlots sélectionnés, ou sur tous. `Échap` annule le coup de pinceau, `Ctrl+Z` ensuite.
+
+### Outil Rectangle
+- On dessine un rectangle dans l'éditeur UV : l'îlot sélectionné (ou celui sous le rectangle) est rendu droit, tourné pour suivre le côté long du rectangle, puis étiré pour le remplir exactement.
+
+### Outils d'îlots (façon Maya UV Toolkit / RizomUV)
+- **Aligner** à gauche, au centre, à droite, en haut, en bas ; **Répartir** en U ou en V à écarts égaux.
+- **Pivoter** d'un angle libre, ±90°, 180° ; **Miroir** U ou V ; **Échelle** ×2 ou ×½.
+- **Empiler** les îlots les uns sur les autres ; **Égaliser la densité** de texels de la sélection ; **Remplir la tuile**.
+- **Optimiser** (relaxation ARAP, comme « Optimize » de RizomUV) et **Redéplier** (LSCM + ARAP) les îlots sélectionnés, en gardant leur place, leur orientation et leur taille.
+- Tous ces outils sont aussi dans le menu UV et le clic droit de l'éditeur UV. « Aligner sur les axes » s'appelle désormais « Orienter ».
+
 ## [0.2.1] - 2026-10-23
 
 ### Interface

@@ -21,6 +21,7 @@ pub mod segment;
 pub mod shapepack;
 pub mod solver;
 pub mod unwrap;
+pub mod uvtools;
 
 use math::V2;
 use mesh::{Mesh, Topology};
