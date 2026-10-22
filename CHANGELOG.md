@@ -2,6 +2,16 @@
 
 ## [0.2.0] - 2026-10-21
 
+### Édition UV et rangement (layout)
+- **Mode rangement** (Ctrl+P, panneau « Rangement ») : range les UV actuelles dans la tuile sans redéplier, par exemple pour réunir des objets dépliés séparément. Les îlots sélectionnés vont dans la place libre, sans recouvrir les autres. Option « Égaliser la densité ».
+- **Édition des îlots dans l'éditeur UV, comme dans Blender** : clic, Maj+clic, sélection au rectangle, A / Alt+A / Ctrl+I, glisser pour déplacer, G / R / S avec X / Y pour l'axe et Ctrl pour le pas, Échap ou clic droit pour annuler, Ctrl+Z. Molette : zoom sous le pointeur ; clic molette ou clic droit glissé : déplacer la vue.
+- **Rendre droit** (Maj+W) : une bande courbe de quads devient un rectangle droit, et les couvercles attachés suivent. Aussi : Aligner sur les axes, Miroir, Pivoter de 90°.
+- Menu clic droit dans l'éditeur UV.
+
+### Import
+- OBJ en Z vers le haut détecté automatiquement : les objets ne sont plus importés couchés.
+- Objet → **Pivoter de 90° (redresser)** sur X, Y ou Z, pour les fichiers ambigus.
+
 ### Auto-apprentissage
 - EasyUV apprend en travaillant. À chaque dépliage, il essaie plusieurs réglages en parallèle (angle de couture, tolérance de distorsion, ARAP), garde le meilleur et mémorise le résultat de chaque essai pour ce type de maillage.
 - Les réglages proposés pour un nouveau maillage viennent d'un modèle de substitution à noyau, construit sur l'empreinte du maillage (plis, courbure, bords, topologie, forme). Plus l'outil travaille, mieux il prédit et moins il a besoin d'explorer.

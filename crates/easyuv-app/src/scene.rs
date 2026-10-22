@@ -30,6 +30,14 @@ pub struct Scene {
     density_ts: u32,
     /// Incrémenté à chaque modification visible (cache du rendu 3D).
     pub generation: u64,
+    /// Îlot UV de chaque face (déduit des UV : faces reliées par des UV continues).
+    pub face_island: Vec<u32>,
+    /// Coins de chaque îlot UV.
+    pub island_corners: Vec<Vec<u32>>,
+    /// Objet de chaque îlot UV.
+    pub island_object: Vec<u32>,
+    /// Îlots sélectionnés dans l'éditeur UV.
+    pub island_selected: Vec<bool>,
 }
 
 /// Une entrée de reconstruction : objet source, décalage éventuel (copie), état.
@@ -61,6 +69,10 @@ impl Scene {
             object_densities: Vec::new(),
             density_ts: 1,
             generation: 0,
+            face_island: Vec::new(),
+            island_corners: Vec::new(),
+            island_object: Vec::new(),
+            island_selected: Vec::new(),
         };
         s.rebuild_derived();
         s
@@ -304,6 +316,7 @@ impl Scene {
             Some(u) if !self.model.objects.is_empty() => self.set_uv(u, texture_size),
             _ => {
                 self.uv = None;
+                self.rebuild_islands();
                 self.seam_set.clear();
                 self.face_stretch.clear();
                 self.density = 0.0;
@@ -398,7 +411,218 @@ impl Scene {
     pub fn set_uv(&mut self, uv: UvResult, texture_size: u32) {
         self.seam_set = uv.seams.iter().map(|&(a, b)| if a < b { (a, b) } else { (b, a) }).collect();
         self.uv = Some(uv);
+        self.rebuild_islands();
         self.refresh(texture_size);
+    }
+
+    /// Recalcule les îlots UV (après un dépliage, un rangement ou un changement d'objets).
+    fn rebuild_islands(&mut self) {
+        self.face_island.clear();
+        self.island_corners.clear();
+        self.island_object.clear();
+        self.island_selected.clear();
+        let Some(uv) = &self.uv else { return };
+        let m = &self.model.mesh;
+        let (fi, n) = easyuv::layout::uv_islands(m, &uv.corner_uv);
+        self.island_corners = vec![Vec::new(); n];
+        self.island_object = vec![0; n];
+        for f in 0..m.face_count() {
+            let i = fi[f] as usize;
+            self.island_corners[i].extend(m.face_range(f).map(|c| c as u32));
+            self.island_object[i] = self.face_object[f];
+        }
+        self.face_island = fi;
+        self.island_selected = vec![false; n];
+    }
+
+    // ---------- édition UV (îlots) ----------
+
+    /// Îlot visible sous le point `p` (coordonnées UV), le dernier dessiné l'emportant.
+    pub fn pick_island(&self, p: [f32; 2]) -> Option<usize> {
+        let uv = self.uv.as_ref()?;
+        let m = &self.model.mesh;
+        let mut hit = None;
+        for f in 0..m.face_count() {
+            if self.hidden[self.face_object[f] as usize] {
+                continue;
+            }
+            let r = m.face_range(f);
+            for t in m.fan(f) {
+                let [a, b, c] = t.map(|k| uv.corner_uv[r.start + k]);
+                let e = |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+                let (e0, e1, e2) = (e(a, b), e(b, c), e(c, a));
+                // triangle UV dégénéré (objet jamais déplié) : ne capte pas le clic
+                if ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() < 1e-12 {
+                    continue;
+                }
+                if (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0) {
+                    hit = Some(self.face_island[f] as usize);
+                }
+            }
+        }
+        hit
+    }
+
+    pub fn has_island_selection(&self) -> bool {
+        self.island_selected.iter().any(|&s| s)
+    }
+
+    pub fn island_visible(&self, i: usize) -> bool {
+        !self.hidden[self.island_object[i] as usize]
+    }
+
+    /// Clic dans l'éditeur UV : sélectionne l'îlot `i` seul, ou le bascule avec Maj.
+    pub fn click_island(&mut self, i: Option<usize>, extend: bool) {
+        match (i, extend) {
+            (Some(i), false) => {
+                self.island_selected.iter_mut().for_each(|s| *s = false);
+                self.island_selected[i] = true;
+            }
+            (Some(i), true) => self.island_selected[i] = !self.island_selected[i],
+            (None, false) => self.island_selected.iter_mut().for_each(|s| *s = false),
+            (None, true) => {}
+        }
+        self.touch();
+    }
+
+    pub fn select_all_islands(&mut self, on: bool) {
+        for i in 0..self.island_selected.len() {
+            self.island_selected[i] = on && self.island_visible(i);
+        }
+        self.touch();
+    }
+
+    pub fn invert_islands(&mut self) {
+        for i in 0..self.island_selected.len() {
+            self.island_selected[i] = !self.island_selected[i] && self.island_visible(i);
+        }
+        self.touch();
+    }
+
+    /// Sélection au rectangle : îlots dont un centre de face est dans [lo, hi].
+    /// `mode` : 1 = ajouter, -1 = retirer, 0 = remplacer.
+    pub fn box_select_islands(&mut self, lo: [f32; 2], hi: [f32; 2], mode: i32) {
+        let Some(uv) = &self.uv else { return };
+        let m = &self.model.mesh;
+        let mut inside = vec![false; self.island_selected.len()];
+        for f in 0..m.face_count() {
+            if self.hidden[self.face_object[f] as usize] {
+                continue;
+            }
+            let r = m.face_range(f);
+            let n = r.len() as f32;
+            let c = r.fold([0.0f32; 2], |a, ci| [a[0] + uv.corner_uv[ci][0] / n, a[1] + uv.corner_uv[ci][1] / n]);
+            if c[0] >= lo[0] && c[0] <= hi[0] && c[1] >= lo[1] && c[1] <= hi[1] {
+                inside[self.face_island[f] as usize] = true;
+            }
+        }
+        for (s, hit) in self.island_selected.iter_mut().zip(inside) {
+            *s = match mode {
+                1 => *s || hit,
+                -1 => *s && !hit,
+                _ => hit,
+            };
+        }
+        self.touch();
+    }
+
+    /// Coins des îlots sélectionnés.
+    pub fn selected_corners(&self) -> Vec<u32> {
+        (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).flat_map(|i| self.island_corners[i].iter().copied()).collect()
+    }
+
+    /// Boîte UV (min, max) d'un ensemble de coins.
+    pub fn corners_bounds(&self, corners: &[u32]) -> Option<([f32; 2], [f32; 2])> {
+        let uv = self.uv.as_ref()?;
+        if corners.is_empty() {
+            return None;
+        }
+        let mut lo = [f32::MAX; 2];
+        let mut hi = [f32::MIN; 2];
+        for &c in corners {
+            let p = uv.corner_uv[c as usize];
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        Some((lo, hi))
+    }
+
+    /// Applique `f` aux UV d'origine `orig` des coins `corners` (transformation interactive).
+    pub fn transform_corners(&mut self, orig: &[[f32; 2]], corners: &[u32], f: impl Fn([f32; 2]) -> [f32; 2]) {
+        let Some(uv) = &mut self.uv else { return };
+        for &c in corners {
+            uv.corner_uv[c as usize] = f(orig[c as usize]);
+        }
+        self.touch();
+    }
+
+    /// Transformation de chaque îlot sélectionné autour de son propre centre (miroir,
+    /// quart de tour) : `f(p - centre)`.
+    pub fn per_island(&mut self, f: impl Fn([f32; 2]) -> [f32; 2], texture_size: u32) -> usize {
+        let sel: Vec<usize> = (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).collect();
+        for &i in &sel {
+            let corners = self.island_corners[i].clone();
+            let Some((lo, hi)) = self.corners_bounds(&corners) else { continue };
+            let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+            let uv = self.uv.as_mut().unwrap();
+            for &k in &corners {
+                let p = uv.corner_uv[k as usize];
+                let q = f([p[0] - c[0], p[1] - c[1]]);
+                uv.corner_uv[k as usize] = [q[0] + c[0], q[1] + c[1]];
+            }
+        }
+        if !sel.is_empty() {
+            self.refresh(texture_size);
+        }
+        sel.len()
+    }
+
+    /// Redresse les îlots sélectionnés : boîte englobante minimale alignée sur les axes,
+    /// côté long horizontal, centre conservé.
+    pub fn straighten_islands(&mut self, texture_size: u32) -> usize {
+        let sel: Vec<usize> = (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).collect();
+        for &i in &sel {
+            let corners = self.island_corners[i].clone();
+            let Some((lo, hi)) = self.corners_bounds(&corners) else { continue };
+            let uv = self.uv.as_mut().unwrap();
+            let mut pts: Vec<V2> = corners.iter().map(|&k| V2::new(uv.corner_uv[k as usize][0] as f64, uv.corner_uv[k as usize][1] as f64)).collect();
+            let (w, h) = easyuv::pack::orient_min_box(&mut pts);
+            let off = [(lo[0] + hi[0]) as f64 * 0.5 - w * 0.5, (lo[1] + hi[1]) as f64 * 0.5 - h * 0.5];
+            for (k, p) in corners.iter().zip(pts) {
+                uv.corner_uv[*k as usize] = [(p.x + off[0]) as f32, (p.y + off[1]) as f32];
+            }
+        }
+        if !sel.is_empty() {
+            self.refresh(texture_size);
+        }
+        sel.len()
+    }
+
+    /// Rend droites les bandes / grilles de quads sélectionnées. Retourne (redressés, ignorés).
+    pub fn straighten_strips(&mut self, texture_size: u32) -> (usize, usize) {
+        let Some(uv) = &mut self.uv else { return (0, 0) };
+        let r = easyuv::layout::straighten_grid(&self.model.mesh, &mut uv.corner_uv, &self.face_island, &self.island_selected);
+        if r.0 > 0 {
+            self.refresh(texture_size);
+        }
+        r
+    }
+
+    // ---------- objets : orientation ----------
+
+    /// Quart de tour des objets sélectionnés (tous si aucune sélection) : redresse un import
+    /// couché. Les UV ne changent pas.
+    pub fn rotate_objects_quarter(&mut self, axis: usize, positive: bool) -> usize {
+        let targets = self.unwrap_targets();
+        for &i in &targets {
+            self.model.rotate_object_quarter(i, axis, positive);
+        }
+        let mesh = &self.model.mesh;
+        self.face_normals = (0..mesh.face_count()).map(|f| mesh.face_normal(f)).collect();
+        let (lo, hi) = mesh.bounds();
+        self.radius = (hi - lo).length() * 0.5;
+        self.touch();
+        targets.len()
     }
 
     /// Recalcule étirement et densité après modification des UV.
@@ -539,6 +763,52 @@ mod tests {
         assert!(max > 0.9);
         let nv = s.model.mesh.positions.len() as u32;
         assert!(uv.seams.iter().all(|&(a, b)| a < nv && b < nv));
+    }
+
+    #[test]
+    fn islands_pick_select_transform() {
+        let mut s = scene();
+        let n = s.island_selected.len();
+        assert!(n >= 6, "{n} îlots");
+        // le centre d'un triangle d'une face est sur son îlot
+        let f = 0;
+        let uv = s.uv.as_ref().unwrap();
+        let r = s.model.mesh.face_range(f);
+        let t: Vec<[f32; 2]> = r.clone().take(3).map(|c| uv.corner_uv[c]).collect();
+        let p = [(t[0][0] + t[1][0] + t[2][0]) / 3.0, (t[0][1] + t[1][1] + t[2][1]) / 3.0];
+        let hit = s.pick_island(p).unwrap();
+        assert_eq!(hit, s.face_island[f] as usize);
+        s.click_island(Some(hit), false);
+        assert_eq!(s.island_selected.iter().filter(|&&x| x).count(), 1);
+        // déplacement : seuls les coins de l'îlot bougent
+        let orig = s.uv.as_ref().unwrap().corner_uv.clone();
+        let corners = s.selected_corners();
+        s.transform_corners(&orig, &corners, |q| [q[0] + 2.0, q[1]]);
+        let now = &s.uv.as_ref().unwrap().corner_uv;
+        let moved = (0..now.len()).filter(|&c| now[c] != orig[c]).count();
+        assert_eq!(moved, corners.len());
+        assert!(s.pick_island(p).is_none_or(|i| i != hit));
+        // miroir autour du centre de l'îlot : la boîte ne change pas
+        let b0 = s.corners_bounds(&corners).unwrap();
+        s.per_island(|p| [-p[0], p[1]], 2048);
+        let b1 = s.corners_bounds(&corners).unwrap();
+        assert!((b0.0[0] - b1.0[0]).abs() < 1e-5 && (b0.1[1] - b1.1[1]).abs() < 1e-5);
+        s.select_all_islands(true);
+        assert!(s.island_selected.iter().all(|&x| x));
+    }
+
+    #[test]
+    fn rotate_object_keeps_it_on_the_ground() {
+        let mut s = scene();
+        s.click(Some(1), false);
+        let o = s.model.objects[1].clone();
+        let zmin = |s: &Scene| s.model.mesh.positions[o.vert_start..o.vert_end].iter().map(|p| p.z).fold(f64::MAX, f64::min);
+        let before = zmin(&s);
+        assert_eq!(s.rotate_objects_quarter(0, true), 1);
+        assert!((zmin(&s) - before).abs() < 1e-9);
+        // le tore (plat sur Z) est maintenant debout : sa hauteur devient son diamètre
+        let h = s.model.mesh.positions[o.vert_start..o.vert_end].iter().map(|p| p.z).fold(f64::MIN, f64::max) - zmin(&s);
+        assert!(h > 2.0, "hauteur {h}");
     }
 
     #[test]
