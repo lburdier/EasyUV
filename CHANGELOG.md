@@ -2,6 +2,11 @@
 
 ## [0.3.1] - 2026-10-23
 
+### Formes organiques (crosses, sculptures)
+- **Coutures sans escaliers** : quand un îlot est redécoupé, la frontière entre les deux moitiés est optimisée face par face (longueur + pénalité à chaque virage). Sur une grille de quads dense, les coutures suivent les boucles d'arêtes au lieu de zigzaguer : virages des coutures -43 % en moyenne sur le corpus de test, -56 % sur une forme organique en quads.
+- **Moins de miettes** : les petits îlots voisins sont fusionnés jusqu'à 3 % de la surface (au lieu de 1 %) quand la qualité le permet ; -10 % d'îlots sur le corpus, distorsion inchangée. Sur la crosse du revolver de test : 180 -> 159 îlots.
+- Un îlot replié sur lui-même est d'abord détendu plus longtemps avant d'être redécoupé.
+
 ### Rendre droit, une bonne fois pour toutes
 - **Grille parfaite** (`Maj+G`) : chaque rangée et chaque colonne de l'îlot passe sur une droite, comme tracée à la règle. Rangées et colonnes sont lues face par face (les diagonales des triangles ne comptent pas), les rangées fines d'un biseau restent distinctes, l'orientation de l'îlot est trouvée seule. Sur la sélection, ou sur tous les îlots ; un îlot qui en serait abîmé reste tel quel.
 - « Rendre droit » finit désormais par la Grille parfaite : les lignes intérieures ne gondolent plus.

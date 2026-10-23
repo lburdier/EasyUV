@@ -262,6 +262,38 @@ pub fn measure_density(mesh: &Mesh, corner_uv: &[[f32; 2]], texture_size: u32) -
 
 #[cfg(test)]
 mod tests {
+    /// Virage moyen des coutures (0 = droites, 0,5 = angle droit à chaque sommet) : une
+    /// couture en escalier sur une grille de quads tourne à chaque marche.
+    fn seam_turn(m: &mesh::Mesh, seams: &[(u32, u32)]) -> f64 {
+        let mut adj: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for &(a, b) in seams {
+            adj.entry(a).or_default().push(b);
+            adj.entry(b).or_default().push(a);
+        }
+        let (mut t, mut n) = (0.0f64, 0.0f64);
+        for (&v, nb) in &adj {
+            if let [a, b] = nb[..] {
+                let (u1, u2) = (m.positions[a as usize] - m.positions[v as usize], m.positions[b as usize] - m.positions[v as usize]);
+                t += (1.0 + u1.dot(u2) / (u1.length() * u2.length()).max(1e-300)) * 0.5;
+                n += 1.0;
+            }
+        }
+        t / n.max(1.0)
+    }
+
+    #[test]
+    fn organic_seams_follow_edge_loops() {
+        // forme organique dense en quads : les découpes suivent les boucles d'arêtes au lieu
+        // de faire des escaliers
+        let m = crate::primitives::blob(1.0, 96, 48);
+        let mut p = Params::default();
+        p.shape = crate::regions::ShapePreset::Organic;
+        let r = smart_unwrap(&m, &p, &[]);
+        let turn = seam_turn(&m, &r.seams);
+        eprintln!("virage moyen des coutures : {turn:.3}, {} îlots", r.stats.charts);
+        assert!(turn < 0.2, "coutures en escalier : virage moyen {turn:.3}");
+    }
+
     use super::*;
 
     fn check(mesh: &Mesh, name: &str) -> UvResult {
