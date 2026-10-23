@@ -76,6 +76,8 @@ pub struct Scene {
     pub corner_sel: Vec<bool>,
     /// Coutures marquées à la main (paires de sommets, a < b), imposées aux dépliages.
     pub marked_seams: HashSet<(u32, u32)>,
+    /// Îlot survolé dans l'éditeur UV : mis en évidence sur le modèle 3D.
+    pub hover_island: Option<usize>,
 }
 
 /// Une entrée de reconstruction : objet source, décalage éventuel (copie), état.
@@ -114,6 +116,7 @@ impl Scene {
             sel_mode: SelectMode::Island,
             corner_sel: Vec::new(),
             marked_seams: HashSet::new(),
+            hover_island: None,
         };
         s.rebuild_derived();
         s
@@ -486,6 +489,7 @@ impl Scene {
         self.face_island = fi;
         self.island_selected = vec![false; n];
         self.corner_sel = vec![false; m.corners.len()];
+        self.hover_island = None;
     }
 
     // ---------- édition UV (îlots) ----------
@@ -1087,7 +1091,7 @@ impl Scene {
     /// Transformation de chaque îlot sélectionné autour de son propre centre (miroir,
     /// quart de tour) : `f(p - centre)`.
     pub fn per_island(&mut self, f: impl Fn([f32; 2]) -> [f32; 2], texture_size: u32) -> usize {
-        let sel: Vec<usize> = (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).collect();
+        let sel = self.selected_island_ids();
         for &i in &sel {
             let corners = self.island_corners[i].clone();
             let Some((lo, hi)) = self.corners_bounds(&corners) else { continue };
@@ -1108,7 +1112,7 @@ impl Scene {
     /// Redresse les îlots sélectionnés : boîte englobante minimale alignée sur les axes,
     /// côté long horizontal, centre conservé.
     pub fn straighten_islands(&mut self, texture_size: u32) -> usize {
-        let sel: Vec<usize> = (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).collect();
+        let sel = self.selected_island_ids();
         for &i in &sel {
             let corners = self.island_corners[i].clone();
             let Some((lo, hi)) = self.corners_bounds(&corners) else { continue };
@@ -1127,9 +1131,15 @@ impl Scene {
     }
 
     /// Rend droites les bandes / grilles de quads sélectionnées. Retourne (redressés, ignorés).
+    /// En mode sommets, 4 sommets choisis sur le bord d'un îlot en sont les coins imposés.
     pub fn straighten_strips(&mut self, texture_size: u32) -> (usize, usize) {
+        let mut which = vec![false; self.island_selected.len()];
+        for i in self.selected_island_ids() {
+            which[i] = true;
+        }
+        let hint: Vec<usize> = if self.sel_mode == SelectMode::Vertex { self.selected_corners().into_iter().map(|c| c as usize).collect() } else { Vec::new() };
         let Some(uv) = &mut self.uv else { return (0, 0) };
-        let r = easyuv::layout::straighten_grid(&self.model.mesh, &mut uv.corner_uv, &self.face_island, &self.island_selected);
+        let r = easyuv::layout::straighten_with_corners(&self.model.mesh, &mut uv.corner_uv, &self.face_island, &which, &hint);
         if r.0 > 0 {
             self.refresh(texture_size);
         }

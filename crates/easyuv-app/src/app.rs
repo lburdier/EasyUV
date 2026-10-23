@@ -957,7 +957,7 @@ impl EasyUvApp {
             self.undo.pop();
         }
         self.status = match (done, skipped) {
-            (0, _) => "Rien à rendre droit : il faut des bandes (quads en grille ou arcs), pas des couvercles. Un îlot qui serait abîmé n'est pas modifié".into(),
+            (0, _) => "Rien à rendre droit : il faut une bande, pas un couvercle. Astuce : en mode sommets (1), choisissez les 4 coins de la bande puis Maj+W".into(),
             (d, 0) => format!("{d} îlot(s) rendu(s) droit(s) — Ctrl+P pour ranger"),
             (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) : pas une bande, ou le redressement l'aurait abîmé"),
         };
@@ -1810,10 +1810,13 @@ impl EasyUvApp {
                     section(ui, "Damier", true, |ui| {
                         egui::Grid::new("chk").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                             ui.label("Style");
-                            ui.horizontal(|ui| {
-                                self.texture_dirty |= ui.selectable_value(&mut self.checker_style, CheckerStyle::Color, "Couleur").changed();
-                                self.texture_dirty |= ui.selectable_value(&mut self.checker_style, CheckerStyle::Mono, "Mono").changed();
+                            let before = self.checker_style;
+                            egui::ComboBox::from_id_salt("checker_style").selected_text(self.checker_style.label()).width(150.0).show_ui(ui, |ui| {
+                                for st in CheckerStyle::ALL {
+                                    ui.selectable_value(&mut self.checker_style, st, st.label()).on_hover_text(st.help());
+                                }
                             });
+                            self.texture_dirty |= self.checker_style != before;
                             ui.end_row();
                             ui.label("Cellules");
                             self.texture_dirty |= ui.add(egui::Slider::new(&mut self.checker_cells, 2..=64)).changed();
@@ -1822,6 +1825,7 @@ impl EasyUvApp {
                             ui.add(egui::Slider::new(&mut self.view.tiling, 0.25..=16.0).logarithmic(true));
                             ui.end_row();
                         });
+                        ui.label(RichText::new(self.checker_style.help()).small().color(theme::TEXT_DIM));
                         let cell_px = self.params.texture_size as f32 / (self.checker_cells as f32 * self.view.tiling);
                         ui.label(RichText::new(format!("1 case ≈ {cell_px:.0} px de texture")).small().color(theme::TEXT_DIM));
                     });

@@ -213,6 +213,12 @@ pub fn layout_islands(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u3
 /// recalculé par LSCM en s'appuyant sur la bande droite. L'îlot garde sa surface UV et son
 /// centre, côté long horizontal. Retourne (îlots redressés, îlots ignorés : pas de quads).
 pub fn straighten_grid(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u32], which: &[bool]) -> (usize, usize) {
+    straighten_with_corners(mesh, corner_uv, face_island, which, &[])
+}
+
+/// Comme [`straighten_grid`], avec des coins imposés : si l'on a choisi exactement 4 sommets
+/// du bord d'un îlot (`corners` : indices de coins), ce sont les coins du rectangle.
+pub fn straighten_with_corners(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u32], which: &[bool], corners: &[usize]) -> (usize, usize) {
     let n_isl = which.len();
     let mut faces: Vec<Vec<usize>> = vec![Vec::new(); n_isl];
     for f in 0..mesh.face_count() {
@@ -223,7 +229,7 @@ pub fn straighten_grid(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u
     }
     let (mut done, mut skipped) = (0, 0);
     for fs in faces.iter().filter(|fs| !fs.is_empty()) {
-        match straighten_one(mesh, corner_uv, fs) {
+        match straighten_one(mesh, corner_uv, fs, corners) {
             Ok(()) => done += 1,
             Err(why) => {
                 if std::env::var_os("EASYUV_PROFILE").is_some() {
@@ -236,7 +242,7 @@ pub fn straighten_grid(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u
     (done, skipped)
 }
 
-fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize]) -> Result<(), &'static str> {
+fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize], hint_corners: &[usize]) -> Result<(), &'static str> {
     // sommets locaux : (sommet, UV) -> id
     let key = |c: usize| (mesh.corners[c], corner_uv[c][0].to_bits(), corner_uv[c][1].to_bits());
     let mut ids: HashMap<(u32, u32, u32), usize> = HashMap::new();
@@ -269,31 +275,55 @@ fn straighten_one(mesh: &Mesh, corner_uv: &mut [[f32; 2]], fs: &[usize]) -> Resu
         }
     }
 
-    // candidats : grille de quads (exacte quand elle couvre l'îlot) et déroulé polaire
-    // (arc de cône, quelle que soit la topologie) ; on garde le moins abîmé
+    // coins imposés : 4 sommets distincts de cet îlot choisis par l'utilisateur
+    let hint: Option<Vec<usize>> = {
+        let set: std::collections::HashSet<usize> = hint_corners.iter().copied().collect();
+        let mut vs: Vec<usize> = corner_ids.iter().filter(|(c, _)| set.contains(c)).map(|&(_, v)| v).collect();
+        vs.sort();
+        vs.dedup();
+        (vs.len() == 4).then_some(vs)
+    };
+
+    // candidats : grille de quads (exacte quand elle couvre l'îlot), déroulé polaire (arc de
+    // cône) et rectangle à bord épinglé (n'importe quelle bande : ondulée, irrégulière, avec
+    // triangles) ; parmi ceux qui n'abîment pas l'îlot, le moins déformé l'emporte
     let before = damaged(&fv, &pos3, &orig);
-    let mut cands: Vec<(usize, u8, Vec<V2>)> = Vec::new();
+    // (abîmées, genre, distorsion pondérée, UV)
+    let mut cands: Vec<(usize, u8, f64, Vec<V2>)> = Vec::new();
     let mut why = "pas une bande";
-    match grid_straight(&fv, &pos3, &edge_faces) {
-        Ok((uv, full)) => {
-            if let Some(uv) = finalize(&fv, &orig, uv) {
-                cands.push((damaged(&fv, &pos3, &uv), if full { 0 } else { 2 }, uv));
-            }
+    let mut push = |kind: u8, bias: f64, uv: Vec<V2>| {
+        if let Some(uv) = finalize(&fv, &orig, uv) {
+            cands.push((damaged(&fv, &pos3, &uv), kind, distortion(&fv, &pos3, &uv) * bias, uv));
         }
+    };
+    match grid_straight(&fv, &pos3, &edge_faces) {
+        // une grille qui couvre tout est la référence ; partielle, son bout n'est pas garanti droit
+        Ok((uv, full)) => push(if full { 0 } else { 2 }, if full { 0.75 } else { 1.6 }, uv),
         Err(e) => why = e,
     }
-    if let Some(uv) = polar_straight(&fv, &orig).and_then(|uv| finalize(&fv, &orig, uv)) {
-        cands.push((damaged(&fv, &pos3, &uv), 1, uv));
+    if let Some(uv) = polar_straight(&fv, &orig) {
+        push(1, 1.0, uv);
+    }
+    if let Some(uv) = rect_straight(&fv, &pos3, &orig, &edge_faces, hint.as_deref()) {
+        // coins choisis à la main : l'intention de l'utilisateur passe devant
+        push(3, if hint.is_some() { 0.3 } else { 1.0 }, uv);
     }
     if std::env::var_os("EASYUV_PROFILE").is_some() {
-        eprintln!("rendre droit : {} faces, abîmées avant {before}, candidats (genre, abîmées) {:?}", fv.len(), cands.iter().map(|c| (c.1, c.0)).collect::<Vec<_>>());
+        eprintln!(
+            "rendre droit : {} faces, abîmées avant {before}, candidats (genre, abîmées, distorsion) {:?}",
+            fv.len(),
+            cands.iter().map(|c| (c.1, c.0, c.2)).collect::<Vec<_>>()
+        );
     }
-    let Some((dmg, _, uv)) = cands.into_iter().min_by_key(|c| (c.0, c.1)) else { return Err(why) };
+    if cands.is_empty() {
+        return Err(why);
+    }
     // aucun résultat propre : l'îlot reste tel quel plutôt que d'être abîmé. Petite marge :
     // le triangle d'une jonction en T devient forcément un trait sur une grille droite
-    if dmg > before + (fv.len() / 50).max(1) {
+    let tol = before + (fv.len() / 50).max(1);
+    let Some((_, _, _, uv)) = cands.into_iter().filter(|c| c.0 <= tol).min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)) else {
         return Err("le redressement abîmerait des faces");
-    }
+    };
     for &(c, v) in &corner_ids {
         corner_uv[c] = [uv[v].x as f32, uv[v].y as f32];
     }
@@ -479,7 +509,7 @@ fn grid_straight(fv: &[Vec<usize>], pos3: &[crate::math::V3], edge_faces: &EdgeF
                 fixed[nv + v] = Some(uv[v].y);
             }
         }
-        let solved = crate::unwrap::lscm_pinned(&pos3, &tris, &fixed, &uv, 3000);
+        let solved = crate::unwrap::lscm_pinned(pos3, &tris, &fixed, &uv, 3000);
         if solved.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
             return Err("résolution impossible");
         }
@@ -487,6 +517,191 @@ fn grid_straight(fv: &[Vec<usize>], pos3: &[crate::math::V3], edge_faces: &EdgeF
     }
 
     Ok((uv, n_in == fv.len()))
+}
+
+/// Bord unique de l'îlot, dans le sens des faces ; None si l'îlot n'est pas un disque.
+fn boundary_loop(fv: &[Vec<usize>], edge_faces: &EdgeFaces) -> Option<Vec<usize>> {
+    let mut next: HashMap<usize, usize> = HashMap::new();
+    for q in fv {
+        for k in 0..q.len() {
+            let (a, b) = (q[k], q[(k + 1) % q.len()]);
+            if a != b && edge_faces.get(&(a.min(b), a.max(b))).is_some_and(|f| f.len() == 1) && next.insert(a, b).is_some() {
+                return None; // sommet de bord touché deux fois : pas un disque simple
+            }
+        }
+    }
+    let start = *next.keys().min()?;
+    let mut lp = vec![start];
+    let mut v = *next.get(&start)?;
+    while v != start {
+        lp.push(v);
+        v = *next.get(&v)?;
+        if lp.len() > next.len() {
+            return None;
+        }
+    }
+    (lp.len() == next.len()).then_some(lp)
+}
+
+/// Rectangle à bord épinglé (« rectangulariser », comme dans RizomUV ou Maya) : les 4 coins
+/// de la bande vont aux coins d'un rectangle, chaque côté y est réparti selon ses longueurs
+/// 3D, et l'intérieur suit par LSCM. Indépendant de la topologie et de la courbure.
+/// Les coins sont trouvés seuls (là où le bord tourne le plus, à distance les uns des
+/// autres) ou imposés par `hint` (4 sommets locaux du bord).
+fn rect_straight(fv: &[Vec<usize>], pos3: &[crate::math::V3], orig: &[V2], edge_faces: &EdgeFaces, hint: Option<&[usize]>) -> Option<Vec<V2>> {
+    let lp = boundary_loop(fv, edge_faces)?;
+    let n = lp.len();
+    if n < 4 {
+        return None;
+    }
+    let seg: Vec<f64> = (0..n).map(|i| (pos3[lp[(i + 1) % n]] - pos3[lp[i]]).length()).collect();
+    let perim: f64 = seg.iter().sum();
+    let mut s = vec![0.0; n];
+    for i in 1..n {
+        s[i] = s[i - 1] + seg[i - 1];
+    }
+    let area: f64 = fv.iter().map(|q| (1..q.len() - 1).map(|k| 0.5 * (pos3[q[k]] - pos3[q[0]]).cross(pos3[q[k + 1]] - pos3[q[0]]).length()).sum::<f64>()).sum();
+    let corners: Vec<usize> = match hint {
+        Some(h) => {
+            let mut c: Vec<usize> = h.iter().filter_map(|v| lp.iter().position(|x| x == v)).collect();
+            if c.len() != 4 {
+                return None;
+            }
+            c.sort();
+            c
+        }
+        None => {
+            // bande : périmètre ≈ 2 (L + W), aire ≈ L W ; un disque ou un carré n'en est pas une
+            let disc = perim * perim / 4.0 - 4.0 * area;
+            if disc <= 0.0 {
+                return None;
+            }
+            let w = (perim / 2.0 - disc.sqrt()) / 2.0;
+            let l = perim / 2.0 - w;
+            if w <= 0.0 || l < 2.5 * w {
+                return None;
+            }
+            // virage du bord en UV, mesuré sur une fenêtre d'un tiers de largeur
+            let at = |target: f64| -> usize {
+                let t = target.rem_euclid(perim);
+                s.partition_point(|&x| x <= t).saturating_sub(1)
+            };
+            let h = (w * 0.35).max(1e-12);
+            let turn: Vec<f64> = (0..n)
+                .map(|i| {
+                    let (a, b, c) = (orig[lp[at(s[i] - h)]], orig[lp[i]], orig[lp[at(s[i] + h)]]);
+                    let (d1, d2) = (b - a, c - b);
+                    d1.cross(d2).atan2(d1.dot(d2)).abs()
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| turn[b].partial_cmp(&turn[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+            let cyc = |a: usize, b: usize| {
+                let d = (s[a] - s[b]).abs();
+                d.min(perim - d)
+            };
+            let mut c: Vec<usize> = Vec::new();
+            for i in order {
+                if c.iter().all(|&j| cyc(i, j) >= 0.5 * w) {
+                    c.push(i);
+                    if c.len() == 4 {
+                        break;
+                    }
+                }
+            }
+            if c.len() != 4 {
+                return None;
+            }
+            c.sort();
+            c
+        }
+    };
+    // côtés entre coins consécutifs ; les deux plus longs opposés sont les rails
+    let side_len = |k: usize| -> f64 {
+        let (a, b) = (corners[k], corners[(k + 1) % 4]);
+        let (sa, sb) = (s[a], s[b]);
+        if sb > sa {
+            sb - sa
+        } else {
+            perim - sa + sb
+        }
+    };
+    let len: Vec<f64> = (0..4).map(side_len).collect();
+    let r = if len[0] + len[2] >= len[1] + len[3] { 0 } else { 1 };
+    let (lr, hr) = ((len[r] + len[r + 2]) / 2.0, (len[(r + 1) % 4] + len[(r + 3) % 4]) / 2.0);
+    if lr <= 0.0 || hr <= 0.0 {
+        return None;
+    }
+    let nv = pos3.len();
+    let mut fixed: Vec<Option<f64>> = vec![None; 2 * nv];
+    for j in 0..4 {
+        let k = (r + j) % 4;
+        let (a, b) = (corners[k], corners[(k + 1) % 4]);
+        let total = len[k].max(1e-300);
+        let mut i = a;
+        let mut acc = 0.0;
+        while i != b {
+            let t = acc / total;
+            let p = match j {
+                0 => V2::new(t * lr, 0.0),
+                1 => V2::new(lr, t * hr),
+                2 => V2::new((1.0 - t) * lr, hr),
+                _ => V2::new(0.0, (1.0 - t) * hr),
+            };
+            fixed[lp[i]] = Some(p.x);
+            fixed[nv + lp[i]] = Some(p.y);
+            acc += seg[i];
+            i = (i + 1) % n;
+        }
+    }
+    let tris: Vec<[u32; 3]> = fv.iter().flat_map(|q| (1..q.len() - 1).map(move |k| [q[0] as u32, q[k] as u32, q[k + 1] as u32])).collect();
+    let init: Vec<V2> = (0..nv)
+        .map(|v| match (fixed[v], fixed[nv + v]) {
+            (Some(x), Some(y)) => V2::new(x, y),
+            _ => V2::new(lr * 0.5, hr * 0.5),
+        })
+        .collect();
+    let uv = crate::unwrap::lscm_pinned(pos3, &tris, &fixed, &init, 4000);
+    uv.iter().all(|p| p.x.is_finite() && p.y.is_finite()).then_some(uv)
+}
+
+/// Distorsion moyenne (angles et aires, à l'échelle de l'îlot), pondérée par l'aire 3D.
+fn distortion(fv: &[Vec<usize>], pos3: &[crate::math::V3], uv: &[V2]) -> f64 {
+    let (mut a3, mut au) = (0.0, 0.0);
+    for q in fv {
+        for k in 1..q.len() - 1 {
+            a3 += 0.5 * (pos3[q[k]] - pos3[q[0]]).cross(pos3[q[k + 1]] - pos3[q[0]]).length();
+            au += 0.5 * (uv[q[k]] - uv[q[0]]).cross(uv[q[k + 1]] - uv[q[0]]).abs();
+        }
+    }
+    let scale = (au / a3.max(1e-300)).sqrt().max(1e-300);
+    let (mut e, mut w) = (0.0, 0.0);
+    for q in fv {
+        for k in 1..q.len() - 1 {
+            let (p0, p1, p2) = (pos3[q[0]], pos3[q[k]], pos3[q[k + 1]]);
+            let (e1, e2) = (p1 - p0, p2 - p0);
+            let nrm = e1.cross(e2);
+            let l1 = e1.length();
+            let area = 0.5 * nrm.length();
+            if area <= 1e-20 || l1 <= 1e-20 {
+                continue;
+            }
+            let ax = e1 * (1.0 / l1);
+            let ay = nrm.normalized().cross(ax);
+            let (x2, y2) = (e2.dot(ax), e2.dot(ay));
+            let (du1, du2) = ((uv[q[k]] - uv[q[0]]) * (1.0 / scale), (uv[q[k + 1]] - uv[q[0]]) * (1.0 / scale));
+            let j = [du1.x / l1, (du2.x - du1.x * x2 / l1) / y2, du1.y / l1, (du2.y - du1.y * x2 / l1) / y2];
+            let (s1, s2) = crate::math::singular_values_2x2(j[0], j[1], j[2], j[3]);
+            let d = if s2 <= 1e-9 { 3.0 } else { (0.5 * (s1 / s2).ln() + 0.5 * (s1 * s2).ln().abs()).min(3.0) };
+            e += d * area;
+            w += area;
+        }
+    }
+    if w > 0.0 {
+        e / w
+    } else {
+        0.0
+    }
 }
 
 /// Déroulé polaire : une bande courbe dépliée (arc de cône) est un secteur d'anneau. On
@@ -812,6 +1027,73 @@ mod tests {
             let spread = row.iter().fold(f32::MIN, |a, &b| a.max(b)) - row.iter().fold(f32::MAX, |a, &b| a.min(b));
             assert!(spread < 0.05 * height, "rangée {j} pas droite : écart {spread} pour une hauteur {height}");
         }
+    }
+
+    /// Bande de 24 × 4 dont les UV ondulent en S, avec des triangles au bout et au milieu :
+    /// ni la grille de quads ni le déroulé polaire ne suffisent.
+    fn wavy_strip() -> (Mesh, Vec<[f32; 2]>, u32) {
+        let (nx, ny) = (24u32, 4u32);
+        let w = nx + 1;
+        let mut pos = Vec::new();
+        for j in 0..=ny {
+            for i in 0..=nx {
+                pos.push(crate::math::V3::new(i as f64 * 0.1, j as f64 * 0.1, 0.0));
+            }
+        }
+        let mut faces = Vec::new();
+        for j in 0..ny {
+            for i in 0..nx {
+                let (a, b, c, d) = (j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i);
+                if i < 2 || (11..13).contains(&i) {
+                    faces.push(vec![a, b, c]);
+                    faces.push(vec![a, c, d]);
+                } else {
+                    faces.push(vec![a, b, c, d]);
+                }
+            }
+        }
+        let m = Mesh::from_faces(pos, &faces);
+        let uv: Vec<[f32; 2]> = m
+            .corners
+            .iter()
+            .map(|&v| {
+                let (i, j) = ((v % w) as f64, (v / w) as f64);
+                [(i * 0.03) as f32, (j * 0.03 + 0.08 * (i * 0.35).sin()) as f32]
+            })
+            .collect();
+        (m, uv, w)
+    }
+
+    fn rows_straight(m: &Mesh, uv: &[[f32; 2]], w: u32) -> f32 {
+        let mut rows: HashMap<u32, (f32, f32)> = HashMap::new();
+        for (c, &v) in m.corners.iter().enumerate() {
+            let e = rows.entry(v / w).or_insert((f32::MAX, f32::MIN));
+            *e = (e.0.min(uv[c][1]), e.1.max(uv[c][1]));
+        }
+        let height = rows.values().map(|r| r.1).fold(f32::MIN, f32::max) - rows.values().map(|r| r.0).fold(f32::MAX, f32::min);
+        rows.values().map(|r| r.1 - r.0).fold(0.0, f32::max) / height
+    }
+
+    #[test]
+    fn straighten_wavy_strip_with_triangles() {
+        let (m, mut uv, w) = wavy_strip();
+        let fi = vec![0u32; m.face_count()];
+        assert!(rows_straight(&m, &uv, w) > 0.3, "la bande de départ doit onduler");
+        assert_eq!(straighten_grid(&m, &mut uv, &fi, &[true]), (1, 0));
+        let spread = rows_straight(&m, &uv, w);
+        assert!(spread < 0.03, "rangées pas droites : écart {spread:.3} de la hauteur");
+    }
+
+    #[test]
+    fn straighten_with_four_chosen_corners() {
+        let (m, mut uv, w) = wavy_strip();
+        let fi = vec![0u32; m.face_count()];
+        let ny = 4u32;
+        let wanted = [0, w - 1, ny * w, ny * w + w - 1];
+        let corners: Vec<usize> = wanted.iter().map(|&v| m.corners.iter().position(|&x| x == v).unwrap()).collect();
+        assert_eq!(straighten_with_corners(&m, &mut uv, &fi, &[true], &corners), (1, 0));
+        let spread = rows_straight(&m, &uv, w);
+        assert!(spread < 0.03, "rangées pas droites : écart {spread:.3} de la hauteur");
     }
 
     #[test]

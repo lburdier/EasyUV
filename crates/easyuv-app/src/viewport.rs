@@ -233,7 +233,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
             v.to_bits().hash(&mut hs);
         }
         (w, h, scene.generation, scene as *const Scene as usize, cache.mips_gen).hash(&mut hs);
-        (opt.shading as u8, opt.wire, opt.seams, opt.tiling.to_bits()).hash(&mut hs);
+        (opt.shading as u8, opt.wire, opt.seams, opt.tiling.to_bits(), scene.hover_island).hash(&mut hs);
         let key = hs.finish();
         if key != cache.key || cache.tex.is_none() {
             let frame = render_scene(scene, &b, f * ppp as f64, near, w, h, opt, mips, ppp);
@@ -274,9 +274,19 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
                 (Shading::Stretch, Some(_)) => (rgb(stretch_color(scene.face_stretch[fi])), false),
                 _ => ([204, 204, 204], false),
             };
-            // faces sélectionnées dans l'éditeur UV (mode faces) : teinte orange
-            if scene.sel_mode == crate::scene::SelectMode::Face && scene.face_selected(fi) {
-                color = [255, color[1].min(190), color[2].min(110)];
+            // sélection de l'éditeur UV sur le modèle : îlots (mode îlots) ou faces choisies en
+            // orange, îlot survolé en jaune clair
+            let isl = scene.face_island.get(fi).map(|&i| i as usize);
+            let picked = match scene.sel_mode {
+                crate::scene::SelectMode::Island => isl.is_some_and(|i| scene.island_selected.get(i).copied().unwrap_or(false)),
+                crate::scene::SelectMode::Face => scene.face_selected(fi),
+                _ => false,
+            };
+            let mix = |c: [u8; 3], t: [u8; 3], k: f32| -> [u8; 3] { std::array::from_fn(|j| (c[j] as f32 * (1.0 - k) + t[j] as f32 * k) as u8) };
+            if picked {
+                color = mix(color, [255, 150, 30], 0.6);
+            } else if isl.is_some() && isl == scene.hover_island {
+                color = mix(color, [255, 240, 170], 0.45);
             }
             Some(FaceStyle { color, textured, id: o as u32 + 1 })
         })
