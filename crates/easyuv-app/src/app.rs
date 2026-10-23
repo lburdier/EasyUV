@@ -103,6 +103,8 @@ pub struct EasyUvApp {
     sel_angle: f64,
     /// Vue 3D en mode Édition (Tab, comme Blender) : on y choisit sommets, arêtes et faces.
     edit_mode: bool,
+    /// Dernier mode de sélection vu : passer en sommets / arêtes / faces ouvre l'Édition.
+    last_sel_mode: SelectMode,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -259,6 +261,7 @@ impl EasyUvApp {
             score_time: -1.0,
             sel_angle: 30.0,
             edit_mode: false,
+            last_sel_mode: SelectMode::Island,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -1089,17 +1092,25 @@ impl EasyUvApp {
     }
 
     /// En-tête de la vue 3D, après le titre : Objet / Édition, modes de sélection, projection.
-    fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect) {
+    fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect, title: &str) {
         if r.width() < 660.0 {
             return; // vue étroite : ces boutons restent dans le panneau et les menus
         }
-        let x0 = r.left() + if self.edit_mode { 250.0 } else { 196.0 };
-        let at = egui::Rect::from_min_size(egui::pos2(x0, r.top() + 2.0), egui::vec2(220.0, 22.0));
+        // juste après le titre, quelle que soit sa longueur (« Droite · Orthographique »…)
+        let tw = ui.painter().layout_no_wrap(title.to_string(), egui::TextStyle::Body.resolve(ui.style()), theme::TEXT_DIM).size().x;
+        let x0 = r.left() + 8.0 + tw + 14.0;
+        // les boutons d'affichage occupent la droite de l'en-tête (~390 px)
+        if x0 + if self.edit_mode { 290.0 } else { 190.0 } > r.right() - 390.0 {
+            return;
+        }
+        let at = egui::Rect::from_min_size(egui::pos2(x0, r.top() + 2.0), egui::vec2(300.0, 22.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let label = if self.edit_mode { "Édition" } else { "Objet" };
-                if ui.add(egui::Button::new(RichText::new(label).small()).selected(self.edit_mode)).on_hover_text("Tab : mode Objet (choisir des objets) ou Édition (choisir sommets, arêtes et faces sur le modèle)").clicked() {
+                let label = if self.edit_mode { "Édition  (Tab)" } else { "Objet  (Tab : Édition)" };
+                let txt = if self.edit_mode { RichText::new(label).small().color(Color32::BLACK).strong() } else { RichText::new(label).small() };
+                let b = egui::Button::new(txt).fill(if self.edit_mode { theme::ACCENT_ORANGE } else { theme::WIDGET });
+                if ui.add(b).on_hover_text("Tab : mode Objet (un clic choisit un objet) ou Édition (un clic choisit un sommet, une arête ou une face sur le modèle, comme dans Blender). Choisir les modes sommets, arêtes ou faces passe d'office en Édition.").clicked() {
                     self.edit_mode = !self.edit_mode;
                 }
                 if self.edit_mode {
@@ -2305,6 +2316,16 @@ impl eframe::App for EasyUvApp {
 
         self.object_shortcuts(ctx);
         self.update_score(ctx);
+        // choisir sommets, arêtes ou faces (dans l'éditeur UV ou la vue 3D) passe la vue 3D en
+        // Édition : un clic sur le modèle choisit alors directement ces éléments
+        if let Some(s) = &self.scene {
+            if s.sel_mode != self.last_sel_mode {
+                if s.sel_mode != SelectMode::Island {
+                    self.edit_mode = true;
+                }
+                self.last_sel_mode = s.sel_mode;
+            }
+        }
 
         self.top_bar(root);
         self.status_bar(root);
@@ -2370,7 +2391,7 @@ impl eframe::App for EasyUvApp {
                     }
                     let title = if self.edit_mode { format!("{} · Édition", self.cam.title()) } else { self.cam.title() };
                     Self::editor_header(ui, r, &title, &mut self.view, true);
-                    self.view3d_header_extra(ui, r);
+                    self.view3d_header_extra(ui, r, &title);
                 }
                 if ruv.is_none() {
                     self.uv_rect = None;
@@ -2429,6 +2450,7 @@ impl eframe::App for EasyUvApp {
                         None => "Éditeur UV".to_string(),
                     };
                     let mut dummy = ViewOptions { shading: self.view.shading, wire: false, seams: false, grid: false, tiling: 1.0 };
+                    let title = if r.width() < 760.0 { String::new() } else { title };
                     Self::editor_header(ui, r, &title, &mut dummy, false);
                     self.uv_header_bar(ui, egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 26.0)));
                 }
