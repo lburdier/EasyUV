@@ -302,7 +302,8 @@ pub fn draw_vertices(ui: &egui::Ui, rect: Rect, scene: &Scene, cam: &Camera, cac
         if !rect.contains(q) {
             continue;
         }
-        let visible = cache.pick_face(q).is_some_and(|f| m.face(f).contains(&(v as u32)));
+        // sommet visible d'un objet en Édition
+        let visible = cache.pick_face(q).is_some_and(|f| m.face(f).contains(&(v as u32)) && scene.object_editable(scene.face_object[f] as usize));
         if !visible {
             continue;
         }
@@ -512,10 +513,12 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
             // sélection de l'éditeur UV sur le modèle : îlots (mode îlots) ou faces choisies en
             // orange, îlot survolé en jaune clair
             let isl = scene.face_island.get(fi).map(|&i| i as usize);
-            let picked = match scene.sel_mode {
-                crate::scene::SelectMode::Island => isl.is_some_and(|i| scene.island_selected.get(i).copied().unwrap_or(false)),
-                _ => scene.face_selected(fi),
-            };
+            // en Édition, seuls les objets édités montrent leur sélection d'éléments
+            let picked = scene.object_editable(o)
+                && match scene.sel_mode {
+                    crate::scene::SelectMode::Island => isl.is_some_and(|i| scene.island_selected.get(i).copied().unwrap_or(false)),
+                    _ => scene.face_selected(fi),
+                };
             let mix = |c: [u8; 3], t: [u8; 3], k: f32| -> [u8; 3] { std::array::from_fn(|j| (c[j] as f32 * (1.0 - k) + t[j] as f32 * k) as u8) };
             if picked {
                 color = mix(color, [255, 150, 30], 0.6);
@@ -530,24 +533,29 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
     // arêtes choisies dans l'éditeur UV et coutures marquées à la main, toujours visibles
     let picked: std::collections::HashSet<(u32, u32)> = scene.selected_mesh_edges().into_iter().collect();
     let lw = ppp.round().max(1.0) as u8;
-    if wire || opt.seams || !picked.is_empty() || !scene.marked_seams.is_empty() {
+    // en Édition, comme dans Blender : fil de fer et sélection sur les seuls objets édités
+    let editing = scene.is_editing() && scene.edges.len() < 400_000;
+    if wire || editing || opt.seams || !picked.is_empty() || !scene.marked_seams.is_empty() {
         for &(a, bb, o) in &scene.edges {
             if scene.hidden[o as usize] {
                 continue;
             }
+            let edit_o = scene.in_edit(o as usize);
+            let wire = wire || (editing && edit_o);
             let seam = opt.seams && scene.seam_set.contains(&(a, bb));
             let col = |c: Color32| {
                 let c = rgb(c);
                 [c[0], c[1], c[2], 255]
             };
-            if picked.contains(&(a, bb)) {
+            if picked.contains(&(a, bb)) && scene.object_editable(o as usize) {
                 lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::ACCENT_ORANGE), width: lw * 2 });
             } else if scene.marked_seams.contains(&(a, bb)) {
                 lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::SEAM_MARK), width: lw * 2 });
             } else if seam {
                 lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::SEAM_RED), width: lw * 2 });
             } else if wire {
-                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: [0, 0, 0, 90], width: lw });
+                let color = if edit_o { [0, 0, 0, 150] } else { [0, 0, 0, 90] };
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color, width: lw });
             }
         }
     }
@@ -560,8 +568,15 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
         corner_uv: uv.map(|u| u.corner_uv.as_slice()),
         styles: &styles,
     };
-    let active = scene.has_selection().then_some(scene.active);
-    raster::render(&view, &geo, &lines, mips, opt.tiling, &scene.selected, active, (1.5 * ppp).round().max(1.0) as usize)
+    // en Édition, pas de contour d'objet : la sélection est celle des éléments
+    let none;
+    let (selected, active) = if scene.is_editing() {
+        none = vec![false; scene.selected.len()];
+        (&none, None)
+    } else {
+        (&scene.selected, scene.has_selection().then_some(scene.active))
+    };
+    raster::render(&view, &geo, &lines, mips, opt.tiling, selected, active, (1.5 * ppp).round().max(1.0) as usize)
 }
 
 /// Gizmo d'orientation en haut à droite, comme dans Blender.
