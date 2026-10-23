@@ -168,6 +168,9 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
             // îlot refusé : triangles retournés, distorsion excessive ou îlot replié sur lui-même
             let bad = q.flipped > 0 || q.distortion > params.max_distortion || overlap > OVERLAP_TOL;
             if bad && faces.len() > 1 && depth < MAX_DEPTH {
+                if std::env::var_os("EASYUV_PROFILE").is_some() {
+                    eprintln!("  [redécoupe] faces={} prof={depth} dist={:.3} retournés={} chevauch={:.4}", faces.len(), q.distortion, q.flipped, overlap);
+                }
                 split_geodesic(mesh, topo, &faces, &mut cut, &mut owner, &mut next_tag, depth, &mut work);
                 continue;
             }
@@ -181,6 +184,110 @@ pub fn segment_and_unwrap(mesh: &Mesh, topo: &Topology, params: &Params, forced_
     merge_small_charts(mesh, topo, params, forced_seams, &mut done, &mut cut, &mut owner);
     prof("fusion", t_merge);
     (done, cut, shapes)
+}
+
+/// Redresse la frontière entre les deux moitiés d'un découpage (étiquettes 0 / 1) : des
+/// faces passent d'un côté à l'autre tant que cela diminue la longueur de la frontière plus
+/// une pénalité à chaque virage. Une frontière en escalier (un virage par marche) devient
+/// une ligne qui suit les boucles d'arêtes. Une face ne change de côté que si ses voisines
+/// de chaque côté restent d'un seul tenant autour d'elle (pas de région coupée en deux),
+/// et aucune moitié ne descend sous le quart de sa surface de départ.
+#[allow(clippy::too_many_arguments)]
+fn straighten_boundary(mesh: &Mesh, topo: &Topology, faces: &[u32], local: &std::collections::HashMap<u32, u32>, cut: &[bool], lab: &mut [u32], a: u32, b: u32) {
+    let n = faces.len();
+    // arêtes de chaque face : (arête, voisine locale), dans l'ordre de la face
+    let mut ring: Vec<Vec<(u32, Option<u32>)>> = vec![Vec::new(); n];
+    // arêtes intérieures autour de chaque sommet : (arête, autre sommet, face i, face j)
+    let mut around: std::collections::HashMap<u32, Vec<(u32, u32, u32, u32)>> = std::collections::HashMap::new();
+    let mut lens = Vec::new();
+    for (i, &f) in faces.iter().enumerate() {
+        for c in mesh.face_range(f as usize) {
+            let e = topo.corner_edge[c];
+            let nb = if cut[e as usize] { None } else { topo.opposite(e, f).and_then(|g| local.get(&g).copied()) };
+            ring[i].push((e, nb));
+            if let Some(j) = nb {
+                if (i as u32) < j {
+                    let (va, vb) = topo.edges[e as usize].key;
+                    around.entry(va).or_default().push((e, vb, i as u32, j));
+                    around.entry(vb).or_default().push((e, va, i as u32, j));
+                    lens.push(topo.edges[e as usize].length);
+                }
+            }
+        }
+    }
+    if lens.is_empty() {
+        return;
+    }
+    lens.sort_by(|x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal));
+    // un virage à angle droit coûte environ une arête
+    let lambda = 2.0 * lens[lens.len() / 2];
+    let pos = |v: u32| mesh.positions[v as usize];
+    let turn = |v: u32, lab: &[u32]| -> f64 {
+        let Some(es) = around.get(&v) else { return 0.0 };
+        let bd: Vec<u32> = es.iter().filter(|&&(_, _, i, j)| lab[i as usize] != lab[j as usize]).map(|&(_, o, _, _)| o).collect();
+        match bd.len() {
+            0 | 1 => 0.0,
+            2 => {
+                let (u1, u2) = (pos(bd[0]) - pos(v), pos(bd[1]) - pos(v));
+                let c = u1.dot(u2) / (u1.length() * u2.length()).max(1e-300);
+                (1.0 + c) * 0.5
+            }
+            _ => 1.0,
+        }
+    };
+    let area = |i: usize| topo.face_areas[faces[i] as usize];
+    let mut side_area = [0.0f64; 2];
+    for i in 0..n {
+        if lab[i] <= 1 {
+            side_area[lab[i] as usize] += area(i);
+        }
+    }
+    let floor = [side_area[0] * 0.25, side_area[1] * 0.25];
+    for _pass in 0..40 {
+        let mut changed = false;
+        for i in 0..n {
+            let old = lab[i];
+            if old > 1 || i as u32 == a || i as u32 == b {
+                continue;
+            }
+            let new = 1 - old;
+            // la face doit toucher l'autre côté, et ses voisines de chaque côté former un seul
+            // arc autour d'elle (sinon la déplacer couperait une région en deux)
+            let labels: Vec<Option<u32>> = ring[i].iter().map(|&(_, nb)| nb.map(|j| lab[j as usize])).collect();
+            if !labels.contains(&Some(new)) || side_area[old as usize] - area(i) < floor[old as usize] {
+                continue;
+            }
+            let runs = |want: u32| {
+                let k = labels.len();
+                (0..k).filter(|&t| labels[t] == Some(want) && labels[(t + k - 1) % k] != Some(want)).count()
+            };
+            if runs(old) > 1 || runs(new) > 1 {
+                continue;
+            }
+            // variation d'énergie : longueur de frontière + virages aux sommets de la face
+            let mut d_len = 0.0;
+            for &(e, nb) in &ring[i] {
+                if let Some(j) = nb {
+                    let lj = lab[j as usize];
+                    d_len += topo.edges[e as usize].length * (((new != lj) as i32 - (old != lj) as i32) as f64);
+                }
+            }
+            let verts = mesh.face(faces[i] as usize);
+            let before: f64 = verts.iter().map(|&v| turn(v, lab)).sum();
+            lab[i] = new;
+            let after: f64 = verts.iter().map(|&v| turn(v, lab)).sum();
+            if d_len + lambda * (after - before) < -1e-9 {
+                side_area[old as usize] -= area(i);
+                side_area[new as usize] += area(i);
+                changed = true;
+            } else {
+                lab[i] = old;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Profilage optionnel (variable d'environnement EASYUV_PROFILE).
@@ -230,7 +337,7 @@ fn merge_small_charts(
         // petits îlots d'abord ; paires disjointes
         // seules les miettes (< 1 % de la surface) sont fusionnées : les grands îlots plats (faces de
         // boîte) restent séparés, ils se rangent mieux ainsi
-        let mut order: Vec<usize> = (0..done.len()).filter(|&c| area[c] < 0.01 * total_area).collect();
+        let mut order: Vec<usize> = (0..done.len()).filter(|&c| area[c] < 0.03 * total_area).collect();
         order.sort_by(|&a, &b| area[a].partial_cmp(&area[b]).unwrap().then(a.cmp(&b)));
         let mut used = vec![false; done.len()];
         let mut pairs: Vec<(usize, usize)> = Vec::new();
@@ -347,8 +454,22 @@ fn unwrap_one(chart: &Chart, params: &Params) -> (Vec<V2>, crate::unwrap::Unwrap
         }
     }
     let t = std::time::Instant::now();
-    let overlap = crate::metrics::chart_self_overlap(&chart.tris, &uv, 256);
+    let mut overlap = crate::metrics::chart_self_overlap(&chart.tris, &uv, 256);
     prof("  chevauchement", t);
+    // îlot replié sur lui-même (sculptures, reliefs) : une relaxation plus longue le déplie
+    // souvent, ce qui évite de le redécouper en morceaux
+    if overlap > OVERLAP_TOL && q.distortion.is_finite() {
+        let mut more = uv.clone();
+        arap(chart, &mut more, (params.relax_iterations as usize * 3).max(12), 300 + 200 * params.quality as usize + (8.0 * n.sqrt()) as usize);
+        normalize_scale(chart, &mut more);
+        let q2 = quality(chart, &more);
+        let o2 = crate::metrics::chart_self_overlap(&chart.tris, &more, 256);
+        if o2 < overlap && q2.flipped <= q.flipped && q2.distortion.is_finite() {
+            uv = more;
+            q = q2;
+            overlap = o2;
+        }
+    }
     (uv, q, overlap)
 }
 
@@ -602,6 +723,7 @@ fn split_geodesic(
             break;
         }
     }
+    straighten_boundary(mesh, topo, faces, &local, cut, &mut lab, a, b);
     let mut part: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
     for (i, &f) in faces.iter().enumerate() {
         let l = if lab[i] == 1 { 1 } else { 0 };
