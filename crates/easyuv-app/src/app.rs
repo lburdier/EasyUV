@@ -1091,27 +1091,46 @@ impl EasyUvApp {
         );
     }
 
-    /// En-tête de la vue 3D, après le titre : Objet / Édition, modes de sélection, projection.
-    fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect, title: &str) {
-        if r.width() < 660.0 {
-            return; // vue étroite : ces boutons restent dans le panneau et les menus
-        }
+    /// Place de l'en-tête de la vue 3D : (titre affiché, bouton Objet / Édition à x0, en version
+    /// compacte ou non). Le bouton de mode reste visible tant qu'il tient, quitte à masquer le titre.
+    fn view3d_header_layout(&self, ui: &egui::Ui, r: egui::Rect, title: &str) -> (bool, Option<(f32, bool)>) {
+        // les boutons d'affichage occupent la droite de l'en-tête (~390 px)
+        let room = r.right() - 390.0;
+        let full = if self.edit_mode { 290.0 } else { 190.0 };
         // juste après le titre, quelle que soit sa longueur (« Droite · Orthographique »…)
         let tw = ui.painter().layout_no_wrap(title.to_string(), egui::TextStyle::Body.resolve(ui.style()), theme::TEXT_DIM).size().x;
-        let x0 = r.left() + 8.0 + tw + 14.0;
-        // les boutons d'affichage occupent la droite de l'en-tête (~390 px)
-        if x0 + if self.edit_mode { 290.0 } else { 190.0 } > r.right() - 390.0 {
-            return;
+        let after_title = r.left() + 8.0 + tw + 14.0;
+        let left = r.left() + 8.0;
+        if after_title + full <= room {
+            (true, Some((after_title, false)))
+        } else if left + full <= room {
+            (false, Some((left, false)))
+        } else if left + 70.0 <= room {
+            (false, Some((left, true)))
+        } else {
+            (r.width() > 540.0, None) // très étroit : Tab seulement
         }
+    }
+
+    /// En-tête de la vue 3D : Objet / Édition, puis modes de sélection et projection (sauf compact).
+    fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect, x0: f32, compact: bool) {
         let at = egui::Rect::from_min_size(egui::pos2(x0, r.top() + 2.0), egui::vec2(300.0, 22.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let label = if self.edit_mode { "Édition  (Tab)" } else { "Objet  (Tab : Édition)" };
+                let label = match (self.edit_mode, compact) {
+                    (true, true) => "Édition",
+                    (false, true) => "Objet",
+                    (true, false) => "Édition  (Tab)",
+                    (false, false) => "Objet  (Tab : Édition)",
+                };
                 let txt = if self.edit_mode { RichText::new(label).small().color(Color32::BLACK).strong() } else { RichText::new(label).small() };
                 let b = egui::Button::new(txt).fill(if self.edit_mode { theme::ACCENT_ORANGE } else { theme::WIDGET });
-                if ui.add(b).on_hover_text("Tab : mode Objet (un clic choisit un objet) ou Édition (un clic choisit un sommet, une arête ou une face sur le modèle, comme dans Blender). Choisir les modes sommets, arêtes ou faces passe d'office en Édition.").clicked() {
-                    self.edit_mode = !self.edit_mode;
+                if ui.add(b).on_hover_text("Tab : mode Objet (un clic choisit un objet) ou Édition des objets sélectionnés (un clic choisit un de leurs sommets, arêtes ou faces, comme dans Blender). Choisir les modes sommets, arêtes ou faces passe d'office en Édition.").clicked() {
+                    self.toggle_edit_mode();
+                }
+                if compact {
+                    return;
                 }
                 if self.edit_mode {
                     let mode = self.scene.as_ref().map_or(SelectMode::Island, |s| s.sel_mode);
@@ -1131,17 +1150,47 @@ impl EasyUvApp {
         });
     }
 
+    /// Passe en Édition les objets sélectionnés (comme Tab dans Blender), ou revient au mode
+    /// Objet. Renvoie false quand aucun objet n'est sélectionné (on reste en mode Objet).
+    fn set_edit_mode(&mut self, on: bool) -> bool {
+        let Some(s) = &mut self.scene else {
+            self.edit_mode = false;
+            return !on;
+        };
+        if !on {
+            s.exit_edit();
+            self.edit_mode = false;
+            return true;
+        }
+        // un seul objet visible : il passe en Édition sans avoir à le choisir
+        if !s.selection().iter().any(|&i| !s.hidden[i]) {
+            let vis: Vec<usize> = (0..s.len()).filter(|&i| !s.hidden[i]).collect();
+            if vis.len() == 1 {
+                s.click(Some(vis[0]), false);
+            }
+        }
+        self.edit_mode = s.enter_edit() > 0;
+        self.edit_mode
+    }
+
+    fn toggle_edit_mode(&mut self) {
+        let on = !self.edit_mode;
+        self.status = if !self.set_edit_mode(on) {
+            "Mode Édition : sélectionnez d'abord un objet (clic en mode Objet), puis Tab".into()
+        } else if on {
+            let n = self.scene.as_ref().map_or(0, |s| s.editing.iter().filter(|&&e| e).count());
+            format!("Mode Édition ({n} objet(s)) : clic sur un sommet, une arête ou une face (1 2 3), Alt+clic : boucle, Maj : ajouter, Tab : mode Objet")
+        } else {
+            "Mode Objet".into()
+        };
+    }
+
     /// Touches de la vue 3D (pointeur dessus), comme Blender.
     fn view3d_keys(&mut self, ui: &egui::Ui, r: egui::Rect) {
         let k = |key: egui::Key| ui.input(|i| i.key_pressed(key));
         let (ctrl, shift, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.shift, i.modifiers.alt));
         if k(egui::Key::Tab) {
-            self.edit_mode = !self.edit_mode;
-            self.status = if self.edit_mode {
-                "Mode Édition : clic sur un sommet, une arête ou une face (1 2 3), Alt+clic : boucle, Maj : ajouter, Tab : mode Objet".into()
-            } else {
-                "Mode Objet".into()
-            };
+            self.toggle_edit_mode();
         }
         // vues d'axe : 3 droite, 7 dessus (Ctrl : en face), 5 ortho ; 1 face en mode Objet
         // (en Édition, 1 à 4 choisissent le mode de sélection)
@@ -1178,7 +1227,7 @@ impl EasyUvApp {
             self.status = format!("Sélection liée : {n} face(s)");
         } else if k(egui::Key::L) {
             // L : la partie reliée sous le pointeur
-            if let Some(f) = ui.input(|i| i.pointer.hover_pos()).and_then(|p| self.render.pick_face(p)) {
+            if let Some(f) = ui.input(|i| i.pointer.hover_pos()).and_then(|p| self.render.pick_face(p)).filter(|&f| s.object_editable(s.face_object[f] as usize)) {
                 if !shift {
                     s.select_all_uv(false);
                 }
@@ -1203,8 +1252,9 @@ impl EasyUvApp {
     fn edit_click(&mut self, ui: &egui::Ui, resp: &egui::Response, r: egui::Rect) {
         let Some(p) = resp.interact_pointer_pos() else { return };
         let (shift, alt) = ui.input(|i| (i.modifiers.shift || i.modifiers.command, i.modifiers.alt));
-        let f = self.render.pick_face(p);
         let Some(s) = &mut self.scene else { return };
+        // seules les faces des objets en Édition se choisissent
+        let f = self.render.pick_face(p).filter(|&f| s.object_editable(s.face_object[f] as usize));
         // positions écran des sommets de la face touchée (seuls interrogés)
         let screen: std::collections::HashMap<u32, [f32; 2]> = f
             .map(|f| s.model.mesh.face(f).iter().filter_map(|&v| viewport::screen_pos(&self.cam, r, s.model.mesh.positions[v as usize]).map(|q| (v, [q.x, q.y]))).collect())
@@ -1712,7 +1762,7 @@ impl EasyUvApp {
         } else if self.pointer_over_uv(root.ctx()) {
             "1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic / rectangle : sélection   Glisser, G R S : transformer   U : déplier la sélection   Q, Maj+1 à 5 : outils   [ ] : rayon   Molette : zoom"
         } else {
-            "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   U : déplier   F : cadrer la sélection"
+            "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   Tab : Édition   U : déplier   F : cadrer la sélection"
         };
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(8, 3)))
@@ -2318,12 +2368,19 @@ impl eframe::App for EasyUvApp {
         self.update_score(ctx);
         // choisir sommets, arêtes ou faces (dans l'éditeur UV ou la vue 3D) passe la vue 3D en
         // Édition : un clic sur le modèle choisit alors directement ces éléments
-        if let Some(s) = &self.scene {
-            if s.sel_mode != self.last_sel_mode {
-                if s.sel_mode != SelectMode::Island {
-                    self.edit_mode = true;
+        // l'état d'Édition vit dans la scène (annuler, supprimer, ouvrir un fichier le changent)
+        if let Some(s) = &mut self.scene {
+            if s.is_editing() && !(0..s.len()).any(|o| s.in_edit(o) && !s.hidden[o]) {
+                s.exit_edit(); // tous les objets édités ont été masqués
+            }
+        }
+        self.edit_mode = self.scene.as_ref().is_some_and(|s| s.is_editing());
+        if let Some(mode) = self.scene.as_ref().map(|s| s.sel_mode) {
+            if mode != self.last_sel_mode {
+                if mode != SelectMode::Island && !self.edit_mode {
+                    self.set_edit_mode(true);
                 }
-                self.last_sel_mode = s.sel_mode;
+                self.last_sel_mode = mode;
             }
         }
 
@@ -2370,7 +2427,7 @@ impl eframe::App for EasyUvApp {
                             s.click(hit, extend);
                         }
                     }
-                    if resp.secondary_clicked() {
+                    if resp.secondary_clicked() && !self.edit_mode {
                         // le clic droit sélectionne l'objet visé avant d'ouvrir le menu
                         let hit = resp.interact_pointer_pos().and_then(|p| self.render.pick(p));
                         if let (Some(s), Some(h)) = (&mut self.scene, hit) {
@@ -2380,18 +2437,19 @@ impl eframe::App for EasyUvApp {
                         }
                     }
                     resp.context_menu(|ui| self.object_menu_items(ui));
-                    // en Édition, le fil de fer est toujours visible, comme dans Blender
-                    let mut vopt = self.view;
-                    vopt.wire |= self.edit_mode;
-                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &vopt, &self.mips, &mut self.render);
+                    // en Édition, le fil de fer des objets édités est dessiné d'office (render_scene)
+                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, &self.mips, &mut self.render);
                     if self.edit_mode {
                         if let Some(s) = &self.scene {
                             viewport::draw_vertices(ui, r, s, &self.cam, &self.render, s.sel_mode == SelectMode::Vertex);
                         }
                     }
                     let title = if self.edit_mode { format!("{} · Édition", self.cam.title()) } else { self.cam.title() };
-                    Self::editor_header(ui, r, &title, &mut self.view, true);
-                    self.view3d_header_extra(ui, r, &title);
+                    let (show_title, extra) = self.view3d_header_layout(ui, r, &title);
+                    Self::editor_header(ui, r, if show_title { &title } else { "" }, &mut self.view, true);
+                    if let Some((x0, compact)) = extra {
+                        self.view3d_header_extra(ui, r, x0, compact);
+                    }
                 }
                 if ruv.is_none() {
                     self.uv_rect = None;

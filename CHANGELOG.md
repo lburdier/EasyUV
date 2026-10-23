@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.5] - 2026-10-23
+
+### Modes Objet et Édition comme Blender
+- `Tab` (ou le bouton Objet / Édition) ne passe en **Édition** que les objets sélectionnés en mode Objet ; sans objet sélectionné, on reste en mode Objet (un modèle à un seul objet y passe directement).
+- En Édition, seuls les objets édités montrent leur fil de fer, leurs sommets et leur sélection, et seuls leurs sommets, arêtes et faces se choisissent (clic, `Alt`+clic, `A`, `L`, `Ctrl+I`…, dans la vue 3D comme dans l'éditeur UV). Les autres objets restent affichés tels quels.
+- Le contour orange des objets disparaît en Édition ; le clic droit n'y change plus l'objet sélectionné.
+- Le bouton Objet / Édition reste visible quand la vue 3D est étroite (disposition Layout) : le titre s'efface, puis le bouton passe en version courte. La barre d'état rappelle `Tab : Édition`.
+
 ## [0.3.4] - 2026-10-23
 
 ### Sélection directe dans la vue 3D

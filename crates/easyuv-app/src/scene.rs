@@ -45,6 +45,9 @@ pub struct Scene {
     pub active: usize,
     pub selected: Vec<bool>,
     pub hidden: Vec<bool>,
+    /// Objets en mode Édition (vide : mode Objet). Comme dans Blender, seuls ceux-là laissent
+    /// choisir leurs sommets, arêtes et faces.
+    pub editing: Vec<bool>,
     pub face_normals: Vec<V3>,
     /// Objet de chaque face.
     pub face_object: Vec<u32>,
@@ -98,6 +101,7 @@ impl Scene {
             active: 0,
             selected: vec![false; n],
             hidden: vec![false; n],
+            editing: Vec::new(),
             face_normals: Vec::new(),
             face_object: Vec::new(),
             edges: Vec::new(),
@@ -205,6 +209,50 @@ impl Scene {
         for i in 0..self.len() {
             self.selected[i] = !self.selected[i] && !self.hidden[i];
         }
+        self.touch();
+    }
+
+    // ---------- modes Objet / Édition ----------
+
+    pub fn is_editing(&self) -> bool {
+        !self.editing.is_empty()
+    }
+
+    /// L'objet `o` est en mode Édition.
+    pub fn in_edit(&self, o: usize) -> bool {
+        self.editing.get(o).copied().unwrap_or(false)
+    }
+
+    /// On peut choisir les éléments de l'objet `o` : visible et, en Édition, édité.
+    pub fn object_editable(&self, o: usize) -> bool {
+        !self.hidden[o] && (self.editing.is_empty() || self.in_edit(o))
+    }
+
+    /// Tab : passe en Édition les objets sélectionnés visibles. Renvoie leur nombre (0 : rien de
+    /// sélectionné, on reste en mode Objet). La sélection d'éléments des autres objets est retirée.
+    pub fn enter_edit(&mut self) -> usize {
+        let ed: Vec<bool> = (0..self.len()).map(|i| self.selected[i] && !self.hidden[i]).collect();
+        let n = ed.iter().filter(|&&e| e).count();
+        if n == 0 {
+            return 0;
+        }
+        let m = &self.model.mesh;
+        for f in 0..m.face_count() {
+            if !ed[self.face_object[f] as usize] {
+                m.face_range(f).for_each(|c| self.corner_sel[c] = false);
+            }
+        }
+        for i in 0..self.island_selected.len() {
+            self.island_selected[i] &= ed[self.island_object[i] as usize];
+        }
+        self.editing = ed;
+        self.touch();
+        n
+    }
+
+    /// Retour au mode Objet (la sélection d'éléments est gardée pour l'éditeur UV).
+    pub fn exit_edit(&mut self) {
+        self.editing.clear();
         self.touch();
     }
 
@@ -367,6 +415,7 @@ impl Scene {
         self.model = model;
         self.selected = selected;
         self.hidden = hidden;
+        self.editing.clear();
         self.marked_seams = marked;
         self.rebuild_derived();
         match new_uv {
@@ -503,7 +552,7 @@ impl Scene {
         let m = &self.model.mesh;
         let mut hit = None;
         for f in 0..m.face_count() {
-            if self.hidden[self.face_object[f] as usize] {
+            if !self.object_editable(self.face_object[f] as usize) {
                 continue;
             }
             let r = m.face_range(f);
@@ -532,7 +581,7 @@ impl Scene {
     }
 
     pub fn island_visible(&self, i: usize) -> bool {
-        !self.hidden[self.island_object[i] as usize]
+        self.object_editable(self.island_object[i] as usize)
     }
 
     /// Clic dans l'éditeur UV : sélectionne l'îlot `i` seul, ou le bascule avec Maj.
@@ -625,7 +674,7 @@ impl Scene {
     // ---------- sélection de sommets, d'arêtes et de faces (comme Blender) ----------
 
     fn face_visible(&self, f: usize) -> bool {
-        !self.hidden[self.face_object[f] as usize]
+        self.object_editable(self.face_object[f] as usize)
     }
 
     /// Change de mode en convertissant la sélection (îlots <-> coins).
@@ -854,7 +903,8 @@ impl Scene {
     /// `f` touchée au point écran `p` (`screen` donne la position écran d'un sommet).
     /// Maj : ajouter ou retirer. En mode îlots, l'îlot de la face.
     pub fn click_3d(&mut self, f: Option<usize>, p: [f32; 2], screen: impl Fn(u32) -> Option<[f32; 2]>, extend: bool) {
-        let Some(f) = f else {
+        // une face d'un objet qui n'est pas en Édition compte comme le vide
+        let Some(f) = f.filter(|&f| self.face_visible(f)) else {
             if !extend {
                 self.select_all_uv(false);
             }
@@ -1607,6 +1657,28 @@ mod tests {
         assert_eq!(s.reveal_all(), 1);
         assert!(!s.hidden[2] && s.selected[2]);
     }
+    #[test]
+    fn edit_mode_only_selected_objects() {
+        let mut s = scene();
+        s.select_all(false);
+        assert_eq!(s.enter_edit(), 0, "rien de sélectionné : pas d'Édition");
+        assert!(!s.is_editing());
+        s.set_select_mode(SelectMode::Face);
+        s.select_all_uv(true);
+        s.click(Some(1), false);
+        assert_eq!(s.enter_edit(), 1);
+        assert!(s.in_edit(1) && !s.in_edit(0));
+        // la sélection d'éléments des autres objets est retirée, et A ne la remet pas
+        let only_1 = |s: &Scene| (0..s.model.mesh.face_count()).all(|f| s.face_selected(f) == (s.face_object[f] == 1));
+        assert!(only_1(&s));
+        s.select_all_uv(false);
+        s.select_all_uv(true);
+        assert!(only_1(&s));
+        s.exit_edit();
+        s.select_all_uv(true);
+        assert!((0..s.model.mesh.face_count()).all(|f| s.face_selected(f)));
+    }
+
     #[test]
     fn partial_unwrap_keeps_other_objects() {
         let mut s = scene();
