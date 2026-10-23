@@ -20,6 +20,12 @@ pub enum Icon {
     Sew,
     Mark,
     Unwrap,
+    Grid,
+    Orient,
+    BoxSel,
+    Lasso,
+    Circle,
+    Angle,
 }
 
 /// Dessine l'icône dans `r`.
@@ -120,6 +126,52 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
                 p.rect_filled(rr, 0.0, f);
                 p.rect_stroke(rr, 0.0, st, egui::StrokeKind::Middle);
             }
+        }
+        Icon::Grid => {
+            // grille tracée à la règle
+            for k in 0..4 {
+                let t = -0.75 + 0.5 * k as f32;
+                p.line_segment([at(-0.75, t), at(0.75, t)], if k == 0 || k == 3 { st } else { thin });
+                p.line_segment([at(t, -0.75), at(t, 0.75)], if k == 0 || k == 3 { st } else { thin });
+            }
+            p.line_segment([at(-0.75, 0.25), at(0.75, 0.25)], Stroke::new(2.0, theme::ACCENT_ORANGE));
+        }
+        Icon::Orient => {
+            // carré penché qui se remet d'aplomb, flèche de rotation
+            let pts: Vec<Pos2> = [(-0.5, -0.75), (0.75, -0.5), (0.5, 0.75), (-0.75, 0.5)].iter().map(|&(x, y)| at(x, y)).collect();
+            p.add(egui::Shape::closed_line(pts, thin));
+            p.rect_stroke(Rect::from_min_max(at(-0.55, -0.55), at(0.55, 0.55)), 0.0, st, egui::StrokeKind::Middle);
+            let arc: Vec<Pos2> = (0..=8).map(|i| {
+                let a = -0.3 - 1.2 * i as f32 / 8.0;
+                at(0.95 * a.cos(), 0.95 * a.sin())
+            }).collect();
+            p.add(egui::Shape::line(arc, Stroke::new(1.5, theme::ACCENT_ORANGE)));
+        }
+        Icon::BoxSel => {
+            dashed_rect(p, Rect::from_min_max(at(-0.8, -0.6), at(0.8, 0.6)), st);
+        }
+        Icon::Lasso => {
+            let pts: Vec<Pos2> = (0..14).map(|i| {
+                let a = i as f32 / 14.0 * std::f32::consts::TAU;
+                let r = 0.7 + 0.15 * (a * 3.0).sin();
+                at(r * a.cos(), r * a.sin() * 0.8)
+            }).collect();
+            p.add(egui::Shape::closed_line(pts, st));
+        }
+        Icon::Circle => {
+            p.circle_stroke(c, s * 0.8, st);
+            p.circle_filled(c, 1.8, col);
+        }
+        Icon::Angle => {
+            // deux pans qui font un angle, l'arête vive en orange
+            p.line_segment([at(-0.85, 0.6), at(0.0, -0.1)], st);
+            p.line_segment([at(0.0, -0.1), at(0.85, 0.6)], st);
+            p.circle_filled(at(0.0, -0.1), 2.5, theme::ACCENT_ORANGE);
+            let arc: Vec<Pos2> = (0..=6).map(|i| {
+                let a = std::f32::consts::PI * (0.25 + 0.5 * i as f32 / 6.0);
+                at(0.45 * a.cos(), -0.1 + 0.45 * a.sin())
+            }).collect();
+            p.add(egui::Shape::line(arc, thin));
         }
     }
 }
@@ -223,6 +275,12 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
                 let gap = if i >= nx / 2 { cell.x * 0.8 * (1.0 - t) } else { 0.0 };
                 f + egui::vec2(gap, if i >= nx / 2 { -cell.y * 0.5 * (1.0 - t) } else { 0.0 })
             }
+            Icon::Grid => f + egui::vec2((j as f32 * 2.1 + i as f32).sin() * cell.x * 0.18, (i as f32 * 1.4).sin() * cell.y * 0.35) * (1.0 - t),
+            Icon::Orient => {
+                let (sn, cs) = (0.5 * (1.0 - t)).sin_cos();
+                let v = f - center;
+                center + egui::vec2(cs * v.x - sn * v.y, sn * v.x + cs * v.y)
+            }
             _ => f,
         }
     };
@@ -237,6 +295,21 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
         Icon::Rect => draw_rect = Some(Rect::from_min_max(area.left_top() + egui::vec2(0.0, 8.0), Pos2::new(area.left() + area.width() * t.max(0.05), area.bottom() - 8.0))),
         Icon::Cut | Icon::Sew => split_col = Some(nx / 2),
         Icon::Unwrap => fill_cells.extend((0..nx).flat_map(|i| (0..ny).map(move |j| (i, j)))),
+        Icon::Grid | Icon::Orient => {}
+        Icon::BoxSel => {
+            let k = (t * 4.0).round() as usize;
+            fill_cells.extend((1..1 + k).flat_map(|i| (0..2).map(move |j| (i, j))));
+            draw_rect = Some(Rect::from_min_max(flat(1, 0) - egui::vec2(4.0, 4.0), flat(1 + k.max(1), 2) + egui::vec2(4.0, 4.0)));
+        }
+        Icon::Lasso => {
+            fill_cells.extend([(2, 0), (3, 0), (2, 1), (3, 1), (4, 1), (3, 2)].into_iter().take((t * 6.0).round() as usize));
+        }
+        Icon::Circle => {
+            let k = (t * nx as f32) as usize;
+            fill_cells.extend((0..k.min(nx)).map(|i| (i, 1)));
+            brush = Some((Pos2::new(area.left() + area.width() * t, center.y), cell.y * 0.9));
+        }
+        Icon::Angle => highlight.extend((0..ny).flat_map(|j| [(3, j, 3, j + 1), (6, j, 6, j + 1)])),
     }
     // faces surlignées
     for &(i, j) in &fill_cells {
@@ -307,6 +380,12 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
         Icon::Sew => "les deux bords se rejoignent",
         Icon::Mark => "couture imposée au prochain dépliage",
         Icon::Unwrap => "seule la sélection est redépliée",
+        Icon::Grid => "rangées et colonnes passées à la règle",
+        Icon::Orient => "chaque îlot remis d'aplomb sur ses arêtes",
+        Icon::BoxSel => "glisser : tout ce qui est dans le rectangle",
+        Icon::Lasso => "tracer la zone à main levée",
+        Icon::Circle => "peindre la sélection",
+        Icon::Angle => "arêtes vives, ou faces d'un même pan",
     };
     p.text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, caption, egui::FontId::proportional(11.0), theme::TEXT_DIM);
 }

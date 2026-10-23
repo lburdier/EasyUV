@@ -142,6 +142,35 @@ impl UvTool {
     }
 }
 
+/// Forme de la sélection par zone (W pour passer de l'une à l'autre, comme Blender).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SelShape {
+    #[default]
+    Box,
+    Lasso,
+    Circle,
+}
+
+impl SelShape {
+    pub const ALL: [SelShape; 3] = [SelShape::Box, SelShape::Lasso, SelShape::Circle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelShape::Box => "Rectangle de sélection",
+            SelShape::Lasso => "Lasso",
+            SelShape::Circle => "Cercle",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            SelShape::Box => "Glisser dans le vide : tout ce qui est dans le rectangle. Maj : ajouter, Ctrl : retirer.",
+            SelShape::Lasso => "Glisser : tracez la zone à main levée, tout ce qui est dedans est choisi. Maj : ajouter, Ctrl : retirer.",
+            SelShape::Circle => "Glisser : peignez la sélection avec le cercle ([ ] ou Ctrl+molette : rayon). Ctrl : retirer.",
+        }
+    }
+}
+
 /// Coup de pinceau en cours.
 struct BrushStroke {
     /// UV d'avant le geste (Échap, Ctrl+Z).
@@ -170,11 +199,15 @@ pub struct UvEditor {
     stroke: Option<BrushStroke>,
     /// Outil Rectangle : origine écran du rectangle en cours de tracé.
     rect: Option<Pos2>,
+    /// Forme de la sélection par zone.
+    pub sel_shape: SelShape,
+    /// Tracé du lasso en cours (écran).
+    lasso: Vec<Pos2>,
 }
 
 impl Default for UvEditor {
     fn default() -> Self {
-        UvEditor { modal: None, boxsel: None, swallow_primary: false, swallow_secondary: false, tool: UvTool::Select, radius: 60.0, strength: 0.5, stroke: None, rect: None }
+        UvEditor { modal: None, boxsel: None, swallow_primary: false, swallow_secondary: false, tool: UvTool::Select, radius: 60.0, strength: 0.5, stroke: None, rect: None, sel_shape: SelShape::Box, lasso: Vec::new() }
     }
 }
 
@@ -187,6 +220,8 @@ pub enum UvEvent {
     Straighten,
     /// Outil Rectangle : aplatir les îlots sélectionnés dans [lo, hi] (UV).
     FlattenRect([f32; 2], [f32; 2]),
+    /// Maj+G : Grille parfaite.
+    SnapGrid,
 }
 
 impl UvEditor {
@@ -240,7 +275,8 @@ fn camera_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
 pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: Rect, scene: Option<&mut Scene>, ed: &mut UvEditor) -> Option<UvEvent> {
     // pinceau : Ctrl+molette règle le rayon au lieu du zoom
     let zoom = ui.input(|i| i.zoom_delta());
-    if ed.tool.brush().is_some() && resp.hovered() && zoom != 1.0 {
+    let circle = ed.tool == UvTool::Select && ed.sel_shape == SelShape::Circle;
+    if (ed.tool.brush().is_some() || circle) && resp.hovered() && zoom != 1.0 {
         ed.radius = (ed.radius * zoom).clamp(4.0, 600.0);
     } else {
         camera_input(ui, resp, cam, rect);
@@ -399,9 +435,17 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     if shift && key(egui::Key::W) {
         return Some(UvEvent::Straighten);
     }
+    if !shift && !ctrl && key(egui::Key::W) {
+        let i = SelShape::ALL.iter().position(|&x| x == ed.sel_shape).unwrap_or(0);
+        ed.sel_shape = SelShape::ALL[(i + 1) % SelShape::ALL.len()];
+        return Some(UvEvent::Status(format!("Sélection : {}", ed.sel_shape.label())));
+    }
+    if shift && key(egui::Key::G) {
+        return Some(UvEvent::SnapGrid);
+    }
     let start = pointer.filter(|p| rect.contains(*p));
     for (k, kind) in [(egui::Key::G, Kind::Grab), (egui::Key::R, Kind::Rotate), (egui::Key::S, Kind::Scale)] {
-        if !ctrl && key(k) {
+        if !ctrl && !shift && key(k) {
             if let Some(p) = start {
                 if !ed.begin(kind, scene, p, false) {
                     return Some(UvEvent::Status("Sélectionnez d'abord des éléments (clic, A ou rectangle)".into()));
@@ -414,7 +458,11 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     // --- souris : clic, glisser la sélection, rectangle ---
     if resp.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
-        match under_pointer(scene, view, origin) {
+        let mode = if shift { 1 } else if ctrl { -1 } else { 0 };
+        // Maj ou Ctrl maintenu : toujours une sélection par zone (ajouter / retirer), même en
+        // partant d'un îlot, comme Blender ; sans touche, glisser un élément le déplace
+        let grab = if shift || ctrl || ed.sel_shape != SelShape::Box { None } else { under_pointer(scene, view, origin) };
+        match grab {
             Some(selected) => {
                 // glisser un élément : il est d'abord choisi s'il ne l'était pas (comme Blender)
                 if !selected {
@@ -425,16 +473,47 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
                     m.info = "Déplacer (glisser)".into();
                 }
             }
-            None => ed.boxsel = Some((origin, if shift { 1 } else if ctrl { -1 } else { 0 })),
+            None => {
+                ed.boxsel = Some((origin, mode));
+                ed.lasso = vec![origin];
+                // cercle sans touche : on repart d'une sélection vide, puis on peint
+                if ed.sel_shape == SelShape::Circle && mode == 0 {
+                    scene.select_all_uv(false);
+                }
+            }
         }
     }
     if let Some((o, mode)) = ed.boxsel {
-        if !resp.dragged_by(egui::PointerButton::Primary) {
-            ed.boxsel = None;
+        if resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(p) = pointer {
-                let (a, b) = (view.to_uv(o), view.to_uv(p));
-                scene.box_select([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])], mode);
+                match ed.sel_shape {
+                    SelShape::Lasso if ed.lasso.last().is_none_or(|l| (*l - p).length() > 3.0) => ed.lasso.push(p),
+                    SelShape::Circle => {
+                        let (c, r) = (view.to_uv(p), ed.radius / view.side);
+                        scene.select_where(|q| (q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2) <= r * r, if mode < 0 { -1 } else { 1 });
+                    }
+                    _ => {}
+                }
             }
+            ui.ctx().request_repaint();
+        } else {
+            ed.boxsel = None;
+            match ed.sel_shape {
+                SelShape::Box => {
+                    if let Some(p) = pointer {
+                        let (a, b) = (view.to_uv(o), view.to_uv(p));
+                        scene.box_select([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])], mode);
+                    }
+                }
+                SelShape::Lasso => {
+                    let poly: Vec<[f32; 2]> = ed.lasso.iter().map(|p| view.to_uv(*p)).collect();
+                    if poly.len() >= 3 {
+                        scene.select_where(|q| point_in_polygon(q, &poly), mode);
+                    }
+                }
+                SelShape::Circle => {}
+            }
+            ed.lasso.clear();
         }
     }
     if resp.double_clicked() && scene.sel_mode == SelectMode::Edge {
@@ -453,6 +532,19 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         }
     }
     None
+}
+
+/// Point dans un polygone (règle pair-impair).
+fn point_in_polygon(q: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + n - 1) % n]);
+        if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0] {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// Distance de prise d'un sommet ou d'une arête, en pixels d'écran.
@@ -614,12 +706,28 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
         painter.add(Shape::Mesh(l.clone()));
     }
 
-    // Rectangle de sélection
+    // Sélection par zone : rectangle, lasso ou cercle
     if let (Some((o, mode)), Some(p)) = (ed.boxsel, ui.input(|i| i.pointer.latest_pos())) {
-        let r = Rect::from_two_pos(o, p);
         let col = if mode < 0 { theme::SEAM_RED } else { Color32::WHITE };
-        painter.rect_filled(r, 0.0, Color32::from_white_alpha(10));
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
+        match ed.sel_shape {
+            SelShape::Box => {
+                let r = Rect::from_two_pos(o, p);
+                painter.rect_filled(r, 0.0, Color32::from_white_alpha(10));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), egui::StrokeKind::Inside);
+            }
+            SelShape::Lasso => {
+                let mut pts = ed.lasso.clone();
+                pts.push(p);
+                painter.add(Shape::closed_line(pts, Stroke::new(1.0, col)));
+            }
+            SelShape::Circle => {}
+        }
+    }
+    if ed.tool == UvTool::Select && ed.sel_shape == SelShape::Circle {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p)) {
+            let col = if ed.boxsel.is_some_and(|b| b.1 < 0) { theme::SEAM_RED } else { Color32::from_white_alpha(200) };
+            painter.circle_stroke(p, ed.radius, Stroke::new(1.0, col));
+        }
     }
     // Outil Rectangle : le rectangle en cours de tracé
     if let (Some(o), Some(p)) = (ed.rect, ui.input(|i| i.pointer.latest_pos())) {
