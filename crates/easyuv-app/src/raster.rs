@@ -79,6 +79,8 @@ pub struct Frame {
     pub height: usize,
     pub rgba: Vec<u8>,
     pub ids: Vec<u32>,
+    /// Face visible de chaque pixel (+1, 0 = rien) : sélection de sommets, d'arêtes et de faces.
+    pub faces: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -222,17 +224,18 @@ pub fn render(view: &View, geo: &Geometry, lines: &[Line], tex: &Mips, tiling: f
     let mut rgba = vec![0u8; w * h * 4];
     let mut depth = vec![0f32; w * h];
     let mut ids = vec![0u32; w * h];
+    let mut faces = vec![0u32; w * h];
 
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
     let band = h.div_ceil(threads);
     std::thread::scope(|s| {
-        for (((ti, rgba_b), depth_b), ids_b) in rgba.chunks_mut(band * w * 4).enumerate().zip(depth.chunks_mut(band * w)).zip(ids.chunks_mut(band * w)) {
+        for ((((ti, rgba_b), depth_b), ids_b), faces_b) in rgba.chunks_mut(band * w * 4).enumerate().zip(depth.chunks_mut(band * w)).zip(ids.chunks_mut(band * w)).zip(faces.chunks_mut(band * w)) {
             let y0 = ti * band;
             let y1 = (y0 + band).min(h);
             let tris = &tris;
             let shade = &shade;
             s.spawn(move || {
-                raster_band(tris, geo, shade, tex, w, y0, y1, rgba_b, depth_b, ids_b);
+                raster_band(tris, geo, shade, tex, w, y0, y1, rgba_b, depth_b, ids_b, faces_b);
                 lines_band(view, lines, w, y0, y1, rgba_b, depth_b);
             });
         }
@@ -278,11 +281,11 @@ pub fn render(view: &View, geo: &Geometry, lines: &[Line], tex: &Mips, tiling: f
             }
         });
     }
-    Frame { width: w, height: h, rgba, ids }
+    Frame { width: w, height: h, rgba, ids, faces }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn raster_band(tris: &[Tri], geo: &Geometry, shade: &[f32], tex: &Mips, w: usize, y0: usize, y1: usize, rgba: &mut [u8], depth: &mut [f32], ids: &mut [u32]) {
+fn raster_band(tris: &[Tri], geo: &Geometry, shade: &[f32], tex: &Mips, w: usize, y0: usize, y1: usize, rgba: &mut [u8], depth: &mut [f32], ids: &mut [u32], faces: &mut [u32]) {
     for t in tris {
         let [a, b, c] = t.v;
         let miny = a.y.min(b.y).min(c.y).floor().max(y0 as f32) as isize;
@@ -321,6 +324,7 @@ fn raster_band(tris: &[Tri], geo: &Geometry, shade: &[f32], tex: &Mips, w: usize
                 }
                 depth[i] = iz;
                 ids[i] = st.id;
+                faces[i] = t.face + 1;
                 let col = if st.textured {
                     let u = (w0 * a.u + w1 * b.u + w2 * c.u) / iz;
                     let v = (w0 * a.v + w1 * b.v + w2 * c.v) / iz;

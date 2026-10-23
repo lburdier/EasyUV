@@ -98,6 +98,8 @@ Coutures (sur les arêtes sélectionnées) : Couper, Coudre (rapprocher et soude
 
 Sélection par zone : rectangle, lasso ou cercle (`W`), `Maj` pour ajouter, `Ctrl` pour retirer. Sélection par angle : arêtes vives (mode arêtes) ou faces d'un même pan.
 
+Vue 3D comme Blender : gizmo cliquable et pavé numérique pour les vues d'axe orthographiques ; `Tab` pour le mode Édition, où l'on choisit sommets, arêtes et faces sur le modèle (`Alt`+clic : boucle, `L` / `Ctrl+L` : relié, `Ctrl+E` : couture).
+
 Projeter depuis la vue : les UV prennent ce que l'on voit dans la vue 3D (comme Project From View de Blender), rangées dans la place libre ou étirées sur la tuile (Cadré).
 
 Grille parfaite (`Maj+G`) : rangées et colonnes sur des droites. Remettre d'aplomb : îlots tournés d'après leurs arêtes.

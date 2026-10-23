@@ -145,6 +145,8 @@ impl Scene {
         }
         self.selected.resize(self.model.objects.len(), false);
         self.hidden.resize(self.model.objects.len(), false);
+        // la sélection de sommets / arêtes / faces existe aussi avant tout dépliage (vue 3D)
+        self.corner_sel = vec![false; mesh.corners.len()];
         self.active = self.active.min(self.model.objects.len().saturating_sub(1));
         self.touch();
     }
@@ -476,6 +478,7 @@ impl Scene {
         self.island_corners.clear();
         self.island_object.clear();
         self.island_selected.clear();
+        self.corner_sel = vec![false; self.model.mesh.corners.len()];
         let Some(uv) = &self.uv else { return };
         let m = &self.model.mesh;
         let (fi, n) = easyuv::layout::uv_islands(m, &uv.corner_uv);
@@ -824,6 +827,182 @@ impl Scene {
             }
         }
         self.touch();
+    }
+
+    // ---------- sélection dans la vue 3D (mode Édition, comme Blender) ----------
+
+    /// Coins de sommets du maillage (tous les îlots : la vue 3D ne voit pas les coutures).
+    fn select_vertices(&mut self, verts: &[u32], on: bool) {
+        let set: HashSet<u32> = verts.iter().copied().collect();
+        let visible: Vec<usize> = (0..self.model.mesh.face_count()).filter(|&f| self.face_visible(f)).collect();
+        let m = &self.model.mesh;
+        for f in visible {
+            for c in m.face_range(f) {
+                if set.contains(&m.corners[c]) {
+                    self.corner_sel[c] = on;
+                }
+            }
+        }
+    }
+
+    fn vertices_selected(&self, verts: &[u32]) -> bool {
+        let m = &self.model.mesh;
+        verts.iter().all(|&v| (0..m.corners.len()).any(|c| m.corners[c] == v && self.corner_sel[c]))
+    }
+
+    /// Clic dans la vue 3D en mode Édition : sommet, arête ou face selon le mode, sur la face
+    /// `f` touchée au point écran `p` (`screen` donne la position écran d'un sommet).
+    /// Maj : ajouter ou retirer. En mode îlots, l'îlot de la face.
+    pub fn click_3d(&mut self, f: Option<usize>, p: [f32; 2], screen: impl Fn(u32) -> Option<[f32; 2]>, extend: bool) {
+        let Some(f) = f else {
+            if !extend {
+                self.select_all_uv(false);
+            }
+            return;
+        };
+        let vs = self.model.mesh.face(f).to_vec();
+        let d2 = |q: [f32; 2]| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2);
+        let picked: Vec<u32> = match self.sel_mode {
+            SelectMode::Vertex => vs.iter().copied().min_by(|&a, &b| {
+                let (qa, qb) = (screen(a).map_or(f32::MAX, d2), screen(b).map_or(f32::MAX, d2));
+                qa.partial_cmp(&qb).unwrap_or(std::cmp::Ordering::Equal)
+            }).into_iter().collect(),
+            SelectMode::Edge => {
+                let n = vs.len();
+                let seg = |a: u32, b: u32| -> f32 {
+                    let (Some(qa), Some(qb)) = (screen(a), screen(b)) else { return f32::MAX };
+                    let d = [qb[0] - qa[0], qb[1] - qa[1]];
+                    let l2 = (d[0] * d[0] + d[1] * d[1]).max(1e-9);
+                    let t = (((p[0] - qa[0]) * d[0] + (p[1] - qa[1]) * d[1]) / l2).clamp(0.0, 1.0);
+                    d2([qa[0] + t * d[0], qa[1] + t * d[1]])
+                };
+                let k = (0..n).min_by(|&i, &j| seg(vs[i], vs[(i + 1) % n]).partial_cmp(&seg(vs[j], vs[(j + 1) % n])).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+                vec![vs[k], vs[(k + 1) % n]]
+            }
+            SelectMode::Face => vs.clone(),
+            SelectMode::Island => {
+                if self.uv.is_some() {
+                    let i = self.face_island[f] as usize;
+                    if extend {
+                        self.island_selected[i] = !self.island_selected[i];
+                        self.touch();
+                    } else {
+                        self.select_island_only(i);
+                    }
+                }
+                return;
+            }
+        };
+        if self.sel_mode == SelectMode::Face {
+            let r = self.model.mesh.face_range(f);
+            let on = !(extend && r.clone().all(|c| self.corner_sel[c]));
+            if !extend {
+                self.corner_sel.iter_mut().for_each(|s| *s = false);
+            }
+            // la face et les coins des mêmes sommets dans ses voisines (sélection de sommets)
+            self.select_vertices(&vs, on);
+            if !on {
+                self.model.mesh.face_range(f).for_each(|c| self.corner_sel[c] = false);
+            }
+        } else {
+            let on = !(extend && self.vertices_selected(&picked));
+            if !extend {
+                self.corner_sel.iter_mut().for_each(|s| *s = false);
+            }
+            self.select_vertices(&picked, on);
+        }
+        self.touch();
+    }
+
+    /// Alt+clic : boucle d'arêtes passant par l'arête la plus proche du clic, sur la face `f`.
+    pub fn loop_3d(&mut self, f: usize, p: [f32; 2], screen: impl Fn(u32) -> Option<[f32; 2]>, extend: bool) -> usize {
+        let vs = self.model.mesh.face(f).to_vec();
+        let n = vs.len();
+        let seg = |a: u32, b: u32| -> f32 {
+            let (Some(qa), Some(qb)) = (screen(a), screen(b)) else { return f32::MAX };
+            let d = [qb[0] - qa[0], qb[1] - qa[1]];
+            let l2 = (d[0] * d[0] + d[1] * d[1]).max(1e-9);
+            let t = (((p[0] - qa[0]) * d[0] + (p[1] - qa[1]) * d[1]) / l2).clamp(0.0, 1.0);
+            (qa[0] + t * d[0] - p[0]).powi(2) + (qa[1] + t * d[1] - p[1]).powi(2)
+        };
+        let k = (0..n).min_by(|&i, &j| seg(vs[i], vs[(i + 1) % n]).partial_cmp(&seg(vs[j], vs[(j + 1) % n])).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0);
+        let lp = easyuv::uvtools::edge_loop(&self.model.mesh, vs[k], vs[(k + 1) % n]);
+        if self.sel_mode == SelectMode::Vertex || self.sel_mode == SelectMode::Island {
+            self.set_select_mode(SelectMode::Edge);
+        }
+        if !extend {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+        }
+        let verts: Vec<u32> = lp.iter().flat_map(|&(a, b)| [a, b]).collect();
+        self.select_vertices(&verts, true);
+        self.touch();
+        lp.len()
+    }
+
+    /// Ctrl+L : tout ce qui est relié (par le maillage) à la sélection.
+    pub fn select_linked_3d(&mut self) -> usize {
+        let m = &self.model.mesh;
+        let mut by_vert: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            for &v in m.face(f) {
+                by_vert.entry(v).or_default().push(f);
+            }
+        }
+        let mut taken = vec![false; m.face_count()];
+        let mut queue: std::collections::VecDeque<usize> = (0..m.face_count()).filter(|&f| self.face_visible(f) && m.face_range(f).any(|c| self.corner_sel[c])).collect();
+        queue.iter().for_each(|&f| taken[f] = true);
+        while let Some(f) = queue.pop_front() {
+            for &v in m.face(f) {
+                for &g in &by_vert[&v] {
+                    if !taken[g] {
+                        taken[g] = true;
+                        queue.push_back(g);
+                    }
+                }
+            }
+        }
+        let n = taken.iter().filter(|&&t| t).count();
+        for f in 0..m.face_count() {
+            if taken[f] {
+                for c in m.face_range(f) {
+                    self.corner_sel[c] = true;
+                }
+            }
+        }
+        self.touch();
+        n
+    }
+
+    /// Ctrl+ / Ctrl- : agrandit ou réduit la sélection d'un anneau de faces.
+    pub fn grow_shrink(&mut self, grow: bool) {
+        let m = &self.model.mesh;
+        let mut vsel = vec![false; m.positions.len()];
+        for c in 0..m.corners.len() {
+            if self.corner_sel[c] {
+                vsel[m.corners[c] as usize] = true;
+            }
+        }
+        let mut next = vsel.clone();
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let vs = m.face(f);
+            let any = vs.iter().any(|&v| vsel[v as usize]);
+            let all = vs.iter().all(|&v| vsel[v as usize]);
+            if grow && any {
+                vs.iter().for_each(|&v| next[v as usize] = true);
+            }
+            if !grow && any && !all {
+                vs.iter().for_each(|&v| next[v as usize] = false);
+            }
+        }
+        for c in 0..m.corners.len() {
+            self.corner_sel[c] = next[m.corners[c] as usize] && self.face_visible(self.face_island_face(c));
+        }
+        self.touch();
+    }
+
+    /// Face d'un coin (recherche dichotomique).
+    fn face_island_face(&self, c: usize) -> usize {
+        self.model.mesh.face_start.partition_point(|&s| s <= c).saturating_sub(1)
     }
 
     /// Arêtes vives : sélectionne (mode arêtes) les arêtes dont les deux faces font un angle
@@ -1592,6 +1771,33 @@ mod tests {
         let after: Vec<[f32; 2]> = other.iter().map(|&c| s.uv.as_ref().unwrap().corner_uv[c]).collect();
         assert_eq!(before, after, "le tore ne bouge pas");
         assert!(s.has_island_selection());
+    }
+
+    #[test]
+    fn select_in_3d_view_before_unwrap() {
+        // sans UV : on peut choisir arêtes et faces dans la vue 3D, puis marquer une couture
+        let m = Model::single("Tore", easyuv::model::weld(&primitives::torus(1.0, 0.3, 16, 8)));
+        let mut s = Scene::new("t".into(), m);
+        assert!(s.uv.is_none());
+        s.set_select_mode(SelectMode::Edge);
+        let vs = s.model.mesh.face(0).to_vec();
+        let n = s.loop_3d(0, [0.0, 0.0], |v| Some([s_pos(v), 0.0]), false);
+        assert!(n == 16 || n == 8, "boucle de {n}");
+        assert!(s.selected_mesh_edges().len() >= n);
+        assert_eq!(s.mark_selected_seams(true), s.selected_mesh_edges().len());
+        // face
+        s.set_select_mode(SelectMode::Face);
+        s.click_3d(Some(3), [0.0, 0.0], |_| None, false);
+        assert!(s.face_selected(3));
+        let _ = vs;
+        // relié : tout le tore
+        assert_eq!(s.select_linked_3d(), s.model.mesh.face_count());
+    }
+
+    /// Position écran factice : abscisse = numéro du sommet (l'arête la plus proche de 0 est
+    /// celle des plus petits numéros).
+    fn s_pos(v: u32) -> f32 {
+        v as f32
     }
 
     #[test]

@@ -101,6 +101,8 @@ pub struct EasyUvApp {
     score_time: f64,
     /// Seuil de la sélection par angle (degrés).
     sel_angle: f64,
+    /// Vue 3D en mode Édition (Tab, comme Blender) : on y choisit sommets, arêtes et faces.
+    edit_mode: bool,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -114,6 +116,8 @@ pub struct EasyUvApp {
     /// Menu « Supprimer ? » ouvert par X, à la position du pointeur (comme Blender).
     confirm_delete: Option<egui::Pos2>,
 }
+
+const EDIT_HELP: &str = "Mode Édition (Tab) : 1 sommets, 2 arêtes, 3 faces, 4 îlots. Clic : choisir, Maj+clic : ajouter ou retirer, Alt+clic : boucle d'arêtes, A / Alt+A : tout / rien, Ctrl+I : inverser, L / Ctrl+L : partie reliée, Ctrl+ / Ctrl- : agrandir ou réduire, Ctrl+E : marquer la couture, Maj+Ctrl+E : la retirer, U : déplier la sélection. La sélection est la même que dans l'éditeur UV.";
 
 const PROJECT_HELP: &str = "Les UV prennent exactement ce que l'on voit dans la vue 3D, sous cet angle (comme Project From View de Blender) : idéal pour un logo, une étiquette ou un décor à peindre de face. S'applique aux faces sélectionnées dans l'éditeur UV, sinon aux objets sélectionnés, sinon à tout. Le résultat est rangé dans la place libre, à la densité des autres îlots.";
 
@@ -254,6 +258,7 @@ impl EasyUvApp {
             score_gen: None,
             score_time: -1.0,
             sel_angle: 30.0,
+            edit_mode: false,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -1083,17 +1088,124 @@ impl EasyUvApp {
         );
     }
 
-    /// Bouton « Projeter depuis la vue » dans l'en-tête de la vue 3D, après le titre.
+    /// En-tête de la vue 3D, après le titre : Objet / Édition, modes de sélection, projection.
     fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect) {
-        let at = egui::Rect::from_min_size(egui::pos2(r.left() + 156.0, r.top() + 2.0), egui::vec2(28.0, 22.0));
-        if r.width() < 620.0 {
-            return; // vue étroite : le bouton reste dans le panneau et les menus
+        if r.width() < 660.0 {
+            return; // vue étroite : ces boutons restent dans le panneau et les menus
         }
+        let x0 = r.left() + if self.edit_mode { 250.0 } else { 196.0 };
+        let at = egui::Rect::from_min_size(egui::pos2(x0, r.top() + 2.0), egui::vec2(220.0, 22.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
-            if icons::button(ui, Icon::Project, false, "Projeter depuis la vue", "", PROJECT_HELP).clicked() {
-                self.project_view_op(false);
-            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let label = if self.edit_mode { "Édition" } else { "Objet" };
+                if ui.add(egui::Button::new(RichText::new(label).small()).selected(self.edit_mode)).on_hover_text("Tab : mode Objet (choisir des objets) ou Édition (choisir sommets, arêtes et faces sur le modèle)").clicked() {
+                    self.edit_mode = !self.edit_mode;
+                }
+                if self.edit_mode {
+                    let mode = self.scene.as_ref().map_or(SelectMode::Island, |s| s.sel_mode);
+                    for m in SelectMode::ALL {
+                        if icons::button(ui, mode_icon(m), mode == m, &format!("Sélection : {}", m.label()), m.key(), EDIT_HELP).clicked() {
+                            if let Some(s) = &mut self.scene {
+                                s.set_select_mode(m);
+                            }
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                if icons::button(ui, Icon::Project, false, "Projeter depuis la vue", "", PROJECT_HELP).clicked() {
+                    self.project_view_op(false);
+                }
+            });
         });
+    }
+
+    /// Touches de la vue 3D (pointeur dessus), comme Blender.
+    fn view3d_keys(&mut self, ui: &egui::Ui, r: egui::Rect) {
+        let k = |key: egui::Key| ui.input(|i| i.key_pressed(key));
+        let (ctrl, shift, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.shift, i.modifiers.alt));
+        if k(egui::Key::Tab) {
+            self.edit_mode = !self.edit_mode;
+            self.status = if self.edit_mode {
+                "Mode Édition : clic sur un sommet, une arête ou une face (1 2 3), Alt+clic : boucle, Maj : ajouter, Tab : mode Objet".into()
+            } else {
+                "Mode Objet".into()
+            };
+        }
+        // vues d'axe : 3 droite, 7 dessus (Ctrl : en face), 5 ortho ; 1 face en mode Objet
+        // (en Édition, 1 à 4 choisissent le mode de sélection)
+        let views: &[(egui::Key, usize, bool)] = if self.edit_mode {
+            &[(egui::Key::Num7, 2, true)]
+        } else {
+            &[(egui::Key::Num1, 1, false), (egui::Key::Num3, 0, true), (egui::Key::Num7, 2, true)]
+        };
+        for &(key, axis, positive) in views {
+            if k(key) {
+                self.cam.set_axis_view(viewport::AxisView::from_axis(axis, positive != ctrl));
+            }
+        }
+        if k(egui::Key::Num5) {
+            self.cam.toggle_ortho();
+        }
+        if !self.edit_mode {
+            return;
+        }
+        let Some(s) = &mut self.scene else { return };
+        for (key, m) in [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4].into_iter().zip(SelectMode::ALL) {
+            if !ctrl && k(key) {
+                s.set_select_mode(m);
+            }
+        }
+        if k(egui::Key::A) && !ctrl {
+            s.select_all_uv(!alt);
+        }
+        if ctrl && k(egui::Key::I) {
+            s.invert_uv();
+        }
+        if ctrl && k(egui::Key::L) {
+            let n = s.select_linked_3d();
+            self.status = format!("Sélection liée : {n} face(s)");
+        } else if k(egui::Key::L) {
+            // L : la partie reliée sous le pointeur
+            if let Some(f) = ui.input(|i| i.pointer.hover_pos()).and_then(|p| self.render.pick_face(p)) {
+                if !shift {
+                    s.select_all_uv(false);
+                }
+                s.model.mesh.face_range(f).for_each(|c| s.corner_sel[c] = true);
+                let n = s.select_linked_3d();
+                self.status = format!("Partie reliée : {n} face(s)");
+            }
+        }
+        if ctrl && (k(egui::Key::Plus) || k(egui::Key::Equals)) {
+            s.grow_shrink(true);
+        }
+        if ctrl && k(egui::Key::Minus) {
+            s.grow_shrink(false);
+        }
+        if ctrl && k(egui::Key::E) {
+            self.seam_op(SeamOp::Mark(!shift));
+        }
+        let _ = r;
+    }
+
+    /// Clic dans la vue 3D en mode Édition : sommet, arête, face ou îlot ; Alt : boucle.
+    fn edit_click(&mut self, ui: &egui::Ui, resp: &egui::Response, r: egui::Rect) {
+        let Some(p) = resp.interact_pointer_pos() else { return };
+        let (shift, alt) = ui.input(|i| (i.modifiers.shift || i.modifiers.command, i.modifiers.alt));
+        let f = self.render.pick_face(p);
+        let Some(s) = &mut self.scene else { return };
+        // positions écran des sommets de la face touchée (seuls interrogés)
+        let screen: std::collections::HashMap<u32, [f32; 2]> = f
+            .map(|f| s.model.mesh.face(f).iter().filter_map(|&v| viewport::screen_pos(&self.cam, r, s.model.mesh.positions[v as usize]).map(|q| (v, [q.x, q.y]))).collect())
+            .unwrap_or_default();
+        let at = |v: u32| screen.get(&v).copied();
+        match (alt, f) {
+            (true, Some(f)) => {
+                let n = s.loop_3d(f, [p.x, p.y], at, shift);
+                self.status = format!("Boucle de {n} arête(s) — Ctrl+E pour en faire une couture");
+            }
+            _ => s.click_3d(f, [p.x, p.y], at, shift),
+        }
     }
 
     /// Grille parfaite (Maj+G) sur la sélection, ou sur tous les îlots.
@@ -1420,7 +1532,7 @@ impl EasyUvApp {
                 s.invert_selection();
             }
         }
-        if cmd {
+        if cmd || self.edit_mode {
             return;
         }
         // au-dessus de l'éditeur UV, les touches visent les îlots (comme dans Blender)
@@ -1584,7 +1696,9 @@ impl EasyUvApp {
 
     fn status_bar(&mut self, root: &mut egui::Ui) {
         // aide contextuelle, comme la barre d'état de Blender : elle suit la vue sous le pointeur
-        let hints = if self.pointer_over_uv(root.ctx()) {
+        let hints = if self.edit_mode && !self.pointer_over_uv(root.ctx()) {
+            "Édition (Tab)   1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic : choisir   Alt+clic : boucle   A : tout   L / Ctrl+L : relié   Ctrl+E : couture   U : déplier la sélection"
+        } else if self.pointer_over_uv(root.ctx()) {
             "1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic / rectangle : sélection   Glisser, G R S : transformer   U : déplier la sélection   Q, Maj+1 à 5 : outils   [ ] : rayon   Molette : zoom"
         } else {
             "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   U : déplier   F : cadrer la sélection"
@@ -2221,8 +2335,14 @@ impl eframe::App for EasyUvApp {
                 if let Some(r) = r3d {
                     let body = egui::Rect::from_min_max(r.min + egui::vec2(0.0, 26.0), r.max);
                     let resp = ui.interact(body, ui.scope_id().with("vp3d"), egui::Sense::click_and_drag());
-                    viewport::handle_input(ui, &resp, &mut self.cam, body);
-                    if resp.clicked() {
+                    let on_gizmo = viewport::handle_input(ui, &resp, &mut self.cam, body);
+                    if resp.hovered() && !ctx.egui_wants_keyboard_input() {
+                        self.view3d_keys(ui, r);
+                    }
+                    if self.edit_mode && resp.clicked() && !on_gizmo {
+                        self.edit_click(ui, &resp, r);
+                    }
+                    if resp.clicked() && !on_gizmo && !self.edit_mode {
                         let hit = resp.interact_pointer_pos().and_then(|p| self.render.pick(p));
                         let extend = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                         if let Some(s) = &mut self.scene {
@@ -2239,8 +2359,17 @@ impl eframe::App for EasyUvApp {
                         }
                     }
                     resp.context_menu(|ui| self.object_menu_items(ui));
-                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, &self.mips, &mut self.render);
-                    Self::editor_header(ui, r, "Vue 3D · Perspective", &mut self.view, true);
+                    // en Édition, le fil de fer est toujours visible, comme dans Blender
+                    let mut vopt = self.view;
+                    vopt.wire |= self.edit_mode;
+                    viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &vopt, &self.mips, &mut self.render);
+                    if self.edit_mode {
+                        if let Some(s) = &self.scene {
+                            viewport::draw_vertices(ui, r, s, &self.cam, &self.render, s.sel_mode == SelectMode::Vertex);
+                        }
+                    }
+                    let title = if self.edit_mode { format!("{} · Édition", self.cam.title()) } else { self.cam.title() };
+                    Self::editor_header(ui, r, &title, &mut self.view, true);
                     self.view3d_header_extra(ui, r);
                 }
                 if ruv.is_none() {

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.3] - 2026-10-23
+
+### Vue 3D comme Blender
+- **Vues d'axe** : un clic sur une boule du gizmo (X, Y, Z ou leurs opposées) place la vue sur cet axe, en orthographique (Droite, Gauche, Face, Arrière, Dessus, Dessous). Pavé numérique : `1` face, `3` droite, `7` dessus, `Ctrl` pour le côté opposé, `5` perspective / orthographique. Tourner la vue rend la perspective. L'en-tête affiche la vue en cours.
+- **Mode Édition** (`Tab`) : on choisit **sommets, arêtes et faces directement sur le modèle 3D** (`1` `2` `3`, `4` îlots), `Maj`+clic pour ajouter ou retirer, **`Alt`+clic pour une boucle d'arêtes**. La sélection est partagée avec l'éditeur UV, et marche avant tout dépliage (pour placer ses coutures d'abord).
+- Raccourcis Blender en Édition : `A` / `Alt+A` tout / rien, `Ctrl+I` inverser, `L` partie reliée sous le pointeur, `Ctrl+L` tout ce qui est relié, `Ctrl+` / `Ctrl-` agrandir / réduire, `Ctrl+E` marquer la couture, `Maj+Ctrl+E` la retirer, `U` déplier la sélection. Fil de fer et sommets affichés en Édition.
+
+### Affichage
+- **Image nette en mouvement** : la vue 3D ne passe plus d'office en demi-résolution quand on tourne ou zoome. Le temps de chaque image est mesuré et la résolution ne baisse que si une image pleine résolution dépasserait ~14 ms (plus de 60 images par seconde) ; les modèles courants restent nets.
+
+
 ## [0.3.2] - 2026-10-23
 
 ### Projeter depuis la vue

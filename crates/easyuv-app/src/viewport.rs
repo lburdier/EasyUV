@@ -16,6 +16,7 @@ pub enum Shading {
     Stretch,
 }
 
+#[derive(Clone, Copy)]
 pub struct ViewOptions {
     pub shading: Shading,
     pub wire: bool,
@@ -31,11 +32,72 @@ pub struct Camera {
     pub pitch: f64,
     pub dist: f64,
     pub fov: f64,
+    /// Vue orthographique (pavé 5, ou vue d'axe).
+    pub ortho: bool,
+    /// Vue d'axe en cours (Droite, Dessus…), et si l'orthographique a été mis d'office :
+    /// tourner la vue rend alors la perspective, comme Blender.
+    pub axis_view: Option<AxisView>,
+    auto_ortho: bool,
 }
+
+/// Vues d'axe, comme le pavé numérique de Blender.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisView {
+    Front,
+    Back,
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+impl AxisView {
+    pub fn label(self) -> &'static str {
+        match self {
+            AxisView::Front => "Face",
+            AxisView::Back => "Arrière",
+            AxisView::Right => "Droite",
+            AxisView::Left => "Gauche",
+            AxisView::Top => "Dessus",
+            AxisView::Bottom => "Dessous",
+        }
+    }
+
+    /// Vue depuis le côté `+axe` (signe 1) ou `-axe` (signe -1).
+    pub fn from_axis(axis: usize, positive: bool) -> Self {
+        match (axis, positive) {
+            (0, true) => AxisView::Right,
+            (0, false) => AxisView::Left,
+            (1, true) => AxisView::Back,
+            (1, false) => AxisView::Front,
+            (_, true) => AxisView::Top,
+            (_, false) => AxisView::Bottom,
+        }
+    }
+
+    /// (lacet, tangage) : l'œil est du côté de l'axe, X à droite et Z en haut pour les vues
+    /// de côté, X à droite et Y en haut vu de dessus.
+    fn angles(self) -> (f64, f64) {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let top = FRAC_PI_2 - 1e-4;
+        match self {
+            AxisView::Front => (-FRAC_PI_2, 0.0),
+            AxisView::Back => (FRAC_PI_2, 0.0),
+            AxisView::Right => (0.0, 0.0),
+            AxisView::Left => (PI, 0.0),
+            AxisView::Top => (-FRAC_PI_2, top),
+            AxisView::Bottom => (-FRAC_PI_2, -top),
+        }
+    }
+}
+
+/// Recul et focale multipliés d'autant en orthographique : une caméra très lointaine et très
+/// serrée donne la même image qu'une vraie projection orthographique.
+const ORTHO_K: f64 = 60.0;
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { target: V3::ZERO, yaw: -0.9, pitch: 0.45, dist: 6.0, fov: 50f64.to_radians() }
+        Camera { target: V3::ZERO, yaw: -0.9, pitch: 0.45, dist: 6.0, fov: 50f64.to_radians(), ortho: false, axis_view: None, auto_ortho: false }
     }
 }
 
@@ -49,11 +111,47 @@ struct Basis {
 impl Camera {
     fn basis(&self) -> Basis {
         let dir = V3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.cos() * self.yaw.sin(), self.pitch.sin());
-        let eye = self.target + dir * self.dist;
+        let eye = self.target + dir * self.dist * self.focal_scale();
         let fwd = (self.target - eye).normalized();
         let right = fwd.cross(V3::new(0.0, 0.0, 1.0)).normalized();
         let up = right.cross(fwd);
         Basis { eye, right, up, fwd }
+    }
+
+    /// Facteur de focale (et de recul) : 1 en perspective, ORTHO_K en orthographique.
+    fn focal_scale(&self) -> f64 {
+        if self.ortho {
+            ORTHO_K
+        } else {
+            1.0
+        }
+    }
+
+    /// Passe en vue d'axe orthographique (clic sur le gizmo, pavé 1 / 3 / 7).
+    pub fn set_axis_view(&mut self, v: AxisView) {
+        let (yaw, pitch) = v.angles();
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.axis_view = Some(v);
+        if !self.ortho {
+            self.ortho = true;
+            self.auto_ortho = true;
+        }
+    }
+
+    /// Pavé 5 : bascule perspective / orthographique.
+    pub fn toggle_ortho(&mut self) {
+        self.ortho = !self.ortho;
+        self.auto_ortho = false;
+    }
+
+    /// Nom de la vue pour l'en-tête : « Droite · Orthographique », « Perspective »…
+    pub fn title(&self) -> String {
+        let proj = if self.ortho { "Orthographique" } else { "Perspective" };
+        match self.axis_view {
+            Some(v) => format!("Vue 3D · {} · {proj}", v.label()),
+            None => format!("Vue 3D · {proj}"),
+        }
     }
 
     /// Axes de l'écran dans le monde (droite, haut), pour projeter depuis la vue.
@@ -119,16 +217,20 @@ pub struct RenderCache {
     tex: Option<TextureHandle>,
     key: u64,
     ids: Vec<u32>,
+    faces: Vec<u32>,
     w: usize,
     h: usize,
     rect: Rect,
     /// Génération de la texture damier (pour invalider le cache).
     pub mips_gen: u64,
+    /// Coût mesuré d'une image, en nanosecondes par pixel (moyenne glissante) : décide de la
+    /// résolution pendant les déplacements.
+    ns_per_px: f64,
 }
 
 impl Default for RenderCache {
     fn default() -> Self {
-        RenderCache { tex: None, key: 0, ids: Vec::new(), w: 0, h: 0, rect: Rect::NOTHING, mips_gen: 0 }
+        RenderCache { tex: None, key: 0, ids: Vec::new(), faces: Vec::new(), w: 0, h: 0, rect: Rect::NOTHING, mips_gen: 0, ns_per_px: 0.0 }
     }
 }
 
@@ -149,9 +251,112 @@ impl RenderCache {
         let id = *self.ids.get(y.min(self.h - 1) * self.w + x.min(self.w - 1))?;
         (id > 0).then(|| id as usize - 1)
     }
+
+    /// Face visible sous le point écran `pos`.
+    pub fn pick_face(&self, pos: Pos2) -> Option<usize> {
+        if self.w == 0 || !self.rect.contains(pos) {
+            return None;
+        }
+        let x = ((pos.x - self.rect.left()) / self.rect.width() * self.w as f32) as usize;
+        let y = ((pos.y - self.rect.top()) / self.rect.height() * self.h as f32) as usize;
+        let f = *self.faces.get(y.min(self.h - 1) * self.w + x.min(self.w - 1))?;
+        (f > 0).then(|| f as usize - 1)
+    }
 }
 
-pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect: Rect) {
+/// Position écran d'un point 3D dans la vue `rect` (None derrière la caméra).
+pub fn screen_pos(cam: &Camera, rect: Rect, p: V3) -> Option<Pos2> {
+    let b = cam.basis();
+    let f = (rect.height() as f64 * 0.5) / (cam.fov * 0.5).tan() * cam.focal_scale();
+    let d = p - b.eye;
+    let z = d.dot(b.fwd);
+    if z <= cam.dist * cam.focal_scale() * 0.002 {
+        return None;
+    }
+    let c = rect.center();
+    Some(Pos2::new(c.x + (d.dot(b.right) / z * f) as f32, c.y - (d.dot(b.up) / z * f) as f32))
+}
+
+/// Mode Édition : points des sommets (orange s'ils sont sélectionnés), seulement ceux qui
+/// sont visibles (la face sous le point les contient).
+pub fn draw_vertices(ui: &egui::Ui, rect: Rect, scene: &Scene, cam: &Camera, cache: &RenderCache, all: bool) {
+    let painter = ui.painter_at(rect);
+    let m = &scene.model.mesh;
+    let mut sel = vec![false; m.positions.len()];
+    for (c, &s) in scene.corner_sel.iter().enumerate() {
+        if s {
+            sel[m.corners[c] as usize] = true;
+        }
+    }
+    if !all && !sel.iter().any(|&s| s) {
+        return;
+    }
+    if m.positions.len() > 60_000 && all {
+        return; // trop de points : on ne montre que la sélection
+    }
+    for (v, p) in m.positions.iter().enumerate() {
+        if !all && !sel[v] {
+            continue;
+        }
+        let Some(q) = screen_pos(cam, rect, *p) else { continue };
+        if !rect.contains(q) {
+            continue;
+        }
+        let visible = cache.pick_face(q).is_some_and(|f| m.face(f).contains(&(v as u32)));
+        if !visible {
+            continue;
+        }
+        if sel[v] {
+            painter.circle_filled(q, 3.0, theme::ACCENT_ORANGE);
+        } else {
+            painter.circle_filled(q, 1.6, Color32::from_gray(20));
+        }
+    }
+}
+
+/// Centre du gizmo d'axes, dans la zone de la vue (sous l'en-tête).
+fn gizmo_center(body: Rect) -> Pos2 {
+    Pos2::new(body.right() - 52.0, body.top() + 36.0)
+}
+
+/// Boule du gizmo sous le pointeur : (axe 0 / 1 / 2, côté positif), la plus proche de l'œil
+/// l'emportant.
+fn gizmo_hit(body: Rect, b: &Basis, pos: Pos2) -> Option<(usize, bool)> {
+    let c = gizmo_center(body);
+    let r = 36.0f64;
+    let mut best: Option<(f64, (usize, bool))> = None;
+    for axis in 0..3 {
+        for positive in [true, false] {
+            let mut v = V3::ZERO;
+            match axis {
+                0 => v.x = 1.0,
+                1 => v.y = 1.0,
+                _ => v.z = 1.0,
+            }
+            let v = if positive { v } else { v * -1.0 };
+            let p = Pos2::new(c.x + (v.dot(b.right) * r) as f32, c.y - (v.dot(b.up) * r) as f32);
+            if (p - pos).length() <= 10.0 {
+                let depth = v.dot(b.fwd);
+                if best.is_none_or(|(d, _)| depth < d) {
+                    best = Some((depth, (axis, positive)));
+                }
+            }
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// Navigation de la vue 3D. Renvoie vrai si le clic a servi au gizmo (vue d'axe) : il ne
+/// doit alors pas sélectionner l'objet derrière.
+pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect: Rect) -> bool {
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            if let Some((axis, positive)) = gizmo_hit(rect, &cam.basis(), p) {
+                cam.set_axis_view(AxisView::from_axis(axis, positive));
+                return true;
+            }
+        }
+    }
     let (shift, scroll, mmb, lmb, rmb) = ui.input(|i| {
         (
             i.modifiers.shift,
@@ -170,11 +375,17 @@ pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect
         } else {
             cam.yaw -= d.x as f64 * 0.008;
             cam.pitch = (cam.pitch + d.y as f64 * 0.008).clamp(-1.55, 1.55);
+            // tourner quitte la vue d'axe ; l'orthographique mis d'office redevient perspective
+            if cam.axis_view.take().is_some() && cam.auto_ortho {
+                cam.ortho = false;
+                cam.auto_ortho = false;
+            }
         }
     }
     if resp.hovered() && scroll != 0.0 {
         cam.dist = (cam.dist * (-(scroll as f64) * 0.0018).exp()).max(1e-3);
     }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -182,9 +393,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, theme::BG_VIEWPORT);
     let b = cam.basis();
-    let f = (rect.height() as f64 * 0.5) / (cam.fov * 0.5).tan();
+    let f = (rect.height() as f64 * 0.5) / (cam.fov * 0.5).tan() * cam.focal_scale();
     let c = rect.center();
-    let near = cam.dist * 0.002;
+    let near = cam.dist * cam.focal_scale() * 0.002;
     let project = |p: V3| -> (Pos2, f64) {
         let d = p - b.eye;
         let z = d.dot(b.fwd);
@@ -231,24 +442,41 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
             // garantit une dernière image (pleine résolution) à la fin du zoom
             ui.ctx().request_repaint();
         }
-        let ppp = ui.ctx().pixels_per_point() * if moving { 0.5 } else { 1.0 };
+        // en mouvement, la résolution ne baisse que si une image pleine résolution dépasserait
+        // ~14 ms (plus de 60 images par seconde) : les modèles courants restent nets
+        let full = ui.ctx().pixels_per_point();
+        let full_px = (rect.width() * full) as f64 * (rect.height() * full) as f64;
+        let scale = if moving && cache.ns_per_px > 0.0 {
+            let predicted = cache.ns_per_px * full_px;
+            let s = (14.0e6 / predicted.max(1.0)).sqrt().clamp(0.5, 1.0);
+            // par paliers : la texture n'est pas réallouée à chaque image
+            (s * 8.0).floor() / 8.0
+        } else {
+            1.0
+        };
+        let ppp = full * scale as f32;
         let (w, h) = (((rect.width() * ppp) as usize).max(1), ((rect.height() * ppp) as usize).max(1));
         // clé du cache : tout ce qui change l'image
         let mut hs = DefaultHasher::new();
         for v in [cam.target.x, cam.target.y, cam.target.z, cam.yaw, cam.pitch, cam.dist, cam.fov] {
             v.to_bits().hash(&mut hs);
         }
+        cam.ortho.hash(&mut hs);
         (w, h, scene.generation, scene as *const Scene as usize, cache.mips_gen).hash(&mut hs);
         (opt.shading as u8, opt.wire, opt.seams, opt.tiling.to_bits(), scene.hover_island).hash(&mut hs);
         let key = hs.finish();
         if key != cache.key || cache.tex.is_none() {
+            let t0 = std::time::Instant::now();
             let frame = render_scene(scene, &b, f * ppp as f64, near, w, h, opt, mips, ppp);
+            let ns = t0.elapsed().as_nanos() as f64 / (w * h).max(1) as f64;
+            cache.ns_per_px = if cache.ns_per_px > 0.0 { cache.ns_per_px * 0.7 + ns * 0.3 } else { ns };
             let img = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
             match &mut cache.tex {
-                Some(t) => t.set(img, if moving { TextureOptions::LINEAR } else { TextureOptions::NEAREST }),
+                Some(t) => t.set(img, if scale < 1.0 { TextureOptions::LINEAR } else { TextureOptions::NEAREST }),
                 None => cache.tex = Some(ui.ctx().load_texture("viewport3d", img, TextureOptions::NEAREST)),
             }
             cache.ids = frame.ids;
+            cache.faces = frame.faces;
             cache.w = frame.width;
             cache.h = frame.height;
             cache.key = key;
@@ -261,7 +489,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &Camera, 
         cache.w = 0;
     }
 
-    draw_gizmo(&painter, rect, &b);
+    let hover = ui.input(|i| i.pointer.hover_pos());
+    draw_gizmo(&painter, rect, &b, hover);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,8 +514,7 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
             let isl = scene.face_island.get(fi).map(|&i| i as usize);
             let picked = match scene.sel_mode {
                 crate::scene::SelectMode::Island => isl.is_some_and(|i| scene.island_selected.get(i).copied().unwrap_or(false)),
-                crate::scene::SelectMode::Face => scene.face_selected(fi),
-                _ => false,
+                _ => scene.face_selected(fi),
             };
             let mix = |c: [u8; 3], t: [u8; 3], k: f32| -> [u8; 3] { std::array::from_fn(|j| (c[j] as f32 * (1.0 - k) + t[j] as f32 * k) as u8) };
             if picked {
@@ -337,8 +565,11 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
 }
 
 /// Gizmo d'orientation en haut à droite, comme dans Blender.
-fn draw_gizmo(painter: &egui::Painter, rect: Rect, b: &Basis) {
-    let c = Pos2::new(rect.right() - 52.0, rect.top() + 62.0);
+fn draw_gizmo(painter: &egui::Painter, rect: Rect, b: &Basis, hover: Option<Pos2>) {
+    let body = Rect::from_min_max(rect.min + egui::vec2(0.0, 26.0), rect.max);
+    let c = gizmo_center(body);
+    // boule survolée : cliquable, comme dans Blender
+    let hot = hover.and_then(|p| gizmo_hit(body, b, p));
     let r = 36.0f64;
     painter.circle_filled(c, r as f32 + 10.0, Color32::from_white_alpha(8));
     let axes = [
@@ -346,16 +577,22 @@ fn draw_gizmo(painter: &egui::Painter, rect: Rect, b: &Basis) {
         (V3::new(0.0, 1.0, 0.0), theme::AXIS_Y, "Y"),
         (V3::new(0.0, 0.0, 1.0), theme::AXIS_Z, "Z"),
     ];
-    let mut items: Vec<(f64, Pos2, Color32, Option<&str>)> = Vec::new();
-    for (a, col, name) in axes {
+    let mut items: Vec<(f64, Pos2, Color32, Option<&str>, bool)> = Vec::new();
+    for (k, (a, col, name)) in axes.into_iter().enumerate() {
         for sign in [1.0, -1.0] {
             let v = a * sign;
             let p = Pos2::new(c.x + (v.dot(b.right) * r) as f32, c.y - (v.dot(b.up) * r) as f32);
-            items.push((v.dot(b.fwd), p, col, if sign > 0.0 { Some(name) } else { None }));
+            items.push((v.dot(b.fwd), p, col, if sign > 0.0 { Some(name) } else { None }, hot == Some((k, sign > 0.0))));
         }
     }
     items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    for (_, p, col, name) in items {
+    if hot.is_some() {
+        painter.circle_filled(c, r as f32 + 10.0, Color32::from_white_alpha(14));
+    }
+    for (_, p, col, name, is_hot) in items {
+        if is_hot {
+            painter.circle_stroke(p, 11.0, Stroke::new(1.5, Color32::WHITE));
+        }
         if let Some(name) = name {
             painter.line_segment([c, p], Stroke::new(2.0, col));
             painter.circle_filled(p, 9.0, col);
