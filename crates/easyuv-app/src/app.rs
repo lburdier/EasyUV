@@ -115,6 +115,8 @@ pub struct EasyUvApp {
     confirm_delete: Option<egui::Pos2>,
 }
 
+const PROJECT_HELP: &str = "Les UV prennent exactement ce que l'on voit dans la vue 3D, sous cet angle (comme Project From View de Blender) : idéal pour un logo, une étiquette ou un décor à peindre de face. S'applique aux faces sélectionnées dans l'éditeur UV, sinon aux objets sélectionnés, sinon à tout. Le résultat est rangé dans la place libre, à la densité des autres îlots.";
+
 /// Outils de couture du panneau « Outils UV ».
 #[derive(Clone, Copy)]
 enum SeamOp {
@@ -804,6 +806,10 @@ impl EasyUvApp {
             ui.close();
             self.frame_selection();
         }
+        if item(ui, self.scene.is_some(), "Projeter depuis la vue (UV)", "") {
+            ui.close();
+            self.project_view_op(false);
+        }
         ui.menu_button("Pivoter de 90° (redresser)", |ui| {
             for (label, axis, pos) in [("X +90°", 0, true), ("X −90°", 0, false), ("Y +90°", 1, true), ("Y −90°", 1, false), ("Z +90°", 2, true), ("Z −90°", 2, false)] {
                 if ui.button(label).clicked() {
@@ -881,6 +887,14 @@ impl EasyUvApp {
         if item(ui, has_isl, "Rendre droit (bandes, arcs)", "Maj+W") {
             ui.close();
             self.straighten_strips();
+        }
+        if item(ui, self.scene.is_some(), "Projeter depuis la vue", "") {
+            ui.close();
+            self.project_view_op(false);
+        }
+        if item(ui, self.scene.is_some(), "Projeter depuis la vue (cadré)", "") {
+            ui.close();
+            self.project_view_op(true);
         }
         if item(ui, has_uv, "Grille parfaite", "Maj+G") {
             ui.close();
@@ -1046,6 +1060,40 @@ impl EasyUvApp {
                 self.status = e;
             }
         }
+    }
+
+    /// Projection depuis la vue 3D (comme « Project From View » de Blender), annulable.
+    fn project_view_op(&mut self, fit: bool) {
+        if self.scene.is_none() || self.job.is_some() {
+            return;
+        }
+        self.snapshot();
+        let (right, up) = self.cam.view_axes();
+        let params = self.effective_params();
+        let ts = self.params.texture_size;
+        let n = self.scene.as_mut().unwrap().project_from_view(right, up, &params, ts, fit);
+        if n == 0 {
+            self.undo.pop();
+            self.status = "Projeter depuis la vue : rien à projeter".into();
+            return;
+        }
+        self.status = format!(
+            "{n} face(s) projetée(s) depuis la vue{} — Ctrl+Z pour annuler",
+            if fit { ", étirées sur la tuile" } else { ", rangées dans la place libre" }
+        );
+    }
+
+    /// Bouton « Projeter depuis la vue » dans l'en-tête de la vue 3D, après le titre.
+    fn view3d_header_extra(&mut self, ui: &mut egui::Ui, r: egui::Rect) {
+        let at = egui::Rect::from_min_size(egui::pos2(r.left() + 156.0, r.top() + 2.0), egui::vec2(28.0, 22.0));
+        if r.width() < 620.0 {
+            return; // vue étroite : le bouton reste dans le panneau et les menus
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
+            if icons::button(ui, Icon::Project, false, "Projeter depuis la vue", "", PROJECT_HELP).clicked() {
+                self.project_view_op(false);
+            }
+        });
     }
 
     /// Grille parfaite (Maj+G) sur la sélection, ou sur tous les îlots.
@@ -1757,6 +1805,17 @@ impl EasyUvApp {
                             } else if primary_button(ui, &format!("{objects}  (U)")).clicked() {
                                 self.start_unwrap(ui.ctx());
                             }
+                            ui.horizontal(|ui| {
+                                if icons::button(ui, Icon::Project, false, "Projeter depuis la vue", "", PROJECT_HELP).clicked() {
+                                    self.project_view_op(false);
+                                }
+                                if ui.button("Projeter depuis la vue").on_hover_text(PROJECT_HELP).clicked() {
+                                    self.project_view_op(false);
+                                }
+                                if ui.small_button("Cadré").on_hover_text("Même projection, étirée pour remplir toute la tuile 0-1").clicked() {
+                                    self.project_view_op(true);
+                                }
+                            });
                         });
                         if busy {
                             ui.horizontal(|ui| {
@@ -2182,6 +2241,7 @@ impl eframe::App for EasyUvApp {
                     resp.context_menu(|ui| self.object_menu_items(ui));
                     viewport::draw(ui, r, self.scene.as_ref(), &self.cam, &self.view, &self.mips, &mut self.render);
                     Self::editor_header(ui, r, "Vue 3D · Perspective", &mut self.view, true);
+                    self.view3d_header_extra(ui, r);
                 }
                 if ruv.is_none() {
                     self.uv_rect = None;

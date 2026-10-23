@@ -720,6 +720,19 @@ pub fn snap_grid(mesh: &Mesh, corner_uv: &mut [[f32; 2]], isl: &Islands) -> usiz
     done
 }
 
+/// Projection depuis la vue (comme « Project From View » de Blender) : chaque coin des
+/// faces `faces` reçoit la position de son sommet sur le plan de l'écran, `right` et `up`
+/// étant les axes de la vue. Projection orthographique, à l'échelle du monde : une face vue
+/// de face garde sa taille réelle.
+pub fn project_faces(mesh: &Mesh, corner_uv: &mut [[f32; 2]], faces: &[usize], right: V3, up: V3) {
+    for &f in faces {
+        for c in mesh.face_range(f) {
+            let p = mesh.positions[mesh.corners[c] as usize];
+            corner_uv[c] = [p.dot(right) as f32, p.dot(up) as f32];
+        }
+    }
+}
+
 /// Direction dominante des arêtes d'un îlot, modulo 90° (dans [-45°, 45°]) : moyenne
 /// circulaire de 4θ pondérée par la longueur.
 pub fn dominant_angle(mesh: &Mesh, corner_uv: &[[f32; 2]], faces: &[usize]) -> f64 {
@@ -1052,6 +1065,15 @@ mod tests {
         let isl = Islands::new(&m, &fi, &[wall]);
         let (a, b) = bounds(&uv, &isl.corners[0]).unwrap();
         assert!((a.x - lo.x).abs() < 1e-4 && (a.y - lo.y).abs() < 1e-4 && (b.x - hi.x).abs() < 1e-4 && (b.y - hi.y).abs() < 1e-4, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn project_from_front_keeps_shape() {
+        // un quad de 2 × 1 dans le plan XZ, vu de face (axes X et Z) : UV = sa forme exacte
+        let m = Mesh::from_faces(vec![V3::new(0.0, 0.0, 0.0), V3::new(2.0, 0.0, 0.0), V3::new(2.0, 0.0, 1.0), V3::new(0.0, 0.0, 1.0)], &[vec![0, 1, 2, 3]]);
+        let mut uv = vec![[0.0f32; 2]; 4];
+        project_faces(&m, &mut uv, &[0], V3::new(1.0, 0.0, 0.0), V3::new(0.0, 0.0, 1.0));
+        assert_eq!(uv, vec![[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]]);
     }
 
     #[test]

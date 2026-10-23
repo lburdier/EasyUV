@@ -56,6 +56,12 @@ impl Camera {
         Basis { eye, right, up, fwd }
     }
 
+    /// Axes de l'écran dans le monde (droite, haut), pour projeter depuis la vue.
+    pub fn view_axes(&self) -> (V3, V3) {
+        let b = self.basis();
+        (b.right, b.up)
+    }
+
     pub fn frame(&mut self, lo: V3, hi: V3) {
         self.target = (lo + hi) * 0.5;
         let r = ((hi - lo).length() * 0.5).max(1e-3);

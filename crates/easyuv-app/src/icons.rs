@@ -26,6 +26,7 @@ pub enum Icon {
     Lasso,
     Circle,
     Angle,
+    Project,
 }
 
 /// Dessine l'icône dans `r`.
@@ -162,6 +163,16 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
             p.circle_stroke(c, s * 0.8, st);
             p.circle_filled(c, 1.8, col);
         }
+        Icon::Project => {
+            // un œil qui projette un carré sur le plan
+            let eye = [at(-0.9, 0.0), at(-0.6, -0.25), at(-0.3, 0.0), at(-0.6, 0.25)];
+            p.add(egui::Shape::closed_line(eye.to_vec(), st));
+            p.circle_filled(at(-0.6, 0.0), 1.6, col);
+            for y in [-0.6f32, 0.6] {
+                p.add(egui::Shape::dashed_line(&[at(-0.3, 0.0), at(0.5, y)], thin, 2.0, 2.0));
+            }
+            p.rect_stroke(Rect::from_min_max(at(0.5, -0.6), at(0.85, 0.6)), 0.0, Stroke::new(1.5, theme::ACCENT_ORANGE), egui::StrokeKind::Middle);
+        }
         Icon::Angle => {
             // deux pans qui font un angle, l'arête vive en orange
             p.line_segment([at(-0.85, 0.6), at(0.0, -0.1)], st);
@@ -275,6 +286,12 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
                 let gap = if i >= nx / 2 { cell.x * 0.8 * (1.0 - t) } else { 0.0 };
                 f + egui::vec2(gap, if i >= nx / 2 { -cell.y * 0.5 * (1.0 - t) } else { 0.0 })
             }
+            // vue en perspective (trapèze) -> UV à plat
+            Icon::Project => {
+                let k = 0.55 + 0.45 * (f.y - area.top()) / area.height().max(1.0);
+                let seen = Pos2::new(center.x + (f.x - center.x) * k, f.y);
+                seen + (f - seen) * t
+            }
             Icon::Grid => f + egui::vec2((j as f32 * 2.1 + i as f32).sin() * cell.x * 0.18, (i as f32 * 1.4).sin() * cell.y * 0.35) * (1.0 - t),
             Icon::Orient => {
                 let (sn, cs) = (0.5 * (1.0 - t)).sin_cos();
@@ -296,6 +313,7 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
         Icon::Cut | Icon::Sew => split_col = Some(nx / 2),
         Icon::Unwrap => fill_cells.extend((0..nx).flat_map(|i| (0..ny).map(move |j| (i, j)))),
         Icon::Grid | Icon::Orient => {}
+        Icon::Project => fill_cells.extend((2..6).flat_map(|i| (0..ny).map(move |j| (i, j)))),
         Icon::BoxSel => {
             let k = (t * 4.0).round() as usize;
             fill_cells.extend((1..1 + k).flat_map(|i| (0..2).map(move |j| (i, j))));
@@ -381,6 +399,7 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
         Icon::Mark => "couture imposée au prochain dépliage",
         Icon::Unwrap => "seule la sélection est redépliée",
         Icon::Grid => "rangées et colonnes passées à la règle",
+        Icon::Project => "les UV prennent ce que l'on voit de la vue 3D",
         Icon::Orient => "chaque îlot remis d'aplomb sur ses arêtes",
         Icon::BoxSel => "glisser : tout ce qui est dans le rectangle",
         Icon::Lasso => "tracer la zone à main levée",
