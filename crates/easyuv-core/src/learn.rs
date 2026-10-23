@@ -13,7 +13,7 @@
 //! Le modèle est un fichier texte en ajout seul, partagé par l'application, le CLI et Blender.
 
 use crate::mesh::{Mesh, Topology};
-use crate::model::{unwrap_model, Model};
+use crate::model::Model;
 use crate::{Params, Stats, UvResult};
 use std::path::{Path, PathBuf};
 
@@ -434,7 +434,7 @@ pub fn unwrap_learned_with_seams(model: &Model, base: &Params, together: bool, l
                     (
                         i,
                         sc.spawn(move || {
-                            let r = if seams.is_empty() { unwrap_model(m, &p, together) } else { crate::smart_unwrap(&m.mesh, &p, seams) };
+                            let r = crate::model::unwrap_model_with_seams(m, &p, together, seams);
                             let c = components(&r.stats, &m.mesh);
                             (r, c)
                         }),
@@ -499,8 +499,8 @@ mod tests {
         // jamais pire que les réglages d'usine (ils font partie des essais)
         assert!(first.score >= first.default_score - 1e-12);
         // déterminisme : mêmes réglages -> même score
-        let r1 = unwrap_model(&m, &p, true);
-        let r2 = unwrap_model(&m, &p, true);
+        let r1 = crate::model::unwrap_model(&m, &p, true);
+        let r2 = crate::model::unwrap_model(&m, &p, true);
         assert_eq!(score(&r1.stats, &m.mesh), score(&r2.stats, &m.mesh));
         // avec l'expérience acquise, un seul essai retrouve le meilleur réglage
         let again = unwrap_learned(&m, &p, true, &mut l, 1);

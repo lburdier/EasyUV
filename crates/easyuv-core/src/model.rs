@@ -123,6 +123,22 @@ pub fn unwrap_model(model: &Model, params: &Params, together: bool) -> UvResult 
     per_object(model, |_, sub| smart_unwrap(sub, params, &[]))
 }
 
+/// Comme [`unwrap_model`], avec des coutures imposées (paires de sommets du modèle).
+pub fn unwrap_model_with_seams(model: &Model, params: &Params, together: bool, seams: &[(u32, u32)]) -> UvResult {
+    if seams.is_empty() {
+        return unwrap_model(model, params, together);
+    }
+    if together || model.objects.len() <= 1 {
+        return smart_unwrap(&model.mesh, params, seams);
+    }
+    per_object(model, |i, sub| {
+        let o = &model.objects[i];
+        let (v0, v1) = (o.vert_start as u32, o.vert_end as u32);
+        let local: Vec<(u32, u32)> = seams.iter().filter(|&&(a, b)| a >= v0 && a < v1 && b >= v0 && b < v1).map(|&(a, b)| (a - v0, b - v0)).collect();
+        smart_unwrap(sub, params, &local)
+    })
+}
+
 /// Rangement seul (sans redéplier) des UV existantes `corner_uv` d'une scène, ensemble ou
 /// objet par objet comme [`unwrap_model`].
 pub fn pack_model(model: &Model, corner_uv: &[[f32; 2]], params: &Params, together: bool, equalize: bool) -> UvResult {

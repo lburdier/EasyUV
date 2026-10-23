@@ -5,6 +5,38 @@ use easyuv::model::Model;
 use easyuv::UvResult;
 use std::collections::HashSet;
 
+/// Mode de sélection de l'éditeur UV, comme Blender (1 / 2 / 3 / 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SelectMode {
+    Vertex,
+    Edge,
+    Face,
+    #[default]
+    Island,
+}
+
+impl SelectMode {
+    pub const ALL: [SelectMode; 4] = [SelectMode::Vertex, SelectMode::Edge, SelectMode::Face, SelectMode::Island];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelectMode::Vertex => "Sommets",
+            SelectMode::Edge => "Arêtes",
+            SelectMode::Face => "Faces",
+            SelectMode::Island => "Îlots",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SelectMode::Vertex => "1",
+            SelectMode::Edge => "2",
+            SelectMode::Face => "3",
+            SelectMode::Island => "4",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Scene {
     pub name: String,
@@ -38,6 +70,12 @@ pub struct Scene {
     pub island_object: Vec<u32>,
     /// Îlots sélectionnés dans l'éditeur UV.
     pub island_selected: Vec<bool>,
+    /// Mode de sélection de l'éditeur UV.
+    pub sel_mode: SelectMode,
+    /// Coins UV sélectionnés (modes sommets, arêtes et faces).
+    pub corner_sel: Vec<bool>,
+    /// Coutures marquées à la main (paires de sommets, a < b), imposées aux dépliages.
+    pub marked_seams: HashSet<(u32, u32)>,
 }
 
 /// Une entrée de reconstruction : objet source, décalage éventuel (copie), état.
@@ -73,6 +111,9 @@ impl Scene {
             island_corners: Vec::new(),
             island_object: Vec::new(),
             island_selected: Vec::new(),
+            sel_mode: SelectMode::Island,
+            corner_sel: Vec::new(),
+            marked_seams: HashSet::new(),
         };
         s.rebuild_derived();
         s
@@ -279,6 +320,7 @@ impl Scene {
         let mut new_uv = old_uv.map(|u| UvResult { corner_uv: Vec::new(), face_chart: Vec::new(), seams: Vec::new(), stats: u.stats.clone() });
         let mut selected = Vec::new();
         let mut hidden = Vec::new();
+        let mut marked = HashSet::new();
         for e in &plan {
             let mut m = self.model.object_mesh(e.src);
             if let Some(d) = e.offset {
@@ -287,6 +329,15 @@ impl Scene {
                 }
             }
             let vs_new = model.mesh.positions.len() as u32;
+            {
+                let o = &self.model.objects[e.src];
+                let (v0, v1) = (o.vert_start as u32, o.vert_end as u32);
+                for &(a, b) in &self.marked_seams {
+                    if a >= v0 && a < v1 && b >= v0 && b < v1 {
+                        marked.insert((a - v0 + vs_new, b - v0 + vs_new));
+                    }
+                }
+            }
             model.push(e.name.clone(), &m);
             selected.push(e.selected);
             hidden.push(e.hidden);
@@ -311,6 +362,7 @@ impl Scene {
         self.model = model;
         self.selected = selected;
         self.hidden = hidden;
+        self.marked_seams = marked;
         self.rebuild_derived();
         match new_uv {
             Some(u) if !self.model.objects.is_empty() => self.set_uv(u, texture_size),
@@ -433,6 +485,7 @@ impl Scene {
         }
         self.face_island = fi;
         self.island_selected = vec![false; n];
+        self.corner_sel = vec![false; m.corners.len()];
     }
 
     // ---------- édition UV (îlots) ----------
@@ -463,8 +516,12 @@ impl Scene {
         hit
     }
 
+    /// Quelque chose est sélectionné dans l'éditeur UV (îlots, ou sommets / arêtes / faces).
     pub fn has_island_selection(&self) -> bool {
-        self.island_selected.iter().any(|&s| s)
+        match self.sel_mode {
+            SelectMode::Island => self.island_selected.iter().any(|&s| s),
+            _ => self.corner_sel.iter().any(|&s| s),
+        }
     }
 
     pub fn island_visible(&self, i: usize) -> bool {
@@ -526,9 +583,33 @@ impl Scene {
         self.touch();
     }
 
-    /// Îlots sélectionnés et visibles.
+    /// Îlots sélectionnés et visibles ; hors mode îlots, ceux qui contiennent la sélection.
     pub fn selected_island_ids(&self) -> Vec<usize> {
-        (0..self.island_selected.len()).filter(|&i| self.island_selected[i] && self.island_visible(i)).collect()
+        if self.sel_mode == SelectMode::Island {
+            return (0..self.island_selected.len()).filter(|&i| self.island_selected[i] && self.island_visible(i)).collect();
+        }
+        let mut hit = vec![false; self.island_selected.len()];
+        for f in 0..self.model.mesh.face_count() {
+            if self.model.mesh.face_range(f).any(|c| self.corner_sel.get(c).copied().unwrap_or(false)) {
+                if let Some(&i) = self.face_island.get(f) {
+                    hit[i as usize] = true;
+                }
+            }
+        }
+        (0..hit.len()).filter(|&i| hit[i] && self.island_visible(i)).collect()
+    }
+
+    /// Sélectionne l'îlot `i` seul, quel que soit le mode.
+    pub fn select_island_only(&mut self, i: usize) {
+        if self.sel_mode == SelectMode::Island {
+            self.click_island(Some(i), false);
+            return;
+        }
+        self.corner_sel.iter_mut().for_each(|s| *s = false);
+        for &c in &self.island_corners[i] {
+            self.corner_sel[c as usize] = true;
+        }
+        self.touch();
     }
 
     /// Îlots touchés par un pinceau : la sélection s'il y en a une, sinon tout ce qui est visible.
@@ -553,9 +634,429 @@ impl Scene {
         ids.len()
     }
 
-    /// Coins des îlots sélectionnés.
+    /// Coins sélectionnés : ceux des îlots sélectionnés, ou les sommets / arêtes / faces.
     pub fn selected_corners(&self) -> Vec<u32> {
+        if self.sel_mode != SelectMode::Island {
+            return (0..self.corner_sel.len()).filter(|&c| self.corner_sel[c]).map(|c| c as u32).collect();
+        }
         (0..self.island_selected.len()).filter(|&i| self.island_selected[i]).flat_map(|i| self.island_corners[i].iter().copied()).collect()
+    }
+
+    // ---------- sélection de sommets, d'arêtes et de faces (comme Blender) ----------
+
+    fn face_visible(&self, f: usize) -> bool {
+        !self.hidden[self.face_object[f] as usize]
+    }
+
+    /// Change de mode en convertissant la sélection (îlots <-> coins).
+    pub fn set_select_mode(&mut self, mode: SelectMode) {
+        if mode == self.sel_mode {
+            return;
+        }
+        let ids = self.selected_island_ids();
+        let corners = self.selected_corners();
+        let was_island = self.sel_mode == SelectMode::Island;
+        self.sel_mode = mode;
+        if mode == SelectMode::Island {
+            self.island_selected.iter_mut().for_each(|s| *s = false);
+            for i in ids {
+                self.island_selected[i] = true;
+            }
+        } else if was_island {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+            for c in corners {
+                self.corner_sel[c as usize] = true;
+            }
+        }
+        self.touch();
+    }
+
+    /// Coins au même endroit que `c` : même sommet, même îlot, mêmes UV (sélection collante,
+    /// comme « Shared Location » de Blender : l'autre côté d'une couture n'est pas pris).
+    fn sticky(&self, c: usize) -> Vec<usize> {
+        let Some(uv) = &self.uv else { return vec![c] };
+        let m = &self.model.mesh;
+        let (v, p) = (m.corners[c], uv.corner_uv[c]);
+        let isl = self.face_island_of_corner(c);
+        (0..m.corners.len()).filter(|&k| m.corners[k] == v && uv.corner_uv[k] == p && self.face_island_of_corner(k) == isl).collect()
+    }
+
+    fn face_island_of_corner(&self, c: usize) -> u32 {
+        // face_start est croissant : recherche dichotomique de la face du coin
+        let fs = &self.model.mesh.face_start;
+        let f = fs.partition_point(|&s| s <= c).saturating_sub(1);
+        self.face_island.get(f).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Coin UV visible le plus proche de `p` (à moins de `tol`, en unités UV).
+    pub fn pick_corner(&self, p: [f32; 2], tol: f32) -> Option<usize> {
+        let uv = self.uv.as_ref()?;
+        let m = &self.model.mesh;
+        let mut best = (tol * tol, None);
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            for c in m.face_range(f) {
+                let q = uv.corner_uv[c];
+                let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2);
+                if d < best.0 {
+                    best = (d, Some(c));
+                }
+            }
+        }
+        best.1
+    }
+
+    /// Arête UV visible la plus proche de `p` : (coin, coin suivant de la face).
+    pub fn pick_edge(&self, p: [f32; 2], tol: f32) -> Option<(usize, usize)> {
+        let uv = self.uv.as_ref()?;
+        let m = &self.model.mesh;
+        let mut best = (tol, None);
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let r: Vec<usize> = m.face_range(f).collect();
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                let (pa, pb) = (uv.corner_uv[a], uv.corner_uv[b]);
+                let d = [pb[0] - pa[0], pb[1] - pa[1]];
+                let l2 = d[0] * d[0] + d[1] * d[1];
+                let t = if l2 > 0.0 { (((p[0] - pa[0]) * d[0] + (p[1] - pa[1]) * d[1]) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                let dist = ((pa[0] + t * d[0] - p[0]).powi(2) + (pa[1] + t * d[1] - p[1]).powi(2)).sqrt();
+                if dist < best.0 {
+                    best = (dist, Some((a, b)));
+                }
+            }
+        }
+        best.1
+    }
+
+    /// Face visible sous `p` (la dernière dessinée l'emporte).
+    pub fn pick_face(&self, p: [f32; 2]) -> Option<usize> {
+        let uv = self.uv.as_ref()?;
+        let m = &self.model.mesh;
+        let mut hit = None;
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let r = m.face_range(f);
+            for t in m.fan(f) {
+                let [a, b, c] = t.map(|k| uv.corner_uv[r.start + k]);
+                let e = |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+                let (e0, e1, e2) = (e(a, b), e(b, c), e(c, a));
+                if (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0) {
+                    hit = Some(f);
+                }
+            }
+        }
+        hit
+    }
+
+    /// Clic dans l'éditeur UV en mode sommets / arêtes / faces. Maj : ajouter ou retirer.
+    /// Renvoie vrai si un élément a été touché.
+    pub fn click_component(&mut self, p: [f32; 2], tol: f32, extend: bool) -> bool {
+        let picked: Vec<usize> = match self.sel_mode {
+            SelectMode::Vertex => self.pick_corner(p, tol).map(|c| self.sticky(c)).unwrap_or_default(),
+            SelectMode::Edge => self.pick_edge(p, tol).map(|(a, b)| [self.sticky(a), self.sticky(b)].concat()).unwrap_or_default(),
+            SelectMode::Face => self.pick_face(p).map(|f| self.model.mesh.face_range(f).flat_map(|c| self.sticky(c)).collect()).unwrap_or_default(),
+            SelectMode::Island => return false,
+        };
+        let all_on = !picked.is_empty() && picked.iter().all(|&c| self.corner_sel[c]);
+        if !extend {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+        }
+        // Maj+clic sur un élément déjà choisi : il est retiré
+        let on = !(extend && all_on);
+        for c in &picked {
+            self.corner_sel[*c] = on;
+        }
+        self.touch();
+        !picked.is_empty()
+    }
+
+    /// Double-clic en mode arêtes : boucle d'arêtes (dans l'îlot de l'arête cliquée).
+    pub fn select_loop(&mut self, p: [f32; 2], tol: f32, extend: bool) -> usize {
+        let Some((ca, cb)) = self.pick_edge(p, tol) else { return 0 };
+        let m = &self.model.mesh;
+        let lp: HashSet<(u32, u32)> = easyuv::uvtools::edge_loop(m, m.corners[ca], m.corners[cb]).into_iter().collect();
+        let isl = self.face_island_of_corner(ca);
+        if !extend {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+        }
+        for f in 0..m.face_count() {
+            if self.face_island.get(f).copied() != Some(isl) {
+                continue;
+            }
+            let r: Vec<usize> = m.face_range(f).collect();
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                let (va, vb) = (m.corners[a], m.corners[b]);
+                if lp.contains(&(va.min(vb), va.max(vb))) {
+                    self.corner_sel[a] = true;
+                    self.corner_sel[b] = true;
+                }
+            }
+        }
+        self.touch();
+        lp.len()
+    }
+
+    /// Sélection au rectangle, selon le mode. `mode` : 1 = ajouter, -1 = retirer, 0 = remplacer.
+    pub fn box_select(&mut self, lo: [f32; 2], hi: [f32; 2], mode: i32) {
+        if self.sel_mode == SelectMode::Island {
+            self.box_select_islands(lo, hi, mode);
+            return;
+        }
+        let Some(uv) = &self.uv else { return };
+        let m = &self.model.mesh;
+        let inside = |q: [f32; 2]| q[0] >= lo[0] && q[0] <= hi[0] && q[1] >= lo[1] && q[1] <= hi[1];
+        let mut hit = vec![false; m.corners.len()];
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let r = m.face_range(f);
+            if self.sel_mode == SelectMode::Face {
+                let n = r.len() as f32;
+                let c = r.clone().fold([0.0f32; 2], |a, k| [a[0] + uv.corner_uv[k][0] / n, a[1] + uv.corner_uv[k][1] / n]);
+                if inside(c) {
+                    r.for_each(|k| hit[k] = true);
+                }
+            } else {
+                for k in r {
+                    hit[k] = inside(uv.corner_uv[k]);
+                }
+            }
+        }
+        for (s, h) in self.corner_sel.iter_mut().zip(hit) {
+            *s = match mode {
+                1 => *s || h,
+                -1 => *s && !h,
+                _ => h,
+            };
+        }
+        self.touch();
+    }
+
+    /// Tout sélectionner / désélectionner (A / Alt+A), selon le mode.
+    pub fn select_all_uv(&mut self, on: bool) {
+        if self.sel_mode == SelectMode::Island {
+            self.select_all_islands(on);
+            return;
+        }
+        let m = &self.model.mesh;
+        for f in 0..m.face_count() {
+            let vis = self.face_visible(f);
+            for c in m.face_range(f) {
+                self.corner_sel[c] = on && vis;
+            }
+        }
+        self.touch();
+    }
+
+    /// Inverser la sélection (Ctrl+I), selon le mode.
+    pub fn invert_uv(&mut self) {
+        if self.sel_mode == SelectMode::Island {
+            self.invert_islands();
+            return;
+        }
+        let m = &self.model.mesh;
+        for f in 0..m.face_count() {
+            let vis = self.face_visible(f);
+            for c in m.face_range(f) {
+                self.corner_sel[c] = !self.corner_sel[c] && vis;
+            }
+        }
+        self.touch();
+    }
+
+    /// Une face est sélectionnée quand tous ses coins le sont.
+    pub fn face_selected(&self, f: usize) -> bool {
+        self.model.mesh.face_range(f).all(|c| self.corner_sel.get(c).copied().unwrap_or(false))
+    }
+
+    /// Faces visées par « Déplier la sélection » : celles des îlots sélectionnés, ou les faces
+    /// entièrement sélectionnées (à défaut, les îlots touchés par la sélection).
+    pub fn selected_faces(&self) -> Vec<usize> {
+        let m = &self.model.mesh;
+        if self.sel_mode != SelectMode::Island {
+            let full: Vec<usize> = (0..m.face_count()).filter(|&f| self.face_visible(f) && self.face_selected(f)).collect();
+            if !full.is_empty() {
+                return full;
+            }
+        }
+        let ids: HashSet<usize> = self.selected_island_ids().into_iter().collect();
+        (0..m.face_count()).filter(|&f| self.face_island.get(f).is_some_and(|&i| ids.contains(&(i as usize)))).collect()
+    }
+
+    /// Arêtes sélectionnées (paires de sommets, a < b) : arêtes de face dont les deux coins
+    /// sont sélectionnés.
+    pub fn selected_mesh_edges(&self) -> Vec<(u32, u32)> {
+        if self.sel_mode == SelectMode::Island {
+            return Vec::new();
+        }
+        let m = &self.model.mesh;
+        let mut out = HashSet::new();
+        for f in 0..m.face_count() {
+            let r: Vec<usize> = m.face_range(f).collect();
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                if self.corner_sel[a] && self.corner_sel[b] {
+                    let (va, vb) = (m.corners[a], m.corners[b]);
+                    out.insert((va.min(vb), va.max(vb)));
+                }
+            }
+        }
+        let mut v: Vec<(u32, u32)> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Coutures marquées, en indices du sous-modèle `sub_model(targets)`.
+    pub fn sub_seams(&self, targets: &[usize]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut base = 0u32;
+        for &i in targets {
+            let o = &self.model.objects[i];
+            let (v0, v1) = (o.vert_start as u32, o.vert_end as u32);
+            out.extend(self.marked_seams.iter().filter(|&&(a, b)| a >= v0 && a < v1 && b >= v0 && b < v1).map(|&(a, b)| (a - v0 + base, b - v0 + base)));
+            base += v1 - v0;
+        }
+        out.sort();
+        out
+    }
+
+    /// Marque (ou efface) les arêtes sélectionnées comme coutures pour les dépliages suivants.
+    pub fn mark_selected_seams(&mut self, on: bool) -> usize {
+        let edges = self.selected_mesh_edges();
+        for e in &edges {
+            if on {
+                self.marked_seams.insert(*e);
+            } else {
+                self.marked_seams.remove(e);
+            }
+        }
+        self.touch();
+        edges.len()
+    }
+
+    /// Remplace les UV des faces `faces` par celles de `r` (dépliées à part), range les
+    /// nouveaux îlots dans la place libre à la densité des autres, recalcule les îlots et
+    /// les coutures, et sélectionne le résultat.
+    fn replace_faces_uv(&mut self, faces: &[usize], r: &UvResult, params: &easyuv::Params, texture_size: u32) {
+        let Some(old) = &self.uv else { return };
+        let m = &self.model.mesh;
+        let mut uv = old.corner_uv.clone();
+        let mut k = 0;
+        for &f in faces {
+            for c in m.face_range(f) {
+                uv[c] = r.corner_uv[k];
+                k += 1;
+            }
+        }
+        let (fi, n) = easyuv::layout::uv_islands(m, &uv);
+        let mut which = vec![false; n];
+        for &f in faces {
+            which[fi[f] as usize] = true;
+        }
+        easyuv::layout::layout_islands(m, &mut uv, &fi, Some(&which), params, true);
+        let (seams, seam_length) = easyuv::layout::uv_seams(m, &uv, &fi);
+        let mut stats = old.stats.clone();
+        stats.charts = n;
+        stats.seams = seams.len();
+        stats.seam_length = seam_length;
+        stats.time_ms = r.stats.time_ms;
+        let mode = self.sel_mode;
+        self.set_uv(UvResult { corner_uv: uv, face_chart: fi, seams, stats }, texture_size);
+        // le résultat reste sélectionné, dans le mode courant
+        let fi = self.face_island.clone();
+        for &f in faces {
+            self.island_selected[fi[f] as usize] = true;
+            for c in self.model.mesh.face_range(f) {
+                self.corner_sel[c] = mode != SelectMode::Island;
+            }
+        }
+        self.touch();
+    }
+
+    /// Dépliage intelligent des seules faces sélectionnées (îlots ou faces) ; les coutures
+    /// marquées sont respectées.
+    pub fn unwrap_selection(&mut self, params: &easyuv::Params, texture_size: u32) -> Result<String, String> {
+        if self.uv.is_none() {
+            return Err("Dépliez d'abord l'objet (U) : la sélection UV vient ensuite".into());
+        }
+        let faces = self.selected_faces();
+        if faces.is_empty() {
+            return Err("Sélectionnez d'abord des îlots ou des faces dans l'éditeur UV".into());
+        }
+        let seams: Vec<(u32, u32)> = self.marked_seams.iter().copied().collect();
+        let r = easyuv::uvtools::unwrap_faces(&self.model.mesh, &faces, &seams, params);
+        let charts = r.stats.charts;
+        self.replace_faces_uv(&faces, &r, params, texture_size);
+        Ok(format!("Sélection dépliée : {} faces, {charts} îlot(s), distorsion {:.3}, {:.0} ms", faces.len(), r.stats.mean_distortion, r.stats.time_ms))
+    }
+
+    /// Couper : les arêtes sélectionnées deviennent des coutures (marquées), et les îlots
+    /// qu'elles traversent sont redépliés avec leurs coutures actuelles plus celles-ci.
+    pub fn cut_selected(&mut self, params: &easyuv::Params, texture_size: u32) -> Result<String, String> {
+        let edges = self.selected_mesh_edges();
+        if edges.is_empty() {
+            return Err("Couper : sélectionnez des arêtes (mode Arêtes, touche 2 ; double-clic : boucle)".into());
+        }
+        let Some(uv) = &self.uv else { return Err("Dépliez d'abord l'objet (U)".into()) };
+        let m = &self.model.mesh;
+        let set: HashSet<(u32, u32)> = edges.iter().copied().collect();
+        // îlots traversés par les arêtes à couper
+        let mut touched = HashSet::new();
+        for f in 0..m.face_count() {
+            let vs = m.face(f);
+            if (0..vs.len()).any(|i| set.contains(&(vs[i].min(vs[(i + 1) % vs.len()]), vs[i].max(vs[(i + 1) % vs.len()])))) {
+                touched.insert(self.face_island[f]);
+            }
+        }
+        let faces: Vec<usize> = (0..m.face_count()).filter(|&f| touched.contains(&self.face_island[f])).collect();
+        let (current, _) = easyuv::layout::uv_seams(m, &uv.corner_uv, &self.face_island);
+        let mut seams: Vec<(u32, u32)> = current;
+        seams.extend(edges.iter().copied());
+        seams.extend(self.marked_seams.iter().copied());
+        for e in &edges {
+            self.marked_seams.insert(*e);
+        }
+        let r = easyuv::uvtools::unwrap_faces(&self.model.mesh, &faces, &seams, params);
+        self.replace_faces_uv(&faces, &r, params, texture_size);
+        Ok(format!("{} arête(s) coupée(s) : {} îlot(s) redéplié(s) — Ctrl+Z pour annuler", edges.len(), touched.len()))
+    }
+
+    /// Coudre : rapproche et soude les îlots le long des arêtes sélectionnées, puis détend
+    /// l'îlot recousu. Les coutures marquées correspondantes sont effacées.
+    pub fn sew_selected(&mut self, texture_size: u32) -> Result<String, String> {
+        let edges = self.selected_mesh_edges();
+        if edges.is_empty() {
+            return Err("Coudre : sélectionnez des arêtes de couture (mode Arêtes, touche 2)".into());
+        }
+        let Some(uv) = &mut self.uv else { return Err("Dépliez d'abord l'objet (U)".into()) };
+        let m = &self.model.mesh;
+        let n = easyuv::uvtools::sew(m, &mut uv.corner_uv, &self.face_island, &edges);
+        if n == 0 {
+            return Err("Rien à coudre : choisissez des arêtes sur une couture (les deux côtés d'une couture)".into());
+        }
+        for e in &edges {
+            self.marked_seams.remove(e);
+        }
+        let corner_uv = uv.corner_uv.clone();
+        let (fi, nisl) = easyuv::layout::uv_islands(m, &corner_uv);
+        let (seams, seam_length) = easyuv::layout::uv_seams(m, &corner_uv, &fi);
+        let mut stats = uv.stats.clone();
+        stats.charts = nisl;
+        stats.seams = seams.len();
+        stats.seam_length = seam_length;
+        let set: HashSet<(u32, u32)> = edges.iter().copied().collect();
+        let mut sewn = HashSet::new();
+        for f in 0..m.face_count() {
+            let vs = m.face(f);
+            if (0..vs.len()).any(|i| set.contains(&(vs[i].min(vs[(i + 1) % vs.len()]), vs[i].max(vs[(i + 1) % vs.len()])))) {
+                sewn.insert(fi[f] as usize);
+            }
+        }
+        let mut corner_uv = corner_uv;
+        let ids: Vec<usize> = sewn.into_iter().collect();
+        // l'îlot recousu est détendu, pour effacer le pli le long de la couture
+        easyuv::uvtools::optimize(m, &mut corner_uv, &easyuv::uvtools::Islands::new(m, &fi, &ids), 4);
+        let mode = self.sel_mode;
+        self.set_uv(UvResult { corner_uv, face_chart: fi, seams, stats }, texture_size);
+        let _ = mode;
+        Ok(format!("{n} couture(s) recousue(s) — Ctrl+Z pour annuler"))
     }
 
     /// Boîte UV (min, max) d'un ensemble de coins.
@@ -842,5 +1343,86 @@ mod tests {
     fn no_selection_unwraps_everything() {
         let s = scene();
         assert_eq!(s.unwrap_targets(), vec![0, 1, 2]);
+    }
+
+    fn cube_scene() -> Scene {
+        let m = Model::single("Cube", easyuv::model::weld(&primitives::cube(2.0)));
+        let mut s = Scene::new("cube".into(), m);
+        let uv = easyuv::model::unwrap_model(&s.model, &easyuv::Params::default(), true);
+        s.set_uv(uv, 2048);
+        s
+    }
+
+    /// Sélectionne en mode arêtes l'arête (a, b) du maillage, des deux côtés.
+    fn pick_edge(s: &mut Scene, a: u32, b: u32) {
+        s.set_select_mode(SelectMode::Edge);
+        s.corner_sel.iter_mut().for_each(|c| *c = false);
+        for c in 0..s.model.mesh.corners.len() {
+            let v = s.model.mesh.corners[c];
+            if v == a || v == b {
+                s.corner_sel[c] = true;
+            }
+        }
+    }
+
+    #[test]
+    fn modes_convert_selection() {
+        let mut s = scene();
+        s.click_island(Some(0), false);
+        let faces: Vec<usize> = (0..s.model.mesh.face_count()).filter(|&f| s.face_island[f] == 0).collect();
+        s.set_select_mode(SelectMode::Face);
+        assert_eq!(s.selected_faces(), faces);
+        assert_eq!(s.selected_island_ids(), vec![0]);
+        s.set_select_mode(SelectMode::Island);
+        assert!(s.island_selected[0] && s.island_selected.iter().filter(|&&x| x).count() == 1);
+    }
+
+    #[test]
+    fn unwrap_selection_keeps_the_rest() {
+        let mut s = scene();
+        s.click_island(Some(0), false);
+        let sel: HashSet<usize> = s.selected_faces().into_iter().collect();
+        let before = s.uv.as_ref().unwrap().corner_uv.clone();
+        s.unwrap_selection(&easyuv::Params::default(), 2048).unwrap();
+        let after = &s.uv.as_ref().unwrap().corner_uv;
+        for f in 0..s.model.mesh.face_count() {
+            if !sel.contains(&f) {
+                for c in s.model.mesh.face_range(f) {
+                    assert_eq!(before[c], after[c], "face {f} hors sélection modifiée");
+                }
+            }
+        }
+        assert!(s.has_island_selection(), "le résultat reste sélectionné");
+    }
+
+    #[test]
+    fn sew_then_cut_cube_faces() {
+        let mut s = cube_scene();
+        let n0 = s.island_selected.len();
+        assert_eq!(n0, 6);
+        // une arête partagée par deux faces du cube
+        let vs = s.model.mesh.face(0).to_vec();
+        pick_edge(&mut s, vs[0], vs[1]);
+        assert_eq!(s.selected_mesh_edges(), vec![(vs[0].min(vs[1]), vs[0].max(vs[1]))]);
+        s.sew_selected(2048).unwrap();
+        assert_eq!(s.island_selected.len(), 5, "deux faces recousues");
+        pick_edge(&mut s, vs[0], vs[1]);
+        s.cut_selected(&easyuv::Params::default(), 2048).unwrap();
+        assert_eq!(s.island_selected.len(), 6, "recoupées");
+        assert!(s.marked_seams.contains(&(vs[0].min(vs[1]), vs[0].max(vs[1]))));
+    }
+
+    #[test]
+    fn edge_loop_in_uv_editor() {
+        let mut s = scene();
+        s.set_select_mode(SelectMode::Edge);
+        // une arête du tore (objet 1), cliquée au milieu de son segment UV
+        let o = s.model.objects[1].clone();
+        let c = s.model.mesh.face_range(o.face_start).start;
+        let uv = s.uv.as_ref().unwrap().corner_uv.clone();
+        let mid = [(uv[c][0] + uv[c + 1][0]) * 0.5, (uv[c][1] + uv[c + 1][1]) * 0.5];
+        let n = s.select_loop(mid, 1e-3, false);
+        assert!(n >= 8, "boucle de {n} arêtes");
+        assert!(s.selected_mesh_edges().len() >= 2);
     }
 }

@@ -83,14 +83,20 @@ Glisser-déposer un fichier pour l'ouvrir, avec `Maj` pour l'ajouter à la scèn
 
 Panneau « Outils UV », menu UV et clic droit dans l'éditeur UV, dans l'esprit du UV Toolkit de Maya et de RizomUV.
 
+Modes de sélection, comme Blender : sommets `1`, arêtes `2` (double-clic : boucle), faces `3`, îlots `4`. Avec une sélection, `U` ne déplie qu'elle ; `Maj+U` déplie les objets.
+
 | Outil (touche dans l'éditeur UV) | Effet |
 |---|---|
 | Sélection `Q` | clic, `Maj`+clic, rectangle ; glisser, `G` `R` `S` pour transformer |
-| Pinceau Déplacer `1` | tire les UV sous le pinceau, l'effet s'atténue vers le bord |
-| Pinceau Détendre `2` | les arêtes reprennent leur longueur 3D (moins d'étirement) |
-| Pinceau Redresser `3` | les arêtes s'alignent sur l'horizontale ou la verticale la plus proche : rend droite la zone peinte |
-| Pinceau Pincer `4` | resserre les UV vers le centre, `Maj` pour les écarter |
-| Rectangle `5` | dessinez un rectangle : l'îlot sélectionné y est rendu droit puis étiré pour le remplir |
+| Pinceau Déplacer `Maj+1` | tire les UV sous le pinceau, l'effet s'atténue vers le bord |
+| Pinceau Détendre `Maj+2` | les arêtes reprennent leur longueur 3D (moins d'étirement) |
+| Pinceau Redresser `Maj+3` | les arêtes s'alignent sur l'horizontale ou la verticale la plus proche : rend droite la zone peinte |
+| Pinceau Pincer `Maj+4` | resserre les UV vers le centre, `Maj` pour les écarter |
+| Rectangle `Maj+5` | dessinez un rectangle : l'îlot sélectionné y est rendu droit puis étiré pour le remplir |
+
+Coutures (sur les arêtes sélectionnées) : Couper, Coudre (rapprocher et souder les îlots), Marquer la couture pour les prochains dépliages, Retirer la marque.
+
+Le score UV (sur 100) est affiché en direct dans l'en-tête de l'éditeur UV : distorsion, chevauchements, faces retournées, remplissage, densité égale, coutures.
 
 Rayon du pinceau : `[` `]` ou `Ctrl`+molette. Les pinceaux agissent sur les îlots sélectionnés, ou sur tous si rien n'est sélectionné ; `Échap` annule le coup de pinceau, `Ctrl+Z` après.
 

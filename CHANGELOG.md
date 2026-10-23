@@ -2,8 +2,28 @@
 
 ## [0.3.0] - 2026-10-23
 
+### Sélection de sommets, d'arêtes et de faces (comme Blender)
+- Modes de sélection de l'éditeur UV : **sommets** `1`, **arêtes** `2`, **faces** `3`, **îlots** `4`, aussi en icônes dans l'en-tête de l'éditeur. La sélection est convertie quand on change de mode.
+- Clic, `Maj`+clic (ajouter ou retirer), rectangle, `A` / `Alt+A` / `Ctrl+I` ; glisser ou `G` `R` `S` déplacent, pivotent et mettent à l'échelle la sélection dans tous les modes. Les deux côtés d'une couture restent séparés (comme « Shared Location » de Blender).
+- **Double-clic sur une arête : toute la boucle d'arêtes.**
+- Vue 3D : arêtes choisies en orange, faces choisies teintées, coutures marquées en rose.
+
+### Dépliage de la sélection
+- **`U` avec une sélection dans l'éditeur UV ne déplie qu'elle** (îlots ou faces) : dépliage intelligent des seules faces choisies, rangées dans la place libre à la densité des autres îlots ; le reste ne bouge pas. `Maj+U` déplie toujours les objets.
+
+### Outils de couture
+- **Couper** : les arêtes sélectionnées deviennent des coutures et les îlots traversés sont redépliés.
+- **Coudre** : l'îlot voisin est tourné et rapproché, les arêtes sont soudées, puis l'îlot recousu est détendu (« Move and Sew » de Maya).
+- **Marquer la couture / Retirer la marque** : coutures imposées à tous les dépliages suivants (« Mark Seam » de Blender), gardées à la suppression ou à la duplication d'objets.
+
+### Score UV en direct
+- Note sur 100 dans l'en-tête de l'éditeur UV et dans le panneau « Score UV », recalculée à chaque modification (même pendant un coup de pinceau) : distorsion, chevauchements, faces retournées, remplissage de la tuile, UV hors tuile, densité égale entre îlots, coutures. Une barre par critère et un conseil pour le point le plus faible.
+
+### Icônes et aperçus
+- Chaque outil et chaque mode a son icône. En laissant le pointeur dessus, une infobulle explique l'outil avec une petite animation de ce qu'il fait.
+
 ### Pinceaux UV
-- Nouveaux outils dans l'éditeur UV (touches `Q`, `1` à `5`, ou panneau « Outils UV ») :
+- Nouveaux outils dans l'éditeur UV (touches `Q`, `Maj+1` à `Maj+5`, ou panneau « Outils UV ») :
   - **Déplacer** : tire les UV sous le pinceau, avec une atténuation douce vers le bord.
   - **Détendre** : les arêtes reprennent leur longueur 3D, l'étirement disparaît là où l'on peint.
   - **Redresser** : les arêtes s'alignent sur l'horizontale ou la verticale la plus proche ; la zone peinte devient droite.
