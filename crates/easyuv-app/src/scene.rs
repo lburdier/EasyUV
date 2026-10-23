@@ -1045,6 +1045,54 @@ impl Scene {
         self.touch();
     }
 
+    /// Projection depuis la vue : les faces sélectionnées dans l'éditeur UV (sinon celles des
+    /// objets sélectionnés, sinon tout) prennent les UV de ce que l'on voit dans la vue 3D.
+    /// Rangées dans la place libre à la densité des autres, ou étirées sur toute la tuile
+    /// (`fit`). Renvoie le nombre de faces projetées.
+    pub fn project_from_view(&mut self, right: V3, up: V3, params: &easyuv::Params, texture_size: u32, fit: bool) -> usize {
+        let faces: Vec<usize> = if self.uv.is_some() && self.has_island_selection() {
+            self.selected_faces()
+        } else {
+            let targets = self.unwrap_targets();
+            targets.iter().flat_map(|&i| self.model.objects[i].face_start..self.model.objects[i].face_end).filter(|&f| self.face_visible(f)).collect()
+        };
+        if faces.is_empty() {
+            return 0;
+        }
+        let m = &self.model.mesh;
+        let mut uv = self.uv.as_ref().map(|u| u.corner_uv.clone()).unwrap_or_else(|| vec![[0.0; 2]; m.corners.len()]);
+        let stats = self.uv.as_ref().map(|u| u.stats.clone()).unwrap_or_default();
+        easyuv::uvtools::project_faces(m, &mut uv, &faces, right, up);
+        let (fi, n) = easyuv::layout::uv_islands(m, &uv);
+        let mut which = vec![false; n];
+        for &f in &faces {
+            which[fi[f] as usize] = true;
+        }
+        let ids: Vec<usize> = (0..n).filter(|&i| which[i]).collect();
+        if fit {
+            easyuv::uvtools::fit_to_tile(&mut uv, &easyuv::uvtools::Islands::new(m, &fi, &ids));
+        } else {
+            easyuv::layout::layout_islands(m, &mut uv, &fi, Some(&which), params, true);
+        }
+        let (seams, seam_length) = easyuv::layout::uv_seams(m, &uv, &fi);
+        let mut stats = stats;
+        stats.charts = n;
+        stats.seams = seams.len();
+        stats.seam_length = seam_length;
+        let mode = self.sel_mode;
+        self.set_uv(UvResult { corner_uv: uv, face_chart: fi, seams, stats }, texture_size);
+        // le résultat reste sélectionné
+        let fi = self.face_island.clone();
+        for &f in &faces {
+            self.island_selected[fi[f] as usize] = true;
+            for c in self.model.mesh.face_range(f) {
+                self.corner_sel[c] = mode != SelectMode::Island;
+            }
+        }
+        self.touch();
+        faces.len()
+    }
+
     /// Dépliage intelligent des seules faces sélectionnées (îlots ou faces) ; les coutures
     /// marquées sont respectées.
     pub fn unwrap_selection(&mut self, params: &easyuv::Params, texture_size: u32) -> Result<String, String> {
@@ -1530,6 +1578,20 @@ mod tests {
         let n = s.select_loop(mid, 1e-3, false);
         assert!(n >= 8, "boucle de {n} arêtes");
         assert!(s.selected_mesh_edges().len() >= 2);
+    }
+
+    #[test]
+    fn project_from_view_keeps_the_rest() {
+        let mut s = scene();
+        // le cube seul (objet 0), vu de face
+        s.click(Some(0), false);
+        let other: Vec<usize> = s.model.corner_range(1).collect();
+        let before: Vec<[f32; 2]> = other.iter().map(|&c| s.uv.as_ref().unwrap().corner_uv[c]).collect();
+        let n = s.project_from_view(V3::new(1.0, 0.0, 0.0), V3::new(0.0, 0.0, 1.0), &easyuv::Params::default(), 2048, false);
+        assert_eq!(n, s.model.objects[0].face_end - s.model.objects[0].face_start);
+        let after: Vec<[f32; 2]> = other.iter().map(|&c| s.uv.as_ref().unwrap().corner_uv[c]).collect();
+        assert_eq!(before, after, "le tore ne bouge pas");
+        assert!(s.has_island_selection());
     }
 
     #[test]

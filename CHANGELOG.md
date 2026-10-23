@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.2] - 2026-10-23
+
+### Projeter depuis la vue
+- **Dépliage selon l'angle de vue** (comme « Project From View » de Blender) : les UV prennent exactement ce que l'on voit dans la vue 3D, sous l'angle choisi. Idéal pour un logo, une étiquette ou un décor à peindre de face.
+- S'applique aux faces sélectionnées dans l'éditeur UV, sinon aux objets sélectionnés, sinon à tout. Le résultat est rangé dans la place libre à la densité des autres îlots ; la variante **Cadré** l'étire sur toute la tuile.
+- Bouton dans l'en-tête de la vue 3D et dans le panneau « Dépliage intelligent », entrées dans le menu UV, le menu Objet et le clic droit.
+
+
 ## [0.3.1] - 2026-10-23
 
 ### Formes organiques (crosses, sculptures)
