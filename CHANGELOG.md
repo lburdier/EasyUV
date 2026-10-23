@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.4] - 2026-10-23
+
+### Sélection directe dans la vue 3D
+- Choisir le mode sommets, arêtes ou faces (dans l'éditeur UV ou la vue 3D) passe la vue 3D en **Édition** d'office : un clic sur le modèle choisit directement l'élément, sans passer par `Tab`. `Tab` revient au mode Objet.
+- Bouton Objet / Édition plus visible dans l'en-tête de la vue 3D (orange en Édition), placé juste après le titre quelle que soit sa longueur.
+- L'en-tête de l'éditeur UV ne cache plus son titre sous les icônes quand il est étroit.
+
+
 ## [0.3.3] - 2026-10-23
 
 ### Vue 3D comme Blender
