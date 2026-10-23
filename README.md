@@ -96,6 +96,10 @@ Modes de sélection, comme Blender : sommets `1`, arêtes `2` (double-clic : bou
 
 Coutures (sur les arêtes sélectionnées) : Couper, Coudre (rapprocher et souder les îlots), Marquer la couture pour les prochains dépliages, Retirer la marque.
 
+Rendre droit (`Maj+W`) : grille de quads, arc déroulé ou rectangle à bord épinglé, la méthode la moins déformée l'emporte. En mode sommets, 4 sommets choisis sur le bord d'une bande en sont les coins imposés.
+
+Damiers : Couleur, Mono, Numéroté, Cercles, Flèches, Dégradé UV, Diagonales. Les îlots sélectionnés et l'îlot survolé dans l'éditeur UV sont mis en évidence sur le modèle 3D.
+
 Le score UV (sur 100) est affiché en direct dans l'en-tête de l'éditeur UV : distorsion, chevauchements, faces retournées, remplissage, densité égale, coutures.
 
 Rayon du pinceau : `[` `]` ou `Ctrl`+molette. Les pinceaux agissent sur les îlots sélectionnés, ou sur tous si rien n'est sélectionné ; `Échap` annule le coup de pinceau, `Ctrl+Z` après.

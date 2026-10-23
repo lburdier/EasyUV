@@ -19,6 +19,17 @@
 ### Score UV en direct
 - Note sur 100 dans l'en-tête de l'éditeur UV et dans le panneau « Score UV », recalculée à chaque modification (même pendant un coup de pinceau) : distorsion, chevauchements, faces retournées, remplissage de la tuile, UV hors tuile, densité égale entre îlots, coutures. Une barre par critère et un conseil pour le point le plus faible.
 
+### Rendre droit : toutes les bandes
+- Nouvelle méthode « rectangle à bord épinglé » (comme RizomUV ou Maya) : les 4 coins de la bande sont trouvés seuls, son contour est posé sur un rectangle aux longueurs 3D, l'intérieur suit par LSCM. Les bandes ondulées, irrégulières, avec triangles ou jonctions en T deviennent droites, là où ni la grille de quads ni le déroulé en arc ne suffisaient. Parmi les méthodes qui n'abîment pas l'îlot, la moins déformée l'emporte.
+- **Coins choisis à la main** : en mode sommets, sélectionnez les 4 coins de la bande puis `Maj+W` ; ils deviennent les coins du rectangle.
+- Les outils d'îlots (pivoter, miroir, orienter, rendre droit…) marchent aussi en mode sommets, arêtes et faces, sur les îlots de la sélection.
+
+### Sélection visible sur le modèle 3D
+- Les îlots sélectionnés dans l'éditeur UV sont teintés en orange sur le modèle 3D, et l'îlot survolé s'éclaire en jaune : on voit tout de suite de quelle partie du modèle il s'agit.
+
+### Damiers
+- Sept textures de contrôle (panneau « Damier », aussi dans Blender) : Couleur, Mono, **Numéroté** (A1, B2… dans chaque case), **Cercles** (les ellipses montrent l'étirement), **Flèches** (rotations et miroirs), **Dégradé UV** (rouge = U, vert = V), **Diagonales** (cisaillement).
+
 ### Icônes et aperçus
 - Chaque outil et chaque mode a son icône. En laissant le pointeur dessus, une infobulle explique l'outil avec une petite animation de ce qu'il fait.
 

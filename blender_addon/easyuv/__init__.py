@@ -246,7 +246,19 @@ class EasyUVSettings(bpy.types.PropertyGroup):
     texture_size: EnumProperty(name="Texture", items=TEX_SIZES, default="2048")
     target_density: FloatProperty(name="Densite cible (px/m)", default=1024.0, min=1.0, max=100000.0)
     measured: FloatProperty(name="Densite mesuree", default=0.0)
-    checker_style: EnumProperty(name="Style", default="1", items=[("1", "Couleur", ""), ("0", "Mono", "")])
+    checker_style: EnumProperty(
+        name="Style",
+        default="1",
+        items=[
+            ("1", "Couleur", "Couleur par colonne et par rangee, repere L : orientation et position"),
+            ("0", "Mono", "Damier gris neutre : densite et etirement"),
+            ("2", "Numerote", "Chaque case porte ses coordonnees (A1, B2...)"),
+            ("3", "Cercles", "Un cercle par case : les ellipses montrent l'etirement"),
+            ("4", "Fleches", "Une fleche vers +V par case : rotations et miroirs"),
+            ("5", "Degrade UV", "Rouge = U, vert = V : position et coutures"),
+            ("6", "Diagonales", "Lignes a 45 degres : cisaillement"),
+        ],
+    )
     checker_cells: IntProperty(name="Cellules", default=16, min=2, max=128)
     checker_tiling: FloatProperty(name="Repetition", default=1.0, min=0.01, max=64.0)
     last_report: StringProperty(default="")
@@ -620,7 +632,7 @@ class EASYUV_PT_checker(bpy.types.Panel):
     def draw(self, context):
         s = context.scene.easyuv
         l = self.layout
-        l.prop(s, "checker_style", expand=True)
+        l.prop(s, "checker_style")
         l.prop(s, "checker_cells")
         l.prop(s, "checker_tiling")
         cell = tex_size(s) / (s.checker_cells * s.checker_tiling)

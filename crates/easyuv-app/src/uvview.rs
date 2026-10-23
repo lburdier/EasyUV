@@ -249,6 +249,13 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     let scene = scene?;
     scene.uv.as_ref()?;
     let (pointer, shift, ctrl, alt) = ui.input(|i| (i.pointer.latest_pos(), i.modifiers.shift, i.modifiers.command, i.modifiers.alt));
+    // îlot survolé : la vue 3D montre à quelle partie du modèle il correspond
+    let moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+    if !resp.hovered() {
+        scene.hover_island = None;
+    } else if moved && ed.modal.is_none() && ed.stroke.is_none() {
+        scene.hover_island = resp.hover_pos().and_then(|p| scene.pick_island(view.to_uv(p)));
+    }
     let keys = !ui.ctx().egui_wants_keyboard_input() && (resp.hovered() || ed.modal.is_some() || ed.stroke.is_some());
     let key = |k: egui::Key| keys && ui.input(|i| i.key_pressed(k));
 
