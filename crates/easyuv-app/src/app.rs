@@ -3,7 +3,7 @@ use crate::io;
 use crate::scene::{Scene, SelectMode};
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
-use crate::uvview::{self, UvCache, UvCamera, UvEditor, UvEvent, UvTool};
+use crate::uvview::{self, SelShape, UvCache, UvCamera, UvEditor, UvEvent, UvTool};
 use crate::raster::Mips;
 use crate::viewport::{self, Camera, RenderCache, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
@@ -99,6 +99,8 @@ pub struct EasyUvApp {
     score: Option<easyuv::metrics::UvScore>,
     score_gen: Option<u64>,
     score_time: f64,
+    /// Seuil de la sélection par angle (degrés).
+    sel_angle: f64,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -130,6 +132,14 @@ fn tool_icon(t: UvTool) -> Icon {
         UvTool::Straighten => Icon::Straighten,
         UvTool::Pinch => Icon::Pinch,
         UvTool::Rect => Icon::Rect,
+    }
+}
+
+fn shape_icon(s: SelShape) -> Icon {
+    match s {
+        SelShape::Box => Icon::BoxSel,
+        SelShape::Lasso => Icon::Lasso,
+        SelShape::Circle => Icon::Circle,
     }
 }
 
@@ -241,6 +251,7 @@ impl EasyUvApp {
             score: None,
             score_gen: None,
             score_time: -1.0,
+            sel_angle: 30.0,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -871,6 +882,18 @@ impl EasyUvApp {
             ui.close();
             self.straighten_strips();
         }
+        if item(ui, has_uv, "Grille parfaite", "Maj+G") {
+            ui.close();
+            self.snap_grid_op();
+        }
+        if item(ui, has_uv, "Remettre d'aplomb (d'après les arêtes)", "") {
+            ui.close();
+            self.orient_op();
+        }
+        if item(ui, has_uv, "Sélection par angle", "") {
+            ui.close();
+            self.select_by_angle();
+        }
         if item(ui, has_isl, "Orienter sur les axes", "") {
             ui.close();
             self.island_op(|s, ts| s.straighten_islands(ts), "Orienter");
@@ -1025,9 +1048,53 @@ impl EasyUvApp {
         }
     }
 
+    /// Grille parfaite (Maj+G) sur la sélection, ou sur tous les îlots.
+    fn snap_grid_op(&mut self) {
+        if self.scene.as_ref().is_none_or(|s| s.uv.is_none()) {
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        let (n, total) = self.scene.as_mut().unwrap().snap_grid(ts);
+        if n == 0 {
+            self.undo.pop();
+        }
+        self.status = match (n, total) {
+            (0, _) => "Grille parfaite : rien à aligner sans abîmer de faces (îlot sans rangées ni colonnes, comme un couvercle)".into(),
+            (n, t) if n == t => format!("Grille parfaite : {n} îlot(s), rangées et colonnes droites — Ctrl+Z pour annuler"),
+            (n, t) => format!("Grille parfaite : {n} îlot(s) sur {t} ; les autres n'ont pas de grille à aligner"),
+        };
+    }
+
+    /// Remet d'aplomb la sélection (ou tous les îlots) d'après leurs arêtes.
+    fn orient_op(&mut self) {
+        if self.scene.as_ref().is_none_or(|s| s.uv.is_none()) {
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        let n = self.scene.as_mut().unwrap().orient_to_edges(ts);
+        self.status = format!("Remis d'aplomb : {n} îlot(s), arêtes à l'horizontale et à la verticale — Ctrl+P pour ranger");
+    }
+
+    /// Sélection par angle : arêtes vives en mode arêtes, sinon faces liées depuis la sélection.
+    fn select_by_angle(&mut self) {
+        let a = self.sel_angle;
+        let Some(s) = self.scene.as_mut().filter(|s| s.uv.is_some()) else { return };
+        self.status = if s.sel_mode == SelectMode::Edge {
+            let n = s.select_sharp_edges(a, false);
+            format!("{n} arête(s) vive(s) au-delà de {a:.0}° — Couper ou Marquer pour en faire des coutures")
+        } else {
+            match s.select_linked_by_angle(a) {
+                0 => "Par angle : choisissez d'abord une face (mode faces, 3), ou passez en mode arêtes (2) pour les arêtes vives".into(),
+                n => format!("{n} face(s) liées à moins de {a:.0}° — U pour ne déplier qu'elles"),
+            }
+        };
+    }
+
     /// Barre d'icônes de l'éditeur UV : modes de sélection, outils, score en direct.
     fn uv_header_bar(&mut self, ui: &mut egui::Ui, header: egui::Rect) {
-        let r = egui::Rect::from_min_max(egui::pos2(header.right() - 420.0, header.top() + 2.0), egui::pos2(header.right() - 6.0, header.bottom() - 2.0));
+        let r = egui::Rect::from_min_max(egui::pos2(header.right() - 500.0, header.top() + 2.0), egui::pos2(header.right() - 6.0, header.bottom() - 2.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -1036,6 +1103,13 @@ impl EasyUvApp {
                 for t in UvTool::ALL.iter().rev() {
                     if icons::button(ui, tool_icon(*t), self.uv_edit.tool == *t, t.label(), t.key(), t.hint()).clicked() {
                         self.uv_edit.tool = *t;
+                    }
+                }
+                ui.add_space(6.0);
+                for sh in SelShape::ALL.iter().rev() {
+                    if icons::button(ui, shape_icon(*sh), self.uv_edit.sel_shape == *sh, sh.label(), "W", sh.help()).clicked() {
+                        self.uv_edit.sel_shape = *sh;
+                        self.uv_edit.tool = UvTool::Select;
                     }
                 }
                 ui.add_space(6.0);
@@ -1098,10 +1172,31 @@ impl EasyUvApp {
                 }
             }
             ui.add_space(8.0);
+            for sh in SelShape::ALL {
+                if icons::button(ui, shape_icon(sh), self.uv_edit.sel_shape == sh, sh.label(), "W", sh.help()).clicked() {
+                    self.uv_edit.sel_shape = sh;
+                    self.uv_edit.tool = UvTool::Select;
+                }
+            }
+            ui.add_space(8.0);
             for t in UvTool::ALL {
                 if icons::button(ui, tool_icon(t), self.uv_edit.tool == t, t.label(), t.key(), t.hint()).clicked() {
                     self.uv_edit.tool = t;
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            if icons::button(ui, Icon::Angle, false, "Sélection par angle", "", "Mode arêtes : les arêtes vives, dont les faces font un angle au-delà du seuil (pour Couper ou Marquer). Autres modes : depuis les faces choisies, toutes les faces voisines à moins du seuil (un même pan).").clicked() {
+                self.select_by_angle();
+            }
+            ui.label("Par angle");
+            ui.add(egui::DragValue::new(&mut self.sel_angle).range(1.0..=179.0).speed(0.5).suffix("°"));
+            ui.add_space(8.0);
+            if icons::button(ui, Icon::Grid, false, "Grille parfaite", "Maj+G", "Chaque rangée et chaque colonne passe sur une droite, même avec triangles et jonctions en T. Sur la sélection, ou sur tous les îlots. Appliquée aussi à la fin de Rendre droit.").clicked() {
+                self.snap_grid_op();
+            }
+            if icons::button(ui, Icon::Orient, false, "Remettre d'aplomb", "", "Chaque îlot tourne pour que ses arêtes suivent l'horizontale et la verticale (d'après ses arêtes, pas sa boîte). Sur la sélection, ou sur tous les îlots.").clicked() {
+                self.orient_op();
             }
         });
         ui.label(RichText::new(format!("{} : {}", self.uv_edit.tool.label(), self.uv_edit.tool.hint())).small());
@@ -2119,6 +2214,7 @@ impl eframe::App for EasyUvApp {
                         }
                         Some(UvEvent::Status(t)) => self.status = t,
                         Some(UvEvent::Straighten) => self.straighten_strips(),
+                        Some(UvEvent::SnapGrid) => self.snap_grid_op(),
                         Some(UvEvent::FlattenRect(lo, hi)) => {
                             let (lo, hi) = (easyuv::math::V2::new(lo[0] as f64, lo[1] as f64), easyuv::math::V2::new(hi[0] as f64, hi[1] as f64));
                             self.uv_tool_op("Aplatir dans le rectangle", move |m, uv, fi, ids| {

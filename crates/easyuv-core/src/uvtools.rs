@@ -498,6 +498,265 @@ pub fn reunwrap(mesh: &Mesh, corner_uv: &mut [[f32; 2]], isl: &Islands) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Grille parfaite : rangées et colonnes sur des droites
+// ---------------------------------------------------------------------------------------
+
+/// Faces abîmées d'un îlot : retournées (sens opposé à la majorité) ou écrasées (aire UV
+/// rapportée à l'aire 3D sous 15 % de la médiane). Les faces presque nulles en 3D ne
+/// comptent pas.
+pub fn damaged_faces(mesh: &Mesh, corner_uv: &[[f32; 2]], faces: &[usize]) -> usize {
+    let per: Vec<(f64, f64)> = faces
+        .iter()
+        .map(|&f| {
+            let r = mesh.face_range(f);
+            let (mut a3, mut au) = (0.0, 0.0);
+            for t in mesh.fan(f) {
+                let p = |k: usize| mesh.positions[mesh.corners[r.start + t[k]] as usize];
+                let u = |k: usize| to_v2(corner_uv[r.start + t[k]]);
+                a3 += 0.5 * (p(1) - p(0)).cross(p(2) - p(0)).length();
+                au += 0.5 * (u(1) - u(0)).cross(u(2) - u(0));
+            }
+            (a3, au)
+        })
+        .collect();
+    if per.is_empty() {
+        return 0;
+    }
+    let sign = per.iter().map(|p| p.1).sum::<f64>().signum();
+    let mut a3s: Vec<f64> = per.iter().map(|p| p.0).collect();
+    a3s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med3 = a3s[a3s.len() / 2];
+    let ratios: Vec<f64> = per.iter().filter(|p| p.0 > 0.05 * med3).map(|p| p.1 * sign / p.0).collect();
+    if ratios.is_empty() {
+        return 0;
+    }
+    let mut rs = ratios.clone();
+    rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = rs[rs.len() / 2];
+    ratios.iter().filter(|&&r| r < 0.15 * med).count()
+}
+
+/// Grille parfaite : chaque rangée et chaque colonne de l'îlot passe sur une droite, comme
+/// une grille tracée à la règle. L'orientation dominante des arêtes est trouvée seule ;
+/// une arête proche de l'horizontale relie deux sommets d'une même rangée, une arête proche
+/// de la verticale deux sommets d'une même colonne (lues face par face, les diagonales des
+/// triangles exclues), tant que la rangée ondule de moins de trois quarts de case : les
+/// rangées fines d'un biseau restent distinctes. Un îlot qui en serait abîmé reste tel
+/// quel. Renvoie les îlots alignés.
+pub fn snap_grid(mesh: &Mesh, corner_uv: &mut [[f32; 2]], isl: &Islands) -> usize {
+    let mut done = 0;
+    for (faces, corners) in isl.faces.iter().zip(&isl.corners) {
+        let one = Islands { faces: vec![faces.clone()], corners: vec![corners.clone()] };
+        let g = UvGraph::build(mesh, corner_uv, &one);
+        if g.len() < 4 {
+            continue;
+        }
+        let orig_uv: Vec<[f32; 2]> = corners.iter().map(|&c| corner_uv[c]).collect();
+        let before = damaged_faces(mesh, corner_uv, faces);
+        let pts = g.positions(corner_uv);
+        let edges: Vec<(usize, usize)> = g.nbrs.iter().enumerate().flat_map(|(i, n)| n.iter().filter(move |&&(j, _)| j > i).map(move |&(j, _)| (i, j))).collect();
+        // orientation dominante (modulo 90°), moyenne circulaire de 4θ pondérée par la longueur
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for &(a, b) in &edges {
+            let d = pts[b] - pts[a];
+            let l = len2(d);
+            let t = 4.0 * d.y.atan2(d.x);
+            sx += l * t.cos();
+            sy += l * t.sin();
+        }
+        let mut theta = sy.atan2(sx) / 4.0;
+        let n = pts.len() as f64;
+        let c = pts.iter().fold(V2::new(0.0, 0.0), |s, p| s + *p) * (1.0 / n);
+        let (s, co) = (-theta).sin_cos();
+        let mut q: Vec<V2> = pts.iter().map(|p| (*p - c).rotated(co, s)).collect();
+        // arêtes de rangée et de colonne, face par face : dans un quad, la paire d'arêtes
+        // opposées la plus horizontale est la rangée ; dans un triangle, l'arête la plus
+        // horizontale et la plus verticale, la diagonale restant libre (elle relierait deux
+        // rangées d'un biseau fin)
+        let corner_vert: HashMap<usize, usize> = g.corners.iter().enumerate().flat_map(|(v, cs)| cs.iter().map(move |&c| (c, v))).collect();
+        let tilt = |a: usize, b: usize| -> f64 {
+            let d = q[b] - q[a];
+            d.y.abs().atan2(d.x.abs())
+        };
+        let mut kind: HashMap<(usize, usize), u8> = HashMap::new(); // 1 = rangée, 2 = colonne
+        for &f in faces {
+            let vs: Vec<usize> = mesh.face_range(f).filter_map(|c| corner_vert.get(&c).copied()).collect();
+            let n = vs.len();
+            if n < 3 {
+                continue;
+            }
+            let es: Vec<(usize, usize)> = (0..n).map(|i| (vs[i], vs[(i + 1) % n])).filter(|(a, b)| a != b).collect();
+            let mut mark = |e: (usize, usize), k: u8| {
+                kind.entry((e.0.min(e.1), e.0.max(e.1))).or_insert(k);
+            };
+            if es.len() == 4 {
+                let t02 = tilt(es[0].0, es[0].1) + tilt(es[2].0, es[2].1);
+                let t13 = tilt(es[1].0, es[1].1) + tilt(es[3].0, es[3].1);
+                let (h, v) = if t02 <= t13 { ([0, 2], [1, 3]) } else { ([1, 3], [0, 2]) };
+                h.iter().for_each(|&i| mark(es[i], 1));
+                v.iter().for_each(|&i| mark(es[i], 2));
+            } else {
+                let lim = 30f64.to_radians();
+                let flat = es.iter().copied().min_by(|a, b| tilt(a.0, a.1).partial_cmp(&tilt(b.0, b.1)).unwrap_or(std::cmp::Ordering::Equal));
+                let steep = es.iter().copied().max_by(|a, b| tilt(a.0, a.1).partial_cmp(&tilt(b.0, b.1)).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(e) = flat.filter(|e| tilt(e.0, e.1) < lim) {
+                    mark(e, 1);
+                }
+                if let Some(e) = steep.filter(|e| tilt(e.0, e.1) > std::f64::consts::FRAC_PI_2 - lim) {
+                    mark(e, 2);
+                }
+            }
+        }
+        let (mut hor, mut ver): (Vec<(usize, usize)>, Vec<(usize, usize)>) = (Vec::new(), Vec::new());
+        for (&e, &k) in &kind {
+            if k == 1 {
+                hor.push(e);
+            } else {
+                ver.push(e);
+            }
+        }
+        hor.sort();
+        ver.sort();
+        // affinage de l'angle sur les seules rangées et colonnes (les ondulations faussent
+        // un peu la première estimation)
+        let (mut nh, mut dh, mut nv, mut dv) = (0.0, 0.0, 0.0, 0.0);
+        for &(a, b) in &hor {
+            let d = q[b] - q[a];
+            nh += d.y * d.x.signum();
+            dh += d.x.abs();
+        }
+        for &(a, b) in &ver {
+            let d = q[b] - q[a];
+            nv -= d.x * d.y.signum();
+            dv += d.y.abs();
+        }
+        if dh + dv > 0.0 {
+            let resid = (nh.atan2(dh.max(1e-300)) * dh + nv.atan2(dv.max(1e-300)) * dv) / (dh + dv);
+            let (s, co) = (-resid).sin_cos();
+            q.iter_mut().for_each(|p| *p = p.rotated(co, s));
+            theta += resid;
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let cell_h = median(&mut ver.iter().map(|&(a, b)| (q[b].y - q[a].y).abs()).collect());
+        let cell_w = median(&mut hor.iter().map(|&(a, b)| (q[b].x - q[a].x).abs()).collect());
+        if cell_h <= 0.0 || cell_w <= 0.0 {
+            continue;
+        }
+        // hauteur (largeur) de case la plus fine autour de chaque sommet : un biseau fait de
+        // rangées très fines garde ses rangées distinctes
+        let local = |links: &[(usize, usize)], axis: usize, default: f64| -> Vec<f64> {
+            let mut l = vec![default; q.len()];
+            for &(a, b) in links {
+                let d = if axis == 0 { (q[b].x - q[a].x).abs() } else { (q[b].y - q[a].y).abs() };
+                if d > 1e-12 {
+                    l[a] = l[a].min(d);
+                    l[b] = l[b].min(d);
+                }
+            }
+            l
+        };
+        let local_h = local(&ver, 1, cell_h);
+        let local_w = local(&hor, 0, cell_w);
+        // regroupe les sommets d'une même rangée (axe 1) ou colonne (axe 0) et les aligne
+        let mut snap = |links: &mut Vec<(usize, usize)>, axis: usize, size: &[f64]| {
+            let coord = |p: V2| if axis == 0 { p.x } else { p.y };
+            links.sort_by(|&(a, b), &(c, d)| (coord(q[b]) - coord(q[a])).abs().partial_cmp(&(coord(q[d]) - coord(q[c])).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            let mut parent: Vec<usize> = (0..q.len()).collect();
+            // (min, max, plus petite case) de chaque groupe
+            let mut range: Vec<(f64, f64, f64)> = q.iter().enumerate().map(|(i, p)| (coord(*p), coord(*p), size[i])).collect();
+            fn find(p: &mut [usize], mut i: usize) -> usize {
+                while p[i] != i {
+                    p[i] = p[p[i]];
+                    i = p[i];
+                }
+                i
+            }
+            for &(a, b) in links.iter() {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra == rb {
+                    continue;
+                }
+                let (lo, hi, sz) = (range[ra].0.min(range[rb].0), range[ra].1.max(range[rb].1), range[ra].2.min(range[rb].2));
+                // garde-fou : une rangée qui ondule reste une rangée, mais pas au point d'en
+                // toucher une autre
+                if hi - lo <= sz * 0.75 {
+                    parent[ra] = rb;
+                    range[rb] = (lo, hi, sz);
+                }
+            }
+            let mut sum: HashMap<usize, (f64, f64)> = HashMap::new();
+            for i in 0..q.len() {
+                let r = find(&mut parent, i);
+                let e = sum.entry(r).or_insert((0.0, 0.0));
+                e.0 += coord(q[i]);
+                e.1 += 1.0;
+            }
+            for i in 0..q.len() {
+                let r = find(&mut parent, i);
+                let (s, k) = sum[&r];
+                if axis == 0 {
+                    q[i].x = s / k;
+                } else {
+                    q[i].y = s / k;
+                }
+            }
+        };
+        snap(&mut hor, 1, &local_h);
+        snap(&mut ver, 0, &local_w);
+        let (s, co) = theta.sin_cos();
+        let out: Vec<V2> = q.iter().map(|p| p.rotated(co, s) + c).collect();
+        g.write(&out, corner_uv);
+        if damaged_faces(mesh, corner_uv, faces) > before + (faces.len() / 50).max(1) {
+            for (k, &c) in corners.iter().enumerate() {
+                corner_uv[c] = orig_uv[k];
+            }
+            continue;
+        }
+        done += 1;
+    }
+    done
+}
+
+/// Direction dominante des arêtes d'un îlot, modulo 90° (dans [-45°, 45°]) : moyenne
+/// circulaire de 4θ pondérée par la longueur.
+pub fn dominant_angle(mesh: &Mesh, corner_uv: &[[f32; 2]], faces: &[usize]) -> f64 {
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for &f in faces {
+        let r: Vec<usize> = mesh.face_range(f).collect();
+        for i in 0..r.len() {
+            let d = to_v2(corner_uv[r[(i + 1) % r.len()]]) - to_v2(corner_uv[r[i]]);
+            let t = 4.0 * d.y.atan2(d.x);
+            sx += len2(d) * t.cos();
+            sy += len2(d) * t.sin();
+        }
+    }
+    sy.atan2(sx) / 4.0
+}
+
+/// Remet les îlots d'aplomb : chacun tourne pour que ses arêtes suivent l'horizontale et la
+/// verticale (d'après ses arêtes, pas sa boîte), côté long horizontal, autour de son centre.
+pub fn orient_to_edges(mesh: &Mesh, corner_uv: &mut [[f32; 2]], isl: &Islands) -> usize {
+    let mut done = 0;
+    for (faces, cs) in isl.faces.iter().zip(&isl.corners) {
+        let theta = dominant_angle(mesh, corner_uv, faces);
+        let Some((lo, hi)) = bounds(corner_uv, cs) else { continue };
+        let c = (lo + hi) * 0.5;
+        let (s, co) = (-theta).sin_cos();
+        apply(corner_uv, cs, |p| c + (p - c).rotated(co, s));
+        let Some((lo, hi)) = bounds(corner_uv, cs) else { continue };
+        if hi.y - lo.y > hi.x - lo.x {
+            let c = (lo + hi) * 0.5;
+            apply(corner_uv, cs, |p| c + V2::new(-(p.y - c.y), p.x - c.x));
+        }
+        done += 1;
+    }
+    done
+}
+
+// ---------------------------------------------------------------------------------------
 // Coutures : boucles d'arêtes, dépliage partiel, couper, coudre
 // ---------------------------------------------------------------------------------------
 
@@ -793,6 +1052,96 @@ mod tests {
         let isl = Islands::new(&m, &fi, &[wall]);
         let (a, b) = bounds(&uv, &isl.corners[0]).unwrap();
         assert!((a.x - lo.x).abs() < 1e-4 && (a.y - lo.y).abs() < 1e-4 && (b.x - hi.x).abs() < 1e-4 && (b.y - hi.y).abs() < 1e-4, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn orient_follows_edges_not_box() {
+        // grille 6 × 3 penchée de 33° : remise d'aplomb, ses arêtes sont horizontales ou verticales
+        let (nx, ny) = (6u32, 3u32);
+        let w = nx + 1;
+        let pos: Vec<V3> = (0..=ny).flat_map(|j| (0..=nx).map(move |i| V3::new(i as f64, j as f64, 0.0))).collect();
+        let faces: Vec<Vec<u32>> = (0..ny).flat_map(|j| (0..nx).map(move |i| vec![j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i])).collect();
+        let m = Mesh::from_faces(pos, &faces);
+        let (s, c) = 33f64.to_radians().sin_cos();
+        let mut uv: Vec<[f32; 2]> = m.corners.iter().map(|&v| {
+            let p = m.positions[v as usize];
+            let q = V2::new(p.x, p.y).rotated(c, s);
+            [q.x as f32, q.y as f32]
+        }).collect();
+        let fi = vec![0u32; m.face_count()];
+        let isl = Islands::new(&m, &fi, &[0]);
+        assert_eq!(orient_to_edges(&m, &mut uv, &isl), 1);
+        assert!(dominant_angle(&m, &uv, &isl.faces[0]).abs() < 1e-4);
+        let (a, b) = bounds(&uv, &isl.corners[0]).unwrap();
+        assert!(b.x - a.x > b.y - a.y, "côté long horizontal");
+    }
+
+    #[test]
+    fn snap_grid_makes_rows_and_columns_straight() {
+        // bande 20 × 4 avec deux rangées fines de biseau, des triangles, des lignes qui
+        // ondulent et l'ensemble penché de 20° : chaque rangée et chaque colonne redevient droite
+        let nx = 20u32;
+        let ys = [0.0, 0.1, 0.12, 0.14, 0.24];
+        let w = nx + 1;
+        let mut pos = Vec::new();
+        for &y in &ys {
+            for i in 0..=nx {
+                pos.push(V3::new(i as f64 * 0.1, y, 0.0));
+            }
+        }
+        let mut faces = Vec::new();
+        for j in 0..4u32 {
+            for i in 0..nx {
+                let (a, b, c, d) = (j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i);
+                if (5..7).contains(&i) {
+                    faces.push(vec![a, b, c]);
+                    faces.push(vec![a, c, d]);
+                } else {
+                    faces.push(vec![a, b, c, d]);
+                }
+            }
+        }
+        let m = Mesh::from_faces(pos, &faces);
+        let (s, c) = 20f64.to_radians().sin_cos();
+        let mut uv: Vec<[f32; 2]> = m
+            .corners
+            .iter()
+            .map(|&v| {
+                let p = m.positions[v as usize];
+                let (i, j) = (v % w, v / w);
+                // ondulation plus petite qu'un tiers de la rangée la plus fine
+                let wob = V2::new(0.008 * (i as f64 * 1.7 + j as f64).sin(), 0.005 * (i as f64 * 0.9).sin());
+                let q = (V2::new(p.x, p.y) + wob).rotated(c, s);
+                [q.x as f32, q.y as f32]
+            })
+            .collect();
+        let fi = vec![0u32; m.face_count()];
+        let isl = Islands::new(&m, &fi, &[0]);
+        assert_eq!(snap_grid(&m, &mut uv, &isl), 1);
+        // dans le repère de la bande (celui de sa rangée du bas) : rangées à y constant,
+        // colonnes à x constant
+        let end = |v: u32| {
+            let k = m.corners.iter().position(|&x| x == v).unwrap();
+            V2::new(uv[k][0] as f64, uv[k][1] as f64)
+        };
+        let d = end(nx) - end(0);
+        let (s, c) = (-d.y.atan2(d.x)).sin_cos();
+        let local: Vec<V2> = uv.iter().map(|p| V2::new(p[0] as f64, p[1] as f64).rotated(c, s)).collect();
+        let mut rows: HashMap<u32, (f64, f64)> = HashMap::new();
+        let mut cols: HashMap<u32, (f64, f64)> = HashMap::new();
+        for (k, &v) in m.corners.iter().enumerate() {
+            let r = rows.entry(v / w).or_insert((f64::MAX, f64::MIN));
+            *r = (r.0.min(local[k].y), r.1.max(local[k].y));
+            let cl = cols.entry(v % w).or_insert((f64::MAX, f64::MIN));
+            *cl = (cl.0.min(local[k].x), cl.1.max(local[k].x));
+        }
+        let row_spread = rows.values().map(|r| r.1 - r.0).fold(0.0, f64::max);
+        let col_spread = cols.values().map(|r| r.1 - r.0).fold(0.0, f64::max);
+        assert!(row_spread < 1e-4 && col_spread < 1e-4, "rangées {row_spread:.5}, colonnes {col_spread:.5}");
+        // les rangées fines du biseau restent distinctes
+        let mut ry: Vec<f64> = rows.values().map(|r| r.0).collect();
+        ry.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(ry.windows(2).all(|w| w[1] - w[0] > 0.01), "{ry:?}");
     }
 
     #[test]

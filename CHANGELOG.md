@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1] - 2026-10-23
+
+### Rendre droit, une bonne fois pour toutes
+- **Grille parfaite** (`Maj+G`) : chaque rangée et chaque colonne de l'îlot passe sur une droite, comme tracée à la règle. Rangées et colonnes sont lues face par face (les diagonales des triangles ne comptent pas), les rangées fines d'un biseau restent distinctes, l'orientation de l'îlot est trouvée seule. Sur la sélection, ou sur tous les îlots ; un îlot qui en serait abîmé reste tel quel.
+- « Rendre droit » finit désormais par la Grille parfaite : les lignes intérieures ne gondolent plus.
+- **Remettre d'aplomb** : chaque îlot tourne pour que ses arêtes suivent l'horizontale et la verticale (d'après ses arêtes, pas sa boîte), côté long horizontal.
+
+### Sélection
+- **Sélection par zone** : rectangle, **lasso** (tracé à main levée) ou **cercle** que l'on peint ; `W` passe de l'une à l'autre, comme Blender. Icônes dans l'en-tête de l'éditeur UV.
+- **`Maj` maintenu, comme Blender** : `Maj`+clic ajoute ou retire, `Maj`+glisser ajoute par zone même en partant d'un îlot (au lieu de le déplacer), `Ctrl`+glisser retire.
+- **Sélection par angle** (seuil réglable) : en mode arêtes, les arêtes vives (pour Couper ou Marquer) ; dans les autres modes, toutes les faces d'un même pan à partir des faces choisies.
+
+
 ## [0.3.0] - 2026-10-23
 
 ### Sélection de sommets, d'arêtes et de faces (comme Blender)

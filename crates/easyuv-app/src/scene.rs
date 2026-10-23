@@ -560,33 +560,6 @@ impl Scene {
         self.touch();
     }
 
-    /// Sélection au rectangle : îlots dont un centre de face est dans [lo, hi].
-    /// `mode` : 1 = ajouter, -1 = retirer, 0 = remplacer.
-    pub fn box_select_islands(&mut self, lo: [f32; 2], hi: [f32; 2], mode: i32) {
-        let Some(uv) = &self.uv else { return };
-        let m = &self.model.mesh;
-        let mut inside = vec![false; self.island_selected.len()];
-        for f in 0..m.face_count() {
-            if self.hidden[self.face_object[f] as usize] {
-                continue;
-            }
-            let r = m.face_range(f);
-            let n = r.len() as f32;
-            let c = r.fold([0.0f32; 2], |a, ci| [a[0] + uv.corner_uv[ci][0] / n, a[1] + uv.corner_uv[ci][1] / n]);
-            if c[0] >= lo[0] && c[0] <= hi[0] && c[1] >= lo[1] && c[1] <= hi[1] {
-                inside[self.face_island[f] as usize] = true;
-            }
-        }
-        for (s, hit) in self.island_selected.iter_mut().zip(inside) {
-            *s = match mode {
-                1 => *s || hit,
-                -1 => *s && !hit,
-                _ => hit,
-            };
-        }
-        self.touch();
-    }
-
     /// Îlots sélectionnés et visibles ; hors mode îlots, ceux qui contiennent la sélection.
     pub fn selected_island_ids(&self) -> Vec<usize> {
         if self.sel_mode == SelectMode::Island {
@@ -801,36 +774,134 @@ impl Scene {
 
     /// Sélection au rectangle, selon le mode. `mode` : 1 = ajouter, -1 = retirer, 0 = remplacer.
     pub fn box_select(&mut self, lo: [f32; 2], hi: [f32; 2], mode: i32) {
-        if self.sel_mode == SelectMode::Island {
-            self.box_select_islands(lo, hi, mode);
-            return;
-        }
+        self.select_where(|q| q[0] >= lo[0] && q[0] <= hi[0] && q[1] >= lo[1] && q[1] <= hi[1], mode);
+    }
+
+    /// Sélection par zone (rectangle, lasso, cercle) : `inside` dit si un point UV est dans
+    /// la zone. Sommets et arêtes : les coins dedans ; faces et îlots : celles dont le centre
+    /// est dedans. `mode` : 1 = ajouter, -1 = retirer, 0 = remplacer.
+    pub fn select_where(&mut self, inside: impl Fn([f32; 2]) -> bool, mode: i32) {
         let Some(uv) = &self.uv else { return };
         let m = &self.model.mesh;
-        let inside = |q: [f32; 2]| q[0] >= lo[0] && q[0] <= hi[0] && q[1] >= lo[1] && q[1] <= hi[1];
-        let mut hit = vec![false; m.corners.len()];
-        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
-            let r = m.face_range(f);
-            if self.sel_mode == SelectMode::Face {
-                let n = r.len() as f32;
-                let c = r.clone().fold([0.0f32; 2], |a, k| [a[0] + uv.corner_uv[k][0] / n, a[1] + uv.corner_uv[k][1] / n]);
-                if inside(c) {
-                    r.for_each(|k| hit[k] = true);
-                }
-            } else {
-                for k in r {
-                    hit[k] = inside(uv.corner_uv[k]);
-                }
-            }
-        }
-        for (s, h) in self.corner_sel.iter_mut().zip(hit) {
+        let merge = |s: &mut bool, h: bool| {
             *s = match mode {
                 1 => *s || h,
                 -1 => *s && !h,
                 _ => h,
-            };
+            }
+        };
+        let center = |f: usize| {
+            let r = m.face_range(f);
+            let n = r.len() as f32;
+            r.fold([0.0f32; 2], |a, k| [a[0] + uv.corner_uv[k][0] / n, a[1] + uv.corner_uv[k][1] / n])
+        };
+        if self.sel_mode == SelectMode::Island {
+            let mut hit = vec![false; self.island_selected.len()];
+            for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+                if inside(center(f)) {
+                    hit[self.face_island[f] as usize] = true;
+                }
+            }
+            for (s, h) in self.island_selected.iter_mut().zip(hit) {
+                merge(s, h);
+            }
+        } else {
+            let mut hit = vec![false; m.corners.len()];
+            for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+                let r = m.face_range(f);
+                if self.sel_mode == SelectMode::Face {
+                    if inside(center(f)) {
+                        r.for_each(|k| hit[k] = true);
+                    }
+                } else {
+                    for k in r {
+                        hit[k] = inside(uv.corner_uv[k]);
+                    }
+                }
+            }
+            for (s, h) in self.corner_sel.iter_mut().zip(hit) {
+                merge(s, h);
+            }
         }
         self.touch();
+    }
+
+    /// Arêtes vives : sélectionne (mode arêtes) les arêtes dont les deux faces font un angle
+    /// supérieur à `angle_deg`, comme la sélection par angle de RizomUV. Renvoie leur nombre.
+    pub fn select_sharp_edges(&mut self, angle_deg: f64, extend: bool) -> usize {
+        self.set_select_mode(SelectMode::Edge);
+        let m = &self.model.mesh;
+        let mut faces_of: std::collections::HashMap<(u32, u32), Vec<(usize, usize, usize)>> = std::collections::HashMap::new();
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let r: Vec<usize> = m.face_range(f).collect();
+            for i in 0..r.len() {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                let (va, vb) = (m.corners[a], m.corners[b]);
+                faces_of.entry((va.min(vb), va.max(vb))).or_default().push((f, a, b));
+            }
+        }
+        if !extend {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+        }
+        let cos = angle_deg.to_radians().cos();
+        let mut n = 0;
+        for sides in faces_of.values() {
+            let [(f1, a1, b1), (f2, a2, b2)] = sides[..] else { continue };
+            if self.face_normals[f1].dot(self.face_normals[f2]) < cos {
+                for c in [a1, b1, a2, b2] {
+                    self.corner_sel[c] = true;
+                }
+                n += 1;
+            }
+        }
+        self.touch();
+        n
+    }
+
+    /// Faces liées par angle : depuis les faces sélectionnées, gagne les faces voisines (par le
+    /// maillage, coutures comprises) dont la normale s'écarte de moins de `angle_deg` de
+    /// celle de la face d'où l'on vient (« Select Linked Flat Faces » de Blender).
+    pub fn select_linked_by_angle(&mut self, angle_deg: f64) -> usize {
+        let seeds = self.selected_faces();
+        if seeds.is_empty() {
+            return 0;
+        }
+        self.set_select_mode(SelectMode::Face);
+        let m = &self.model.mesh;
+        let mut by_edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+        for f in (0..m.face_count()).filter(|&f| self.face_visible(f)) {
+            let vs = m.face(f);
+            for i in 0..vs.len() {
+                let (a, b) = (vs[i], vs[(i + 1) % vs.len()]);
+                by_edge.entry((a.min(b), a.max(b))).or_default().push(f);
+            }
+        }
+        let cos = angle_deg.to_radians().cos();
+        let mut taken = vec![false; m.face_count()];
+        let mut queue: std::collections::VecDeque<usize> = seeds.iter().copied().collect();
+        seeds.iter().for_each(|&f| taken[f] = true);
+        while let Some(f) = queue.pop_front() {
+            let vs = m.face(f);
+            for i in 0..vs.len() {
+                let (a, b) = (vs[i], vs[(i + 1) % vs.len()]);
+                for &g in by_edge.get(&(a.min(b), a.max(b))).into_iter().flatten() {
+                    if !taken[g] && self.face_normals[f].dot(self.face_normals[g]) >= cos {
+                        taken[g] = true;
+                        queue.push_back(g);
+                    }
+                }
+            }
+        }
+        let n = taken.iter().filter(|&&t| t).count();
+        for f in 0..m.face_count() {
+            if taken[f] {
+                for c in m.face_range(f) {
+                    self.corner_sel[c] = true;
+                }
+            }
+        }
+        self.touch();
+        n
     }
 
     /// Tout sélectionner / désélectionner (A / Alt+A), selon le mode.
@@ -1141,9 +1212,34 @@ impl Scene {
         let Some(uv) = &mut self.uv else { return (0, 0) };
         let r = easyuv::layout::straighten_with_corners(&self.model.mesh, &mut uv.corner_uv, &self.face_island, &which, &hint);
         if r.0 > 0 {
+            // finition : rangées et colonnes passées à la règle (Grille parfaite)
+            let ids: Vec<usize> = (0..which.len()).filter(|&i| which[i]).collect();
+            easyuv::uvtools::snap_grid(&self.model.mesh, &mut uv.corner_uv, &easyuv::uvtools::Islands::new(&self.model.mesh, &self.face_island, &ids));
             self.refresh(texture_size);
         }
         r
+    }
+
+    /// Grille parfaite sur la sélection (ou tout). Renvoie (îlots alignés, îlots visés).
+    pub fn snap_grid(&mut self, texture_size: u32) -> (usize, usize) {
+        let ids = self.brush_islands();
+        let Some(uv) = &mut self.uv else { return (0, 0) };
+        let n = easyuv::uvtools::snap_grid(&self.model.mesh, &mut uv.corner_uv, &easyuv::uvtools::Islands::new(&self.model.mesh, &self.face_island, &ids));
+        if n > 0 {
+            self.refresh(texture_size);
+        }
+        (n, ids.len())
+    }
+
+    /// Remet d'aplomb la sélection (ou tous les îlots) d'après leurs arêtes.
+    pub fn orient_to_edges(&mut self, texture_size: u32) -> usize {
+        let ids = self.brush_islands();
+        let Some(uv) = &mut self.uv else { return 0 };
+        let n = easyuv::uvtools::orient_to_edges(&self.model.mesh, &mut uv.corner_uv, &easyuv::uvtools::Islands::new(&self.model.mesh, &self.face_island, &ids));
+        if n > 0 {
+            self.refresh(texture_size);
+        }
+        n
     }
 
     // ---------- objets : orientation ----------
@@ -1434,5 +1530,36 @@ mod tests {
         let n = s.select_loop(mid, 1e-3, false);
         assert!(n >= 8, "boucle de {n} arêtes");
         assert!(s.selected_mesh_edges().len() >= 2);
+    }
+
+    #[test]
+    fn select_by_angle_on_cube() {
+        let mut s = cube_scene();
+        // les 12 arêtes du cube font 90° : toutes vives au-delà de 30°, aucune au-delà de 100°
+        assert_eq!(s.select_sharp_edges(30.0, false), 12);
+        assert_eq!(s.selected_mesh_edges().len(), 12);
+        assert_eq!(s.select_sharp_edges(100.0, false), 0);
+        // faces liées : une face seule à 30°, tout le cube à 100°
+        s.set_select_mode(SelectMode::Face);
+        s.corner_sel.iter_mut().for_each(|c| *c = false);
+        let r = s.model.mesh.face_range(0);
+        r.for_each(|c| s.corner_sel[c] = true);
+        assert_eq!(s.select_linked_by_angle(30.0), 1);
+        assert_eq!(s.select_linked_by_angle(100.0), 6);
+    }
+
+    #[test]
+    fn zone_selection_adds_and_removes() {
+        let mut s = scene();
+        s.set_select_mode(SelectMode::Island);
+        s.select_where(|_| true, 0);
+        let all = s.island_selected.iter().filter(|&&x| x).count();
+        assert_eq!(all, s.island_selected.len());
+        // retirer tout ce qui est à gauche de u = 0,5, puis rajouter
+        s.select_where(|q| q[0] < 0.5, -1);
+        let after = s.island_selected.iter().filter(|&&x| x).count();
+        assert!(after < all);
+        s.select_where(|q| q[0] < 0.5, 1);
+        assert_eq!(s.island_selected.iter().filter(|&&x| x).count(), all);
     }
 }
