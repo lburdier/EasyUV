@@ -268,26 +268,40 @@ fn render_scene(scene: &Scene, b: &Basis, focal: f64, near: f64, w: usize, h: us
             if scene.hidden[o] {
                 return None;
             }
-            let (color, textured) = match (opt.shading, uv) {
+            let (mut color, textured) = match (opt.shading, uv) {
                 (Shading::Checker, Some(_)) => ([255, 255, 255], true),
                 (Shading::Islands, Some(u)) => (rgb(island_color(u.face_chart[fi])), false),
                 (Shading::Stretch, Some(_)) => (rgb(stretch_color(scene.face_stretch[fi])), false),
                 _ => ([204, 204, 204], false),
             };
+            // faces sélectionnées dans l'éditeur UV (mode faces) : teinte orange
+            if scene.sel_mode == crate::scene::SelectMode::Face && scene.face_selected(fi) {
+                color = [255, color[1].min(190), color[2].min(110)];
+            }
             Some(FaceStyle { color, textured, id: o as u32 + 1 })
         })
         .collect();
     let mut lines = Vec::new();
     let wire = opt.wire && scene.edges.len() < 400_000;
-    if wire || opt.seams {
-        let lw = ppp.round().max(1.0) as u8;
+    // arêtes choisies dans l'éditeur UV et coutures marquées à la main, toujours visibles
+    let picked: std::collections::HashSet<(u32, u32)> = scene.selected_mesh_edges().into_iter().collect();
+    let lw = ppp.round().max(1.0) as u8;
+    if wire || opt.seams || !picked.is_empty() || !scene.marked_seams.is_empty() {
         for &(a, bb, o) in &scene.edges {
             if scene.hidden[o as usize] {
                 continue;
             }
             let seam = opt.seams && scene.seam_set.contains(&(a, bb));
-            if seam {
-                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: { let c = rgb(theme::SEAM_RED); [c[0], c[1], c[2], 255] }, width: lw * 2 });
+            let col = |c: Color32| {
+                let c = rgb(c);
+                [c[0], c[1], c[2], 255]
+            };
+            if picked.contains(&(a, bb)) {
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::ACCENT_ORANGE), width: lw * 2 });
+            } else if scene.marked_seams.contains(&(a, bb)) {
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::SEAM_MARK), width: lw * 2 });
+            } else if seam {
+                lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: col(theme::SEAM_RED), width: lw * 2 });
             } else if wire {
                 lines.push(Line { a: m.positions[a as usize], b: m.positions[bb as usize], color: [0, 0, 0, 90], width: lw });
             }

@@ -497,10 +497,251 @@ pub fn reunwrap(mesh: &Mesh, corner_uv: &mut [[f32; 2]], isl: &Islands) {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Coutures : boucles d'arêtes, dépliage partiel, couper, coudre
+// ---------------------------------------------------------------------------------------
+
+/// Boucle d'arêtes passant par l'arête (a, b), comme Alt+clic dans Blender : à chaque sommet
+/// de valence 4, on continue par l'arête opposée (qui ne touche aucune des faces de l'arête
+/// courante). S'arrête aux pôles, aux bords et quand la boucle se referme.
+pub fn edge_loop(mesh: &Mesh, a: u32, b: u32) -> Vec<(u32, u32)> {
+    let key = |x: u32, y: u32| if x < y { (x, y) } else { (y, x) };
+    let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    let mut vert_edges: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for f in 0..mesh.face_count() {
+        let vs = mesh.face(f);
+        for i in 0..vs.len() {
+            let k = key(vs[i], vs[(i + 1) % vs.len()]);
+            let e = edge_faces.entry(k).or_default();
+            if e.is_empty() {
+                vert_edges.entry(k.0).or_default().push(k);
+                vert_edges.entry(k.1).or_default().push(k);
+            }
+            e.push(f);
+        }
+    }
+    let start = key(a, b);
+    if !edge_faces.contains_key(&start) {
+        return Vec::new();
+    }
+    let mut out = vec![start];
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::from([start]);
+    for (from, mut v) in [(a, b), (b, a)] {
+        let mut prev = key(from, v);
+        loop {
+            let edges = &vert_edges[&v];
+            if edges.len() != 4 {
+                break;
+            }
+            let faces = &edge_faces[&prev];
+            let next = edges.iter().copied().filter(|e| *e != prev && !edge_faces[e].iter().any(|f| faces.contains(f))).collect::<Vec<_>>();
+            let [n] = next[..] else { break };
+            if !seen.insert(n) {
+                break;
+            }
+            out.push(n);
+            prev = n;
+            v = if n.0 == v { n.1 } else { n.0 };
+        }
+    }
+    out
+}
+
+/// Dépliage intelligent des seules faces `faces` (îlots sélectionnés, coupe) : renvoie les UV
+/// de leurs coins, dans l'ordre des faces, rangées dans la tuile 0-1. `seams` : arêtes à
+/// couper (paires de sommets du maillage) ; le bord de la sélection est toujours une couture.
+pub fn unwrap_faces(mesh: &Mesh, faces: &[usize], seams: &[(u32, u32)], params: &crate::Params) -> crate::UvResult {
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut pos = Vec::new();
+    let sub_faces: Vec<Vec<u32>> = faces
+        .iter()
+        .map(|&f| {
+            mesh.face(f)
+                .iter()
+                .map(|&v| {
+                    *remap.entry(v).or_insert_with(|| {
+                        pos.push(mesh.positions[v as usize]);
+                        pos.len() as u32 - 1
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let sub = Mesh::from_faces(pos, &sub_faces);
+    let sub_seams: Vec<(u32, u32)> = seams.iter().filter_map(|(a, b)| Some((*remap.get(a)?, *remap.get(b)?))).collect();
+    let mut p = params.clone();
+    p.density = crate::DensityMode::Fit;
+    crate::smart_unwrap(&sub, &p, &sub_seams)
+}
+
+/// Côté d'une arête : (face, coin du premier sommet de la clé, coin du second).
+type Side = (usize, usize, usize);
+
+/// Coud les arêtes `edges` (paires de sommets) : l'îlot le plus petit de chaque paire
+/// d'îlots est tourné et déplacé pour que ses arêtes rejoignent celles de l'autre (comme
+/// « Move and Sew » de Maya), puis les sommets cousus sont soudés. Deux bords d'un même îlot
+/// se rejoignent à mi-chemin. Renvoie le nombre de paires d'îlots cousues.
+pub fn sew(mesh: &Mesh, corner_uv: &mut [[f32; 2]], face_island: &[u32], edges: &[(u32, u32)]) -> usize {
+    let key = |x: u32, y: u32| if x < y { (x, y) } else { (y, x) };
+    let wanted: std::collections::HashSet<(u32, u32)> = edges.iter().map(|&(a, b)| key(a, b)).collect();
+    // côtés de chaque arête voulue : (face, coin du premier sommet de la clé, coin du second)
+    let mut sides: HashMap<(u32, u32), Vec<Side>> = HashMap::new();
+    for f in 0..mesh.face_count() {
+        let r: Vec<usize> = mesh.face_range(f).collect();
+        for i in 0..r.len() {
+            let (ca, cb) = (r[i], r[(i + 1) % r.len()]);
+            let (va, vb) = (mesh.corners[ca], mesh.corners[cb]);
+            let k = key(va, vb);
+            if wanted.contains(&k) {
+                sides.entry(k).or_default().push(if va == k.0 { (f, ca, cb) } else { (f, cb, ca) });
+            }
+        }
+    }
+    // paires d'îlots -> correspondances (coin côté A, coin côté B)
+    let mut pairs: HashMap<(u32, u32), Vec<(usize, usize)>> = HashMap::new();
+    for s in sides.values() {
+        let [(f1, a1, b1), (f2, a2, b2)] = s[..] else { continue };
+        if corner_uv[a1] == corner_uv[a2] && corner_uv[b1] == corner_uv[b2] {
+            continue; // déjà cousue
+        }
+        let (i1, i2) = (face_island[f1], face_island[f2]);
+        let list = pairs.entry((i1.min(i2), i1.max(i2))).or_default();
+        if i1 <= i2 {
+            list.extend([(a1, a2), (b1, b2)]);
+        } else {
+            list.extend([(a2, a1), (b2, b1)]);
+        }
+    }
+    let island_corners = |i: u32| -> Vec<usize> { (0..mesh.face_count()).filter(|&f| face_island[f] == i).flat_map(|f| mesh.face_range(f)).collect() };
+    let mut done = 0;
+    let mut keys: Vec<(u32, u32)> = pairs.keys().copied().collect();
+    keys.sort();
+    for k in keys {
+        let matches = &pairs[&k];
+        if k.0 == k.1 {
+            // fente dans un même îlot : chaque paire de coins rejoint son milieu
+            for &(ca, cb) in matches {
+                let m = (to_v2(corner_uv[ca]) + to_v2(corner_uv[cb])) * 0.5;
+                weld(mesh, corner_uv, &island_corners(k.0), &[(ca, m), (cb, m)]);
+            }
+            done += 1;
+            continue;
+        }
+        // l'îlot qui bouge : celui qui a le moins de coins
+        let (ca_all, cb_all) = (island_corners(k.0), island_corners(k.1));
+        let moving_is_b = cb_all.len() <= ca_all.len();
+        let (fixed_pts, moving_pts): (Vec<V2>, Vec<V2>) = matches.iter().map(|&(a, b)| if moving_is_b { (to_v2(corner_uv[a]), to_v2(corner_uv[b])) } else { (to_v2(corner_uv[b]), to_v2(corner_uv[a])) }).unzip();
+        let moving = if moving_is_b { &cb_all } else { &ca_all };
+        let Some(t) = rigid_fit(&moving_pts, &fixed_pts) else { continue };
+        apply(corner_uv, moving, &t);
+        // soudure : les coins cousus de l'îlot déplacé prennent la position de l'autre côté
+        let targets: Vec<(usize, V2)> = matches.iter().map(|&(a, b)| if moving_is_b { (b, to_v2(corner_uv[a])) } else { (a, to_v2(corner_uv[b])) }).collect();
+        weld(mesh, corner_uv, moving, &targets);
+        done += 1;
+    }
+    done
+}
+
+/// Place chaque coin `c` en `p`, et avec lui les coins de `pool` du même sommet qui étaient
+/// au même endroit (le reste de l'îlot autour de ce sommet).
+fn weld(mesh: &Mesh, corner_uv: &mut [[f32; 2]], pool: &[usize], targets: &[(usize, V2)]) {
+    for &(c, p) in targets {
+        let (v, old) = (mesh.corners[c], corner_uv[c]);
+        for &k in pool {
+            if mesh.corners[k] == v && corner_uv[k] == old {
+                corner_uv[k] = [p.x as f32, p.y as f32];
+            }
+        }
+        corner_uv[c] = [p.x as f32, p.y as f32];
+    }
+}
+
+/// Meilleure transformation rigide (rotation, éventuel miroir, translation) qui amène
+/// `from` sur `to`.
+fn rigid_fit(from: &[V2], to: &[V2]) -> Option<impl Fn(V2) -> V2> {
+    let n = from.len();
+    if n == 0 || n != to.len() {
+        return None;
+    }
+    let cf = from.iter().fold(V2::new(0.0, 0.0), |s, p| s + *p) * (1.0 / n as f64);
+    let ct = to.iter().fold(V2::new(0.0, 0.0), |s, p| s + *p) * (1.0 / n as f64);
+    let fit = |mirror: bool| {
+        let (mut sd, mut sc) = (0.0, 0.0);
+        for (f, t) in from.iter().zip(to) {
+            let mut a = *f - cf;
+            if mirror {
+                a.x = -a.x;
+            }
+            let b = *t - ct;
+            sd += a.dot(b);
+            sc += a.cross(b);
+        }
+        let (s, c) = sc.atan2(sd).sin_cos();
+        let err: f64 = from
+            .iter()
+            .zip(to)
+            .map(|(f, t)| {
+                let mut a = *f - cf;
+                if mirror {
+                    a.x = -a.x;
+                }
+                len2(a.rotated(c, s) + ct - *t)
+            })
+            .sum();
+        (err, c, s)
+    };
+    let (e0, c0, s0) = fit(false);
+    let (e1, c1, s1) = fit(true);
+    // un seul segment ne dit rien du sens : pas de miroir sans gain net
+    let (mirror, c, s) = if n > 2 && e1 < e0 * 0.5 { (true, c1, s1) } else { (false, c0, s0) };
+    Some(move |p: V2| {
+        let mut a = p - cf;
+        if mirror {
+            a.x = -a.x;
+        }
+        a.rotated(c, s) + ct
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{layout::uv_islands, primitives, smart_unwrap, Params};
+
+    #[test]
+    fn edge_loop_goes_around_cylinder() {
+        // tore soudé de 16 × 8 quads : toute boucle en fait le tour (16 ou 8 arêtes)
+        let m = crate::model::weld(&primitives::torus(1.0, 0.3, 16, 8));
+        let vs = m.face(0).to_vec();
+        for k in 0..2 {
+            let l = edge_loop(&m, vs[k], vs[k + 1]);
+            assert!(l.len() == 16 || l.len() == 8, "boucle de {} arêtes", l.len());
+        }
+    }
+
+    #[test]
+    fn cut_then_sew_restores_one_island() {
+        // grille de 4 x 2 quads, un seul îlot ; on coupe au milieu puis on recoud
+        let (nx, ny) = (4usize, 2usize);
+        let mut pos = Vec::new();
+        for j in 0..=ny {
+            for i in 0..=nx {
+                pos.push(V3::new(i as f64, j as f64, 0.0));
+            }
+        }
+        let w = nx as u32 + 1;
+        let faces: Vec<Vec<u32>> = (0..ny as u32).flat_map(|j| (0..nx as u32).map(move |i| vec![j * w + i, j * w + i + 1, (j + 1) * w + i + 1, (j + 1) * w + i])).collect();
+        let m = Mesh::from_faces(pos, &faces);
+        let cut: Vec<(u32, u32)> = (0..ny as u32).map(|j| (j * w + 2, (j + 1) * w + 2)).collect();
+        let all: Vec<usize> = (0..m.face_count()).collect();
+        let r = unwrap_faces(&m, &all, &cut, &Params::default());
+        let (fi, n) = uv_islands(&m, &r.corner_uv);
+        assert_eq!(n, 2, "la coupe sépare la grille en deux");
+        let mut uv = r.corner_uv.clone();
+        assert_eq!(sew(&m, &mut uv, &fi, &cut), 1);
+        let (_, n2) = uv_islands(&m, &uv);
+        assert_eq!(n2, 1, "recousue, la grille ne fait plus qu'un îlot");
+    }
 
     fn setup() -> (Mesh, Vec<[f32; 2]>, Vec<u32>, usize) {
         let m = primitives::cylinder(1.0, 2.0, 24, 4);

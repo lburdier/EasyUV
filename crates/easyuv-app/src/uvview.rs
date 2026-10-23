@@ -1,7 +1,7 @@
 //! Éditeur UV 2D : tuile 0-1 avec damier, îlots colorés et arêtes, et édition des îlots
 //! à la manière de Blender (clic, rectangle, G / R / S, X / Y, Ctrl, Échap).
 
-use crate::scene::Scene;
+use crate::scene::{Scene, SelectMode};
 use crate::theme;
 use crate::viewport::{island_color, stretch_color, Shading, WHITE_UV};
 use easyuv::math::V2;
@@ -112,11 +112,11 @@ impl UvTool {
     pub fn key(self) -> &'static str {
         match self {
             UvTool::Select => "Q",
-            UvTool::Grab => "1",
-            UvTool::Relax => "2",
-            UvTool::Straighten => "3",
-            UvTool::Pinch => "4",
-            UvTool::Rect => "5",
+            UvTool::Grab => "Maj+1",
+            UvTool::Relax => "Maj+2",
+            UvTool::Straighten => "Maj+3",
+            UvTool::Pinch => "Maj+4",
+            UvTool::Rect => "Maj+5",
         }
     }
 
@@ -252,13 +252,26 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     let keys = !ui.ctx().egui_wants_keyboard_input() && (resp.hovered() || ed.modal.is_some() || ed.stroke.is_some());
     let key = |k: egui::Key| keys && ui.input(|i| i.key_pressed(k));
 
-    // --- choix de l'outil (Q, 1 à 5) et rayon du pinceau ([ ]) ---
-    if ed.modal.is_none() && ed.stroke.is_none() && !ctrl {
-        for (k, t) in [(egui::Key::Q, UvTool::Select), (egui::Key::Num1, UvTool::Grab), (egui::Key::Num2, UvTool::Relax), (egui::Key::Num3, UvTool::Straighten), (egui::Key::Num4, UvTool::Pinch), (egui::Key::Num5, UvTool::Rect)] {
-            if key(k) {
-                ed.tool = t;
-                ed.rect = None;
+    // --- mode de sélection (1 à 4, comme Blender), outils (Q, Maj+1 à Maj+5), rayon ([ ]) ---
+    if ed.modal.is_none() && ed.stroke.is_none() && !ctrl && !alt {
+        let digits = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5];
+        if shift {
+            for (k, t) in digits.into_iter().zip([UvTool::Grab, UvTool::Relax, UvTool::Straighten, UvTool::Pinch, UvTool::Rect]) {
+                if key(k) {
+                    ed.tool = t;
+                    ed.rect = None;
+                }
             }
+        } else {
+            for (k, m) in digits.into_iter().zip(SelectMode::ALL) {
+                if key(k) {
+                    scene.set_select_mode(m);
+                }
+            }
+        }
+        if key(egui::Key::Q) {
+            ed.tool = UvTool::Select;
+            ed.rect = None;
         }
     }
     if key(egui::Key::OpenBracket) {
@@ -271,11 +284,10 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         if let Some(ev) = tool_interact(ui, resp, view, scene, ed, pointer, shift, &key) {
             return Some(ev);
         }
-        // un simple clic choisit l'îlot visé (pour limiter le pinceau à cet îlot)
+        // un simple clic choisit l'élément visé (pour limiter le pinceau à son îlot)
         if resp.clicked() && ed.stroke.is_none() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let hit = scene.pick_island(view.to_uv(p));
-                scene.click_island(hit, shift);
+                select_at(scene, view, p, shift);
             }
         }
         return None;
@@ -372,10 +384,10 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
 
     // --- raccourcis ---
     if key(egui::Key::A) {
-        scene.select_all_islands(!alt);
+        scene.select_all_uv(!alt);
     }
     if ctrl && key(egui::Key::I) {
-        scene.invert_islands();
+        scene.invert_uv();
     }
     if shift && key(egui::Key::W) {
         return Some(UvEvent::Straighten);
@@ -385,20 +397,21 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         if !ctrl && key(k) {
             if let Some(p) = start {
                 if !ed.begin(kind, scene, p, false) {
-                    return Some(UvEvent::Status("Sélectionnez d'abord des îlots (clic, A ou rectangle)".into()));
+                    return Some(UvEvent::Status("Sélectionnez d'abord des éléments (clic, A ou rectangle)".into()));
                 }
                 return None;
             }
         }
     }
 
-    // --- souris : clic, glisser un îlot, rectangle ---
+    // --- souris : clic, glisser la sélection, rectangle ---
     if resp.drag_started_by(egui::PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
-        match scene.pick_island(view.to_uv(origin)) {
-            Some(i) => {
-                if !scene.island_selected[i] {
-                    scene.click_island(Some(i), shift);
+        match under_pointer(scene, view, origin) {
+            Some(selected) => {
+                // glisser un élément : il est d'abord choisi s'il ne l'était pas (comme Blender)
+                if !selected {
+                    select_at(scene, view, origin, shift);
                 }
                 ed.begin(Kind::Grab, scene, origin, true);
                 if let Some(m) = &mut ed.modal {
@@ -413,19 +426,53 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
             ed.boxsel = None;
             if let Some(p) = pointer {
                 let (a, b) = (view.to_uv(o), view.to_uv(p));
-                scene.box_select_islands([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])], mode);
+                scene.box_select([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])], mode);
             }
         }
     }
-    if resp.clicked() {
+    if resp.double_clicked() && scene.sel_mode == SelectMode::Edge {
+        // double-clic sur une arête : toute la boucle d'arêtes
+        if let Some(p) = resp.interact_pointer_pos() {
+            let n = scene.select_loop(view.to_uv(p), PICK_PX / view.side, shift);
+            if n > 0 {
+                return Some(UvEvent::Status(format!("Boucle de {n} arête(s) sélectionnée")));
+            }
+        }
+    } else if resp.clicked() {
         if ed.swallow_primary {
             ed.swallow_primary = false;
         } else if let Some(p) = resp.interact_pointer_pos() {
-            let hit = scene.pick_island(view.to_uv(p));
-            scene.click_island(hit, shift);
+            select_at(scene, view, p, shift);
         }
     }
     None
+}
+
+/// Distance de prise d'un sommet ou d'une arête, en pixels d'écran.
+const PICK_PX: f32 = 8.0;
+
+/// Clic de sélection, selon le mode (îlots, ou sommets / arêtes / faces).
+fn select_at(scene: &mut Scene, view: View, p: Pos2, shift: bool) -> bool {
+    let q = view.to_uv(p);
+    if scene.sel_mode == SelectMode::Island {
+        let hit = scene.pick_island(q);
+        scene.click_island(hit, shift);
+        hit.is_some()
+    } else {
+        scene.click_component(q, PICK_PX / view.side, shift)
+    }
+}
+
+/// Élément sous le pointeur : None s'il n'y a rien, sinon s'il est déjà sélectionné.
+fn under_pointer(scene: &Scene, view: View, p: Pos2) -> Option<bool> {
+    let (q, tol) = (view.to_uv(p), PICK_PX / view.side);
+    let sel = |c: usize| scene.corner_sel.get(c).copied().unwrap_or(false);
+    match scene.sel_mode {
+        SelectMode::Island => scene.pick_island(q).map(|i| scene.island_selected[i]),
+        SelectMode::Vertex => scene.pick_corner(q, tol).map(sel),
+        SelectMode::Edge => scene.pick_edge(q, tol).map(|(a, b)| sel(a) && sel(b)),
+        SelectMode::Face => scene.pick_face(q).map(|f| scene.face_selected(f)),
+    }
 }
 
 fn v2(p: [f32; 2]) -> V2 {
@@ -458,7 +505,7 @@ fn tool_interact(ui: &egui::Ui, resp: &egui::Response, view: View, scene: &mut S
                     // sans sélection : l'îlot sous le rectangle (centre, puis départ du geste)
                     let hit = scene.pick_island([(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5]).or_else(|| scene.pick_island(a));
                     match hit {
-                        Some(i) => scene.click_island(Some(i), false),
+                        Some(i) => scene.select_island_only(i),
                         None => return Some(UvEvent::Status("Sélectionnez l'îlot à aplatir (clic), puis dessinez le rectangle".into())),
                     }
                 }
@@ -627,7 +674,18 @@ fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: Tex
     let nf = m.face_count();
     let draw_edges = nf < 150_000;
     let has_sel = scene.has_selection();
-    let island_sel = |f: usize| scene.face_island.get(f).is_some_and(|&i| scene.island_selected.get(i as usize).copied().unwrap_or(false));
+    let mode = scene.sel_mode;
+    let island_sel = |f: usize| match mode {
+        SelectMode::Island => scene.face_island.get(f).is_some_and(|&i| scene.island_selected.get(i as usize).copied().unwrap_or(false)),
+        SelectMode::Face => scene.face_selected(f),
+        _ => false,
+    };
+    let csel = |c: usize| mode != SelectMode::Island && scene.corner_sel.get(c).copied().unwrap_or(false);
+    let marked = &scene.marked_seams;
+    // mode sommets : un point par coin (les sélectionnés en orange, dessinés en dernier)
+    let mut dots = egui::Mesh::with_texture(tex);
+    let mut sel_dots = egui::Mesh::with_texture(tex);
+    let draw_dots = mode == SelectMode::Vertex && m.corners.len() < 200_000;
     for f in 0..nf {
         let o = scene.face_object[f] as usize;
         if scene.hidden[o] {
@@ -653,19 +711,44 @@ fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: Tex
         for t in m.fan(f) {
             fill.indices.extend_from_slice(&[i0 + t[0] as u32, i0 + t[1] as u32, i0 + t[2] as u32]);
         }
-        if draw_edges || picked {
-            let (lc, out) = if picked { (theme::ACCENT_ORANGE, &mut sel_lines) } else { (Color32::from_white_alpha(if dim { 35 } else { 150 }), &mut lines) };
+        if draw_dots {
+            for c in r.clone() {
+                let q = uv.corner_uv[c];
+                let pt = to_screen(q[0], q[1]);
+                let (out, col, half) = if csel(c) { (&mut sel_dots, theme::ACCENT_ORANGE, 2.5) } else { (&mut dots, Color32::from_white_alpha(if dim { 60 } else { 200 }), 1.5) };
+                let k = out.vertices.len() as u32;
+                for d in [egui::vec2(-half, -half), egui::vec2(half, -half), egui::vec2(half, half), egui::vec2(-half, half)] {
+                    out.vertices.push(Vertex { pos: pt + d, uv: WHITE_UV, color: col });
+                }
+                out.indices.extend_from_slice(&[k, k + 1, k + 2, k, k + 2, k + 3]);
+            }
+        }
+        if draw_edges || picked || mode != SelectMode::Island {
             let n = r.len();
             for i in 0..n {
-                let a = uv.corner_uv[r.start + i];
-                let b = uv.corner_uv[r.start + (i + 1) % n];
+                let (ca, cb) = (r.start + i, r.start + (i + 1) % n);
+                let (va, vb) = (m.corners[ca], m.corners[cb]);
+                let is_marked = marked.contains(&(va.min(vb), va.max(vb)));
+                let edge_sel = csel(ca) && csel(cb);
+                if !(draw_edges || picked || edge_sel || is_marked) {
+                    continue;
+                }
+                let (lc, out, half) = if picked || edge_sel {
+                    (theme::ACCENT_ORANGE, &mut sel_lines, if edge_sel { 1.2 } else { 0.5 })
+                } else if is_marked {
+                    (theme::SEAM_MARK, &mut sel_lines, 1.0)
+                } else {
+                    (Color32::from_white_alpha(if dim { 35 } else { 150 }), &mut lines, 0.5)
+                };
+                let a = uv.corner_uv[ca];
+                let b = uv.corner_uv[cb];
                 let (pa, pb) = (to_screen(a[0], a[1]), to_screen(b[0], b[1]));
                 let d = pb - pa;
                 let len = d.length();
                 if len < 0.3 {
                     continue;
                 }
-                let nrm = egui::vec2(-d.y, d.x) / len * 0.5;
+                let nrm = egui::vec2(-d.y, d.x) / len * half;
                 let k = out.vertices.len() as u32;
                 for p in [pa + nrm, pb + nrm, pb - nrm, pa - nrm] {
                     out.vertices.push(Vertex { pos: p, uv: WHITE_UV, color: lc });
@@ -675,5 +758,7 @@ fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: Tex
         }
     }
     lines.append(sel_lines);
+    lines.append(dots);
+    lines.append(sel_dots);
     (fill, lines)
 }

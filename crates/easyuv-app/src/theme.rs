@@ -15,6 +15,7 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9a, 0x9a, 0x9a);
 pub const ACCENT_BLUE: Color32 = Color32::from_rgb(0x47, 0x72, 0xb3); // sélection Blender
 pub const ACCENT_ORANGE: Color32 = Color32::from_rgb(0xff, 0xa0, 0x28); // objet actif
 pub const SEAM_RED: Color32 = Color32::from_rgb(0xdb, 0x25, 0x12); // coutures Blender
+pub const SEAM_MARK: Color32 = Color32::from_rgb(0xff, 0x5c, 0xc8); // coutures marquées à la main
 pub const GRID: Color32 = Color32::from_rgb(0x48, 0x48, 0x48);
 pub const AXIS_X: Color32 = Color32::from_rgb(0xff, 0x33, 0x52);
 pub const AXIS_Y: Color32 = Color32::from_rgb(0x8b, 0xdc, 0x00);

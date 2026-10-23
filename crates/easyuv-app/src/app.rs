@@ -1,5 +1,6 @@
+use crate::icons::{self, Icon};
 use crate::io;
-use crate::scene::Scene;
+use crate::scene::{Scene, SelectMode};
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
 use crate::uvview::{self, UvCache, UvCamera, UvEditor, UvEvent, UvTool};
@@ -94,6 +95,10 @@ pub struct EasyUvApp {
     /// Outils UV : angle de « Pivoter » et passes de « Optimiser ».
     rot_angle: f64,
     optimize_iters: usize,
+    /// Score UV en direct, et la génération de scène pour laquelle il a été calculé.
+    score: Option<easyuv::metrics::UvScore>,
+    score_gen: Option<u64>,
+    score_time: f64,
     status: String,
     error: Option<String>,
     /// Damier en mipmaps pour le rendu 3D logiciel.
@@ -106,6 +111,89 @@ pub struct EasyUvApp {
     renaming: Option<(usize, String)>,
     /// Menu « Supprimer ? » ouvert par X, à la position du pointeur (comme Blender).
     confirm_delete: Option<egui::Pos2>,
+}
+
+/// Outils de couture du panneau « Outils UV ».
+#[derive(Clone, Copy)]
+enum SeamOp {
+    Cut,
+    Sew,
+    Mark(bool),
+    ClearAll,
+}
+
+fn tool_icon(t: UvTool) -> Icon {
+    match t {
+        UvTool::Select => Icon::Select,
+        UvTool::Grab => Icon::Grab,
+        UvTool::Relax => Icon::Relax,
+        UvTool::Straighten => Icon::Straighten,
+        UvTool::Pinch => Icon::Pinch,
+        UvTool::Rect => Icon::Rect,
+    }
+}
+
+fn mode_icon(m: SelectMode) -> Icon {
+    match m {
+        SelectMode::Vertex => Icon::Vertex,
+        SelectMode::Edge => Icon::Edge,
+        SelectMode::Face => Icon::Face,
+        SelectMode::Island => Icon::Island,
+    }
+}
+
+fn mode_help(m: SelectMode) -> &'static str {
+    match m {
+        SelectMode::Vertex => "Clic : un sommet UV (les deux côtés d'une couture restent séparés). Maj+clic : ajouter ou retirer. Glisser ou G R S : déplacer la sélection.",
+        SelectMode::Edge => "Clic : une arête. Double-clic : toute la boucle d'arêtes. Les outils Couper, Coudre et Marquer agissent sur les arêtes choisies.",
+        SelectMode::Face => "Clic : une face. Rectangle : les faces dont le centre est dedans. U déplie seulement les faces choisies.",
+        SelectMode::Island => "Clic : un îlot entier. Les outils d'îlots (aligner, empiler, optimiser…) agissent sur les îlots choisis.",
+    }
+}
+
+/// Vert au-dessus de 80, jaune au-dessus de 60, orange en dessous.
+fn score_color(total: f64) -> Color32 {
+    if total >= 80.0 {
+        theme::AXIS_Y
+    } else if total >= 60.0 {
+        Color32::from_rgb(0xf0, 0xd0, 0x40)
+    } else {
+        theme::ACCENT_ORANGE
+    }
+}
+
+/// Détail du score UV : une barre par critère, et le conseil le plus utile.
+fn score_details(ui: &mut egui::Ui, sc: &easyuv::metrics::UvScore) {
+    ui.set_min_width(260.0);
+    ui.label(RichText::new(format!("Score UV : {:.0} / 100", sc.total)).strong().color(score_color(sc.total)));
+    egui::Grid::new("score_parts").num_columns(3).spacing([8.0, 3.0]).show(ui, |ui| {
+        for (name, v, w) in &sc.parts {
+            ui.label(RichText::new(*name).small());
+            let (r, p) = ui.allocate_painter(egui::vec2(110.0, 8.0), egui::Sense::hover());
+            p.rect_filled(r.rect, 2.0, theme::FIELD);
+            let mut fill = r.rect;
+            fill.set_width(r.rect.width() * *v as f32);
+            p.rect_filled(fill, 2.0, score_color(v * 100.0));
+            ui.label(RichText::new(format!("{:.0}/{w:.0}", v * w)).small().color(theme::TEXT_DIM));
+            ui.end_row();
+        }
+    });
+    ui.label(
+        RichText::new(format!(
+            "distorsion {:.3} · chevauchement {:.1} % · {} retournée(s) · tuile {:.0} % · hors tuile {:.1} % · écart de densité {:.0} %",
+            sc.distortion,
+            sc.overlap * 100.0,
+            sc.flipped,
+            sc.coverage * 100.0,
+            sc.outside * 100.0,
+            sc.density_spread * 100.0
+        ))
+        .small()
+        .color(theme::TEXT_DIM),
+    );
+    if let Some(a) = sc.advice() {
+        ui.label(RichText::new(format!("Conseil : {a}")).small().color(theme::ACCENT_ORANGE));
+    }
 }
 
 /// Outil d'îlots : (maillage, UV des coins, îlot de chaque face, îlots visés).
@@ -150,6 +238,9 @@ impl EasyUvApp {
             split: SPLIT_DEFAULT,
             rot_angle: 45.0,
             optimize_iters: 10,
+            score: None,
+            score_gen: None,
+            score_time: -1.0,
             status: "Prêt".into(),
             error: None,
             mips: Mips::new(1, &[255, 255, 255, 255]),
@@ -231,6 +322,8 @@ impl EasyUvApp {
         // comme Blender : seuls les objets sélectionnés sont dépliés (tous si aucune sélection)
         let targets = scene.unwrap_targets();
         let model = scene.sub_model(&targets);
+        // coutures marquées à la main : imposées au dépliage
+        let seams = scene.sub_seams(&targets);
         let n_targets = targets.len();
         let all = n_targets == scene.len();
         self.job_targets = targets;
@@ -246,7 +339,7 @@ impl EasyUvApp {
                 Some(l) => {
                     let mut l = l.lock().unwrap();
                     l.priority = priority;
-                    let res = learn::unwrap_learned(&model, &params, together, &mut l, trials);
+                    let res = learn::unwrap_learned_with_seams(&model, &params, together, &mut l, trials, &seams);
                     // l'expérience est conservée même si l'application est fermée ensuite
                     let _ = l.save(&learn::default_path());
                     let info = LearnInfo {
@@ -258,7 +351,7 @@ impl EasyUvApp {
                     };
                     (res.result, Some(info))
                 }
-                None => (easyuv::model::unwrap_model(&model, &params, together), None),
+                None => (easyuv::model::unwrap_model_with_seams(&model, &params, together, &seams), None),
             };
             let _ = tx.send(out);
             ctx.request_repaint();
@@ -818,6 +911,28 @@ impl EasyUvApp {
             }
         }
         ui.separator();
+        if item(ui, has_isl, "Déplier la sélection UV", "U") {
+            ui.close();
+            self.unwrap_uv_selection();
+        }
+        let has_edges = self.scene.as_ref().is_some_and(|s| !s.selected_mesh_edges().is_empty());
+        for (label, op) in [("Couper (arêtes)", SeamOp::Cut), ("Coudre (arêtes)", SeamOp::Sew), ("Marquer la couture", SeamOp::Mark(true)), ("Retirer la marque", SeamOp::Mark(false))] {
+            if item(ui, has_edges, label, "") {
+                ui.close();
+                self.seam_op(op);
+            }
+        }
+        ui.menu_button("Mode de sélection", |ui| {
+            let mode = self.scene.as_ref().map_or(SelectMode::Island, |s| s.sel_mode);
+            for m in SelectMode::ALL {
+                if ui.add(egui::Button::selectable(mode == m, m.label()).shortcut_text(m.key())).clicked() {
+                    ui.close();
+                    if let Some(s) = &mut self.scene {
+                        s.set_select_mode(m);
+                    }
+                }
+            }
+        });
         ui.menu_button("Outil actif", |ui| {
             for t in UvTool::ALL {
                 if ui.add(egui::Button::selectable(self.uv_edit.tool == t, t.label()).shortcut_text(t.key())).clicked() {
@@ -860,14 +975,157 @@ impl EasyUvApp {
         self.status = format!("{label} : {n} îlot(s) — Ctrl+Z pour annuler");
     }
 
+    /// Dépliage intelligent des seules faces sélectionnées dans l'éditeur UV (annulable).
+    fn unwrap_uv_selection(&mut self) {
+        if self.job.is_some() || self.scene.is_none() {
+            return;
+        }
+        self.snapshot();
+        let params = self.effective_params();
+        let ts = self.params.texture_size;
+        match self.scene.as_mut().unwrap().unwrap_selection(&params, ts) {
+            Ok(msg) => self.status = format!("{msg} — Ctrl+Z pour annuler"),
+            Err(e) => {
+                self.undo.pop();
+                self.status = e;
+            }
+        }
+    }
+
+    /// Outils de couture sur les arêtes sélectionnées (annulables).
+    fn seam_op(&mut self, op: SeamOp) {
+        if self.scene.is_none() {
+            return;
+        }
+        self.snapshot();
+        let params = self.effective_params();
+        let ts = self.params.texture_size;
+        let s = self.scene.as_mut().unwrap();
+        let res = match op {
+            SeamOp::Cut => s.cut_selected(&params, ts),
+            SeamOp::Sew => s.sew_selected(ts),
+            SeamOp::Mark(on) => match s.mark_selected_seams(on) {
+                0 => Err("Sélectionnez d'abord des arêtes (mode Arêtes, touche 2 ; double-clic : boucle)".into()),
+                n if on => Ok(format!("{n} arête(s) marquée(s) comme couture : le prochain dépliage les coupera")),
+                n => Ok(format!("Marque de couture retirée sur {n} arête(s)")),
+            },
+            SeamOp::ClearAll => {
+                let n = s.marked_seams.len();
+                s.marked_seams.clear();
+                s.touch();
+                Ok(format!("{n} marque(s) de couture effacée(s)"))
+            }
+        };
+        match res {
+            Ok(m) => self.status = m,
+            Err(e) => {
+                self.undo.pop();
+                self.status = e;
+            }
+        }
+    }
+
+    /// Barre d'icônes de l'éditeur UV : modes de sélection, outils, score en direct.
+    fn uv_header_bar(&mut self, ui: &mut egui::Ui, header: egui::Rect) {
+        let r = egui::Rect::from_min_max(egui::pos2(header.right() - 420.0, header.top() + 2.0), egui::pos2(header.right() - 6.0, header.bottom() - 2.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                self.score_badge(ui);
+                ui.add_space(6.0);
+                for t in UvTool::ALL.iter().rev() {
+                    if icons::button(ui, tool_icon(*t), self.uv_edit.tool == *t, t.label(), t.key(), t.hint()).clicked() {
+                        self.uv_edit.tool = *t;
+                    }
+                }
+                ui.add_space(6.0);
+                let mode = self.scene.as_ref().map_or(SelectMode::Island, |s| s.sel_mode);
+                for m in SelectMode::ALL.iter().rev() {
+                    if icons::button(ui, mode_icon(*m), mode == *m, &format!("Sélection : {}", m.label()), m.key(), mode_help(*m)).clicked() {
+                        if let Some(s) = &mut self.scene {
+                            s.set_select_mode(*m);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// Score UV en direct (recalculé quand les UV changent, au plus 5 fois par seconde).
+    fn update_score(&mut self, ctx: &egui::Context) {
+        let Some(s) = &self.scene else {
+            self.score = None;
+            return;
+        };
+        let Some(uv) = &s.uv else {
+            self.score = None;
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        if self.score_gen == Some(s.generation) || now - self.score_time < 0.2 {
+            if self.score_gen != Some(s.generation) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            return;
+        }
+        let res = if s.model.mesh.face_count() > 40_000 { 128 } else { 256 };
+        self.score = Some(easyuv::metrics::uv_score(&s.model.mesh, &uv.corner_uv, &s.face_island, uv.stats.seam_length, res));
+        self.score_gen = Some(s.generation);
+        self.score_time = now;
+    }
+
+    fn score_badge(&mut self, ui: &mut egui::Ui) {
+        let Some(sc) = &self.score else { return };
+        let col = score_color(sc.total);
+        let txt = RichText::new(format!("Score {:.0}", sc.total)).strong().color(Color32::BLACK);
+        let resp = ui.add(egui::Button::new(txt).fill(col).min_size(egui::vec2(74.0, 20.0)));
+        let sc = sc.clone();
+        resp.on_hover_ui(|ui| score_details(ui, &sc));
+    }
+
     /// Panneau et menus : outils d'îlots façon Maya UV Toolkit / RizomUV.
     fn uv_toolkit(&mut self, ui: &mut egui::Ui) {
         use uvtools::{Align, Islands};
         let has_isl = self.scene.as_ref().is_some_and(|s| s.has_island_selection());
-        ui.label(RichText::new("Pinceaux et outils (Q, 1 à 5 dans l'éditeur UV)").small().color(theme::TEXT_DIM));
+        ui.label(RichText::new("Sélection (1 à 4) et outils (Q, Maj+1 à Maj+5) — survolez une icône pour son aperçu").small().color(theme::TEXT_DIM));
         ui.horizontal_wrapped(|ui| {
+            let mode = self.scene.as_ref().map_or(SelectMode::Island, |s| s.sel_mode);
+            for m in SelectMode::ALL {
+                if icons::button(ui, mode_icon(m), mode == m, &format!("Sélection : {}", m.label()), m.key(), mode_help(m)).clicked() {
+                    if let Some(s) = &mut self.scene {
+                        s.set_select_mode(m);
+                    }
+                }
+            }
+            ui.add_space(8.0);
             for t in UvTool::ALL {
-                ui.selectable_value(&mut self.uv_edit.tool, t, t.label()).on_hover_text(format!("{}\n{}", t.key(), t.hint()));
+                if icons::button(ui, tool_icon(t), self.uv_edit.tool == t, t.label(), t.key(), t.hint()).clicked() {
+                    self.uv_edit.tool = t;
+                }
+            }
+        });
+        ui.label(RichText::new(format!("{} : {}", self.uv_edit.tool.label(), self.uv_edit.tool.hint())).small());
+        // coutures et dépliage de la sélection
+        ui.horizontal_wrapped(|ui| {
+            let edges = self.scene.as_ref().map_or(0, |s| s.selected_mesh_edges().len());
+            ui.label(RichText::new(format!("Coutures ({edges} arête(s))")).color(theme::TEXT_DIM));
+            let items: [(Icon, &str, &str, SeamOp); 4] = [
+                (Icon::Cut, "Couper", "Les arêtes sélectionnées deviennent des coutures et les îlots traversés sont redépliés.", SeamOp::Cut),
+                (Icon::Sew, "Coudre", "Rapproche l'îlot voisin, soude les arêtes sélectionnées puis détend l'îlot recousu (Move and Sew de Maya).", SeamOp::Sew),
+                (Icon::Mark, "Marquer la couture", "Les arêtes sélectionnées seront coupées à chaque dépliage (U), comme Mark Seam de Blender.", SeamOp::Mark(true)),
+                (Icon::Edge, "Retirer la marque", "Les arêtes sélectionnées ne sont plus des coutures imposées.", SeamOp::Mark(false)),
+            ];
+            for (icon, title, help, op) in items {
+                if icons::button(ui, icon, false, title, "", help).clicked() {
+                    self.seam_op(op);
+                }
+            }
+            let marked = self.scene.as_ref().map_or(0, |s| s.marked_seams.len());
+            if marked > 0 && ui.small_button(format!("Effacer les {marked} marques")).clicked() {
+                self.seam_op(SeamOp::ClearAll);
+            }
+            if icons::button(ui, Icon::Unwrap, false, "Déplier la sélection UV", "U", "Dépliage intelligent des seules faces sélectionnées ; le reste ne bouge pas.").clicked() {
+                self.unwrap_uv_selection();
             }
         });
         if self.uv_edit.tool.brush().is_some() {
@@ -1184,7 +1442,7 @@ impl EasyUvApp {
     fn status_bar(&mut self, root: &mut egui::Ui) {
         // aide contextuelle, comme la barre d'état de Blender : elle suit la vue sous le pointeur
         let hints = if self.pointer_over_uv(root.ctx()) {
-            "Clic / Maj+clic / rectangle : îlots   Glisser : déplacer   G R S : transformer   A : tout   F : cadrer   Q, 1 à 5 : outils et pinceaux   [ ] : rayon   Molette : zoom   Clic molette : vue"
+            "1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic / rectangle : sélection   Glisser, G R S : transformer   U : déplier la sélection   Q, Maj+1 à 5 : outils   [ ] : rayon   Molette : zoom"
         } else {
             "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   U : déplier   F : cadrer la sélection"
         };
@@ -1387,14 +1645,21 @@ impl EasyUvApp {
                         let busy = self.job.is_some();
                         ui.add_enabled_ui(!busy && self.scene.is_some(), |ui| {
                             let n_sel = self.scene.as_ref().map_or(0, |s| s.selection().len());
-                            let label = if busy {
-                                "Dépliage…".to_string()
-                            } else if n_sel > 0 {
-                                format!("Déplier la sélection ({n_sel})  (U)")
-                            } else {
-                                "Déplier tout  (U)".to_string()
-                            };
-                            if primary_button(ui, &label).clicked() {
+                            let uv_faces = self.scene.as_ref().filter(|s| s.uv.is_some() && s.has_island_selection()).map_or(0, |s| s.selected_faces().len());
+                            let objects = if n_sel > 0 { format!("Déplier les objets sélectionnés ({n_sel})") } else { "Déplier tout".to_string() };
+                            if busy {
+                                primary_button(ui, "Dépliage…");
+                            } else if uv_faces > 0 {
+                                // une sélection dans l'éditeur UV : U ne redéplie qu'elle
+                                if primary_button(ui, &format!("Déplier la sélection UV ({uv_faces} faces)  (U)")).on_hover_ui(|ui| {
+                                    icons::tooltip(ui, Icon::Unwrap, "Déplier la sélection UV", "U", "Dépliage intelligent des seules faces sélectionnées (îlots ou faces). Le résultat est rangé dans la place libre, à la densité des autres îlots ; les coutures marquées sont respectées.");
+                                }).clicked() {
+                                    self.unwrap_uv_selection();
+                                }
+                                if ui.button(format!("{objects}  (Maj+U)")).clicked() {
+                                    self.start_unwrap(ui.ctx());
+                                }
+                            } else if primary_button(ui, &format!("{objects}  (U)")).clicked() {
                                 self.start_unwrap(ui.ctx());
                             }
                         });
@@ -1584,6 +1849,9 @@ impl EasyUvApp {
                         }
                     });
 
+                    if let Some(sc) = self.score.clone() {
+                        section(ui, "Score UV (en direct)", true, |ui| score_details(ui, &sc));
+                    }
                     if let Some(uv) = self.scene.as_ref().and_then(|s| s.uv.as_ref()) {
                         section(ui, "Statistiques", true, |ui| {
                             let s = &uv.stats;
@@ -1729,7 +1997,13 @@ impl eframe::App for EasyUvApp {
         }
         if !ctx.egui_wants_keyboard_input() && !self.uv_edit.busy() {
             if u {
-                self.start_unwrap(ctx);
+                // U : la sélection UV s'il y en a une (comme Blender), sinon les objets ; Maj+U : les objets
+                let shift = ctx.input(|i| i.modifiers.shift);
+                if !shift && self.scene.as_ref().is_some_and(|s| s.uv.is_some() && s.has_island_selection()) {
+                    self.unwrap_uv_selection();
+                } else {
+                    self.start_unwrap(ctx);
+                }
             }
             // comme Blender : F cadre la sélection, Origine tout, dans la vue sous le pointeur
             if f || home {
@@ -1758,6 +2032,7 @@ impl eframe::App for EasyUvApp {
         }
 
         self.object_shortcuts(ctx);
+        self.update_score(ctx);
 
         self.top_bar(root);
         self.status_bar(root);
@@ -1866,6 +2141,7 @@ impl eframe::App for EasyUvApp {
                     };
                     let mut dummy = ViewOptions { shading: self.view.shading, wire: false, seams: false, grid: false, tiling: 1.0 };
                     Self::editor_header(ui, r, &title, &mut dummy, false);
+                    self.uv_header_bar(ui, egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 26.0)));
                 }
                 // séparateur entre les deux vues, déclaré après elles pour passer devant ;
                 // double-clic : partage par défaut

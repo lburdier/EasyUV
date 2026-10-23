@@ -653,6 +653,31 @@ fn damaged(fv: &[Vec<usize>], pos3: &[crate::math::V3], uv: &[V2]) -> usize {
     ratio.iter().zip(&a3).filter(|(r, &a)| a > 0.05 * med3 && **r < 0.15 * med).count()
 }
 
+/// Coutures des UV : arêtes dont les deux côtés sont dans des îlots différents ou n'ont pas
+/// les mêmes UV. Renvoie les arêtes (paires de sommets) et leur longueur totale rapportée à
+/// la racine de l'aire du maillage.
+pub fn uv_seams(mesh: &Mesh, corner_uv: &[[f32; 2]], face_chart: &[u32]) -> (Vec<(u32, u32)>, f64) {
+    let topo = Topology::build(mesh);
+    let mut seams = Vec::new();
+    let mut length = 0.0;
+    for e in &topo.edges {
+        let is_seam = e.faces.len() > 2
+            || (e.faces.len() == 2
+                && (face_chart[e.faces[0].face as usize] != face_chart[e.faces[1].face as usize]
+                    || corner_uv[e.faces[0].ca as usize] != corner_uv[e.faces[1].ca as usize]
+                    || corner_uv[e.faces[0].cb as usize] != corner_uv[e.faces[1].cb as usize]));
+        if is_seam {
+            seams.push(e.key);
+            length += e.length;
+        }
+    }
+    let total: f64 = topo.face_areas.iter().sum();
+    if total > 0.0 {
+        length /= total.sqrt();
+    }
+    (seams, length)
+}
+
 /// Range toutes les UV existantes d'un maillage (sans redéplier) et calcule les
 /// statistiques et coutures comme après un dépliage.
 pub fn pack_existing(mesh: &Mesh, corner_uv: &[[f32; 2]], params: &Params, equalize: bool) -> UvResult {
@@ -660,21 +685,9 @@ pub fn pack_existing(mesh: &Mesh, corner_uv: &[[f32; 2]], params: &Params, equal
     let mut uv = corner_uv.to_vec();
     let (face_chart, n) = uv_islands(mesh, &uv);
     let rep = layout_islands(mesh, &mut uv, &face_chart, None, params, equalize);
-    let topo = Topology::build(mesh);
     let mut stats = Stats { charts: n, coverage: rep.coverage, overflow: rep.overflow, ..Default::default() };
-    let mut seams = Vec::new();
-    for e in &topo.edges {
-        let is_seam = e.faces.len() > 2
-            || (e.faces.len() == 2 && (face_chart[e.faces[0].face as usize] != face_chart[e.faces[1].face as usize] || uv[e.faces[0].ca as usize] != uv[e.faces[1].ca as usize] || uv[e.faces[0].cb as usize] != uv[e.faces[1].cb as usize]));
-        if is_seam {
-            seams.push(e.key);
-            stats.seam_length += e.length;
-        }
-    }
-    let total: f64 = topo.face_areas.iter().sum();
-    if total > 0.0 {
-        stats.seam_length /= total.sqrt();
-    }
+    let (seams, seam_length) = uv_seams(mesh, &uv, &face_chart);
+    stats.seam_length = seam_length;
     stats.seams = seams.len();
     stats.density_px_per_unit = crate::measure_density(mesh, &uv, params.texture_size);
     stats.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
