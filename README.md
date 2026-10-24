@@ -72,8 +72,9 @@ Raccourcis :
 |---|---|
 | `U` | Déplier |
 | `F` / `Origine` | Cadrer la sélection / tout (dans la vue sous le pointeur) |
-| Molette / clic + glisser | Orbite |
-| Maj + glisser / clic droit | Déplacer la vue |
+| Clic + glisser | Sélection par zone : rectangle, lasso ou cercle (`W` pour changer, `[` `]` : rayon du cercle), `Maj` ajoute, `Ctrl` retire. Objets en mode Objet ; sommets, arêtes, faces ou îlots en Édition |
+| `Alt` + glisser / molette cliquée | Orbite |
+| Clic droit glissé / `Maj` + molette cliquée | Déplacer la vue |
 | Molette | Zoom |
 | `Ctrl+O` / `Ctrl+I` / `Ctrl+S` | Ouvrir / importer dans la scène / exporter |
 

@@ -77,6 +77,10 @@ pub struct EasyUvApp {
     /// Rangement : remettre tous les îlots à la même densité de texels.
     pack_equalize: bool,
     uv_edit: UvEditor,
+    /// Sélection par zone en cours dans la vue 3D : (origine écran, mode 0 / 1 / -1) et tracé
+    /// du lasso. La forme est celle de l'éditeur UV (W).
+    zone3d: Option<(egui::Pos2, i32)>,
+    lasso3d: Vec<egui::Pos2>,
     /// Zone de l'éditeur UV (image précédente) : les raccourcis y visent les îlots.
     uv_rect: Option<egui::Rect>,
     learner: Arc<Mutex<Learner>>,
@@ -260,6 +264,8 @@ impl EasyUvApp {
             job_layout: false,
             pack_equalize: true,
             uv_edit: UvEditor::default(),
+            zone3d: None,
+            lasso3d: Vec::new(),
             uv_rect: None,
             learner: Arc::new(Mutex::new(Learner::load(&learn::default_path()))),
             auto_learn: true,
@@ -1233,7 +1239,7 @@ impl EasyUvApp {
             "Mode Édition : sélectionnez d'abord un objet (clic en mode Objet), puis Tab".into()
         } else if on {
             let n = self.scene.as_ref().map_or(0, |s| s.editing.iter().filter(|&&e| e).count());
-            format!("Mode Édition ({n} objet(s)) : clic sur un sommet, une arête ou une face (1 2 3), Alt+clic : boucle, Maj : ajouter, Tab : mode Objet")
+            format!("Mode Édition ({n} objet(s)) : clic ou glisser pour choisir, Tab : mode Objet")
         } else {
             "Mode Objet".into()
         };
@@ -1245,6 +1251,18 @@ impl EasyUvApp {
         let (ctrl, shift, alt) = ui.input(|i| (i.modifiers.command, i.modifiers.shift, i.modifiers.alt));
         if k(egui::Key::Tab) {
             self.toggle_edit_mode();
+        }
+        // sélection par zone : W change de forme, [ ] règlent le rayon du cercle
+        if k(egui::Key::W) && !ctrl && !shift && !alt {
+            let i = SelShape::ALL.iter().position(|&x| x == self.uv_edit.sel_shape).unwrap_or(0);
+            self.uv_edit.sel_shape = SelShape::ALL[(i + 1) % SelShape::ALL.len()];
+            self.status = format!("Sélection par zone : {} (glisser dans la vue 3D ou l'éditeur UV)", self.uv_edit.sel_shape.label());
+        }
+        if k(egui::Key::OpenBracket) {
+            self.uv_edit.radius = (self.uv_edit.radius / 1.15).max(4.0);
+        }
+        if k(egui::Key::CloseBracket) {
+            self.uv_edit.radius = (self.uv_edit.radius * 1.15).min(600.0);
         }
         // vues d'axe : 3 droite, 7 dessus (Ctrl : en face), 5 ortho ; 1 face en mode Objet
         // (en Édition, 1 à 4 choisissent le mode de sélection)
@@ -1300,6 +1318,115 @@ impl EasyUvApp {
             self.seam_op(SeamOp::Mark(!shift));
         }
         let _ = r;
+    }
+
+    /// Sélection par zone dans la vue 3D (clic gauche glissé) : rectangle, lasso ou cercle,
+    /// comme dans l'éditeur UV. Maj : ajouter, Ctrl : retirer. Objets en mode Objet ;
+    /// sommets, arêtes, faces ou îlots en Édition.
+    fn zone_3d_input(&mut self, ui: &egui::Ui, resp: &egui::Response, r: egui::Rect) {
+        let (shift, ctrl, alt, pointer) = ui.input(|i| (i.modifiers.shift, i.modifiers.command, i.modifiers.alt, i.pointer.latest_pos()));
+        if self.scene.is_none() {
+            self.zone3d = None;
+            return;
+        }
+        let shape = self.uv_edit.sel_shape;
+        if resp.drag_started_by(egui::PointerButton::Primary) && !alt {
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
+            let mode = if shift { 1 } else if ctrl { -1 } else { 0 };
+            self.zone3d = Some((origin, mode));
+            self.lasso3d = vec![origin];
+            // cercle sans touche : on repart d'une sélection vide, puis on peint
+            if shape == SelShape::Circle && mode == 0 {
+                self.apply_zone_3d(r, egui::Rect::NOTHING, &|_| false, 0);
+            }
+        }
+        let Some((o, mode)) = self.zone3d else { return };
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(p) = pointer {
+                match shape {
+                    SelShape::Lasso if self.lasso3d.last().is_none_or(|l| (*l - p).length() > 3.0) => self.lasso3d.push(p),
+                    SelShape::Circle => {
+                        let rad = self.uv_edit.radius;
+                        let area = egui::Rect::from_center_size(p, egui::Vec2::splat(rad * 2.0));
+                        self.apply_zone_3d(r, area, &|q| (q - p).length() <= rad, if mode < 0 { -1 } else { 1 });
+                    }
+                    _ => {}
+                }
+            }
+            ui.ctx().request_repaint();
+            return;
+        }
+        self.zone3d = None;
+        match shape {
+            SelShape::Box => {
+                if let Some(p) = pointer {
+                    let area = egui::Rect::from_two_pos(o, p);
+                    self.apply_zone_3d(r, area, &|q| area.contains(q), mode);
+                }
+            }
+            SelShape::Lasso => {
+                let poly: Vec<[f32; 2]> = self.lasso3d.iter().map(|p| [p.x, p.y]).collect();
+                if poly.len() >= 3 {
+                    let area = egui::Rect::from_points(&self.lasso3d);
+                    self.apply_zone_3d(r, area, &|q| uvview::point_in_polygon([q.x, q.y], &poly), mode);
+                }
+            }
+            SelShape::Circle => {}
+        }
+        self.lasso3d.clear();
+    }
+
+    /// Applique une zone de la vue 3D `r` à la sélection (objets, ou éléments en Édition).
+    fn apply_zone_3d(&mut self, r: egui::Rect, area: egui::Rect, inside: &dyn Fn(egui::Pos2) -> bool, mode: i32) {
+        let Some(s) = &mut self.scene else { return };
+        if !self.edit_mode {
+            let hits = self.render.objects_in(area, inside);
+            s.zone_select_objects(&hits, mode);
+            return;
+        }
+        let (verts, faces) = match s.sel_mode {
+            SelectMode::Vertex | SelectMode::Edge => (viewport::vertices_in(r, s, &self.cam, &self.render, area, inside), Vec::new()),
+            SelectMode::Face => {
+                // faces vues dans la zone dont le centre y est aussi (comme Blender)
+                let m = &s.model.mesh;
+                let faces = self
+                    .render
+                    .faces_in(area, inside)
+                    .into_iter()
+                    .filter(|&f| {
+                        let vs = m.face(f);
+                        let c = vs.iter().fold(V3::ZERO, |a, &v| a + m.positions[v as usize]) * (1.0 / vs.len().max(1) as f64);
+                        viewport::screen_pos(&self.cam, r, c).is_some_and(inside)
+                    })
+                    .collect();
+                (Vec::new(), faces)
+            }
+            SelectMode::Island => (Vec::new(), self.render.faces_in(area, inside)),
+        };
+        s.zone_select_3d(&verts, &faces, mode);
+    }
+
+    /// Tracé de la sélection par zone en cours dans la vue 3D.
+    fn draw_zone_3d(&self, ui: &egui::Ui, body: egui::Rect) {
+        let Some((o, mode)) = self.zone3d else { return };
+        let Some(p) = ui.input(|i| i.pointer.latest_pos()) else { return };
+        let painter = ui.painter_at(body);
+        let col = if mode < 0 { theme::SEAM_RED } else { Color32::WHITE };
+        match self.uv_edit.sel_shape {
+            SelShape::Box => {
+                let rr = egui::Rect::from_two_pos(o, p);
+                painter.rect_filled(rr, 0.0, Color32::from_white_alpha(10));
+                painter.rect_stroke(rr, 0.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Inside);
+            }
+            SelShape::Lasso => {
+                let mut pts = self.lasso3d.clone();
+                pts.push(p);
+                painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.0, col)));
+            }
+            SelShape::Circle => {
+                painter.circle_stroke(p, self.uv_edit.radius, egui::Stroke::new(1.0, col));
+            }
+        }
     }
 
     /// Clic dans la vue 3D en mode Édition : sommet, arête, face ou îlot ; Alt : boucle.
@@ -1837,11 +1964,11 @@ impl EasyUvApp {
     fn status_bar(&mut self, root: &mut egui::Ui) {
         // aide contextuelle, comme la barre d'état de Blender : elle suit la vue sous le pointeur
         let hints = if self.edit_mode && !self.pointer_over_uv(root.ctx()) {
-            "Édition (Tab)   1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic : choisir   Alt+clic : boucle   A : tout   L / Ctrl+L : relié   Ctrl+E : couture   U : déplier la sélection"
+            "Édition (Tab)   1 2 3 4 : sommets, arêtes, faces, îlots   Clic / glisser : choisir (W : forme, Maj : ajouter, Ctrl : retirer)   Alt+glisser : orbite   Alt+clic : boucle   A : tout   L : relié   Ctrl+E : couture"
         } else if self.pointer_over_uv(root.ctx()) {
             "1 2 3 4 : sommets, arêtes, faces, îlots   Clic / Maj+clic / rectangle : sélection   Glisser, G R S : transformer   U : déplier la sélection   Q, Maj+1 à 5 : outils   [ ] : rayon   Molette : zoom"
         } else {
-            "Molette/Clic : orbite   Maj+glisser / Clic droit : déplacer   Molette : zoom   Clic : sélectionner   Tab : Édition   U : déplier   F : cadrer la sélection"
+            "Glisser : sélection par zone (W : forme)   Alt+glisser / molette cliquée : orbite   Clic droit glissé : déplacer   Molette : zoom   Clic : sélectionner   Tab : Édition   U : déplier   F : cadrer la sélection"
         };
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(8, 3)))
@@ -2496,6 +2623,7 @@ impl eframe::App for EasyUvApp {
                     if resp.hovered() && !ctx.egui_wants_keyboard_input() {
                         self.view3d_keys(ui, r);
                     }
+                    self.zone_3d_input(ui, &resp, r);
                     if self.edit_mode && resp.clicked() && !on_gizmo {
                         self.edit_click(ui, &resp, r);
                     }
@@ -2523,6 +2651,7 @@ impl eframe::App for EasyUvApp {
                             viewport::draw_vertices(ui, r, s, &self.cam, &self.render, s.sel_mode == SelectMode::Vertex);
                         }
                     }
+                    self.draw_zone_3d(ui, body);
                     let title = if self.edit_mode { format!("{} · Édition", self.cam.title()) } else { self.cam.title() };
                     let (show_title, extra) = self.view3d_header_layout(ui, r, &title);
                     Self::editor_header(ui, r, if show_title { &title } else { "" }, &mut self.view, true);

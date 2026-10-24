@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.8] - 2026-10-24
+
+### Sélection par zone dans la vue 3D
+- **Glisser au clic gauche dans la vue 3D sélectionne par zone** : rectangle, lasso ou cercle, la même forme que dans l'éditeur UV (`W` pour changer, `[` `]` : rayon du cercle). `Maj` ajoute, `Ctrl` retire.
+- En mode Objet, les objets vus dans la zone ; en Édition, les sommets, arêtes, faces (centre dans la zone) ou îlots, seulement ceux qui sont visibles (pas ceux cachés derrière le modèle).
+- **Navigation** : la vue tourne avec `Alt`+glisser ou la molette cliquée ; le clic droit glissé (ou `Maj` + molette cliquée) la déplace toujours.
+
 ## [0.3.7] - 2026-10-24
 
 ### Lisser et rendre droit à l'endroit choisi

@@ -252,6 +252,43 @@ impl RenderCache {
         (id > 0).then(|| id as usize - 1)
     }
 
+    /// Identifiants (objets ou faces, selon `faces`) visibles dans la zone : pixels du dernier
+    /// rendu compris dans `area` et pour lesquels `inside` est vrai.
+    fn ids_in(&self, faces: bool, area: Rect, inside: &dyn Fn(Pos2) -> bool) -> Vec<usize> {
+        if self.w == 0 {
+            return Vec::new();
+        }
+        let buf = if faces { &self.faces } else { &self.ids };
+        let (sx, sy) = (self.rect.width() / self.w as f32, self.rect.height() / self.h as f32);
+        let area = area.intersect(self.rect);
+        let x0 = ((area.left() - self.rect.left()) / sx).floor().max(0.0) as usize;
+        let x1 = (((area.right() - self.rect.left()) / sx).ceil() as usize).min(self.w);
+        let y0 = ((area.top() - self.rect.top()) / sy).floor().max(0.0) as usize;
+        let y1 = (((area.bottom() - self.rect.top()) / sy).ceil() as usize).min(self.h);
+        let mut seen = std::collections::HashSet::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let id = buf[y * self.w + x];
+                if id > 0 && !seen.contains(&id) && inside(Pos2::new(self.rect.left() + (x as f32 + 0.5) * sx, self.rect.top() + (y as f32 + 0.5) * sy)) {
+                    seen.insert(id);
+                }
+            }
+        }
+        let mut v: Vec<usize> = seen.into_iter().map(|id| id as usize - 1).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Objets visibles dans la zone (sélection par zone en mode Objet).
+    pub fn objects_in(&self, area: Rect, inside: &dyn Fn(Pos2) -> bool) -> Vec<usize> {
+        self.ids_in(false, area, inside)
+    }
+
+    /// Faces visibles dans la zone.
+    pub fn faces_in(&self, area: Rect, inside: &dyn Fn(Pos2) -> bool) -> Vec<usize> {
+        self.ids_in(true, area, inside)
+    }
+
     /// Face visible sous le point écran `pos`.
     pub fn pick_face(&self, pos: Pos2) -> Option<usize> {
         if self.w == 0 || !self.rect.contains(pos) {
@@ -275,6 +312,23 @@ pub fn screen_pos(cam: &Camera, rect: Rect, p: V3) -> Option<Pos2> {
     }
     let c = rect.center();
     Some(Pos2::new(c.x + (d.dot(b.right) / z * f) as f32, c.y - (d.dot(b.up) / z * f) as f32))
+}
+
+/// Sommets visibles d'objets en Édition dont la position écran est dans la zone.
+pub fn vertices_in(rect: Rect, scene: &Scene, cam: &Camera, cache: &RenderCache, area: Rect, inside: &dyn Fn(Pos2) -> bool) -> Vec<u32> {
+    let m = &scene.model.mesh;
+    let mut out = Vec::new();
+    for (v, p) in m.positions.iter().enumerate() {
+        let Some(q) = screen_pos(cam, rect, *p) else { continue };
+        if !area.contains(q) || !rect.contains(q) || !inside(q) {
+            continue;
+        }
+        // caché derrière une autre face : non (comme les points dessinés en Édition)
+        if cache.pick_face(q).is_some_and(|f| m.face(f).contains(&(v as u32)) && scene.object_editable(scene.face_object[f] as usize)) {
+            out.push(v as u32);
+        }
+    }
+    out
 }
 
 /// Mode Édition : points des sommets (orange s'ils sont sélectionnés), seulement ceux qui
@@ -367,9 +421,11 @@ pub fn handle_input(ui: &egui::Ui, resp: &egui::Response, cam: &mut Camera, rect
             i.pointer.secondary_down(),
         )
     });
-    if resp.dragged() && (mmb || lmb || rmb) {
+    // le clic gauche glissé sélectionne par zone ; Alt+glisser ou la molette cliquée tourne
+    let alt = ui.input(|i| i.modifiers.alt);
+    if resp.dragged() && (mmb || (lmb && alt) || rmb) {
         let d = resp.drag_delta();
-        if shift || rmb {
+        if (shift && !lmb) || rmb {
             let b = cam.basis();
             let k = cam.dist * (cam.fov * 0.5).tan() * 2.0 / rect.height().max(1.0) as f64;
             cam.target = cam.target - b.right * (d.x as f64 * k) + b.up * (d.y as f64 * k);

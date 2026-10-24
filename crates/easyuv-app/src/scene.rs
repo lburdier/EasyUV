@@ -226,6 +226,27 @@ impl Scene {
         self.touch();
     }
 
+    /// Sélection par zone des objets (vue 3D, mode Objet) : `hits` sont les objets vus dans
+    /// la zone. `mode` : 0 remplace, 1 ajoute, -1 retire.
+    pub fn zone_select_objects(&mut self, hits: &[usize], mode: i32) {
+        if mode == 0 {
+            self.selected.iter_mut().for_each(|s| *s = false);
+        }
+        for &i in hits {
+            if i < self.len() && !self.hidden[i] {
+                self.selected[i] = mode >= 0;
+            }
+        }
+        if mode >= 0 {
+            if let Some(&i) = hits.iter().find(|&&i| i < self.len() && !self.hidden[i]) {
+                if !self.selected.get(self.active).copied().unwrap_or(false) {
+                    self.active = i;
+                }
+            }
+        }
+        self.touch();
+    }
+
     pub fn select_all(&mut self, on: bool) {
         for i in 0..self.len() {
             self.selected[i] = on && !self.hidden[i];
@@ -1182,6 +1203,35 @@ impl Scene {
         self.touch();
     }
 
+    /// Sélection par zone dans la vue 3D, en mode Édition : `verts` (sommets visibles dans la
+    /// zone) en modes sommets et arêtes, `faces` (faces visibles dans la zone) en modes faces
+    /// et îlots. Seuls les objets en Édition comptent. `mode` : 0 remplace, 1 ajoute, -1 retire.
+    pub fn zone_select_3d(&mut self, verts: &[u32], faces: &[usize], mode: i32) {
+        if mode == 0 {
+            self.corner_sel.iter_mut().for_each(|s| *s = false);
+            self.island_selected.iter_mut().for_each(|s| *s = false);
+        }
+        let on = mode >= 0;
+        let faces: Vec<usize> = faces.iter().copied().filter(|&f| f < self.face_object.len() && self.face_visible(f)).collect();
+        match self.sel_mode {
+            SelectMode::Vertex | SelectMode::Edge => self.select_vertices(verts, on),
+            SelectMode::Face => {
+                let vs: Vec<u32> = faces.iter().flat_map(|&f| self.model.mesh.face(f).iter().copied()).collect();
+                self.select_vertices(&vs, on);
+            }
+            SelectMode::Island => {
+                if self.uv.is_some() {
+                    for &f in &faces {
+                        if let Some(sel) = self.island_selected.get_mut(self.face_island[f] as usize) {
+                            *sel = on;
+                        }
+                    }
+                }
+            }
+        }
+        self.touch();
+    }
+
     /// Alt+clic : boucle d'arêtes passant par l'arête la plus proche du clic, sur la face `f`.
     pub fn loop_3d(&mut self, f: usize, p: [f32; 2], screen: impl Fn(u32) -> Option<[f32; 2]>, extend: bool) -> usize {
         let vs = self.model.mesh.face(f).to_vec();
@@ -1928,6 +1978,36 @@ mod tests {
         s.set_select_mode(SelectMode::Island);
         s.click_island(Some(i), false);
         assert!(s.selection_tool(SelectionOp::Smooth, 2048).is_ok());
+    }
+
+    #[test]
+    fn zone_select_in_3d() {
+        let mut s = scene();
+        // objets : remplacer, ajouter, retirer ; un objet masqué n'est jamais pris
+        s.hidden[2] = true;
+        s.zone_select_objects(&[0, 2], 0);
+        assert_eq!(s.selected, vec![true, false, false]);
+        s.zone_select_objects(&[1], 1);
+        assert_eq!(s.selected, vec![true, true, false]);
+        s.zone_select_objects(&[0], -1);
+        assert_eq!(s.selected, vec![false, true, false]);
+        // Édition (tore seul) : les faces de la zone, et rien sur le cube qui n'est pas édité
+        s.hidden[2] = false;
+        s.click(Some(1), false);
+        s.enter_edit();
+        s.set_select_mode(SelectMode::Face);
+        let (a, b) = (s.model.objects[1].face_start, s.model.objects[0].face_start);
+        s.zone_select_3d(&[], &[a, a + 1, b], 0);
+        assert!(s.face_selected(a) && s.face_selected(a + 1));
+        assert!(!s.face_selected(b), "le cube n'est pas en Édition");
+        s.zone_select_3d(&[], &[a], -1);
+        assert!(!s.face_selected(a), "Ctrl retire la face");
+        // sommets : ceux de la zone seulement
+        s.set_select_mode(SelectMode::Vertex);
+        let v = s.model.mesh.face(a + 5)[0];
+        s.zone_select_3d(&[v], &[], 0);
+        let m = &s.model.mesh;
+        assert!((0..m.corners.len()).all(|c| s.corner_sel[c] == (m.corners[c] == v)));
     }
 
     #[test]

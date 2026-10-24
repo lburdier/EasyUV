@@ -553,7 +553,7 @@ pub fn release_text(scene: &mut Scene) -> String {
 }
 
 /// Point dans un polygone (règle pair-impair).
-fn point_in_polygon(q: [f32; 2], poly: &[[f32; 2]]) -> bool {
+pub fn point_in_polygon(q: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let mut inside = false;
     let n = poly.len();
     for i in 0..n {
