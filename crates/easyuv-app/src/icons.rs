@@ -27,6 +27,10 @@ pub enum Icon {
     Circle,
     Angle,
     Project,
+    Smooth,
+    Line,
+    LineU,
+    LineV,
 }
 
 /// Dessine l'icône dans `r`.
@@ -173,6 +177,37 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, col: Color32) {
             }
             p.rect_stroke(Rect::from_min_max(at(0.5, -0.6), at(0.85, 0.6)), 0.0, Stroke::new(1.5, theme::ACCENT_ORANGE), egui::StrokeKind::Middle);
         }
+        Icon::Smooth => {
+            // ligne en dents de scie, et la même lissée
+            let zig: Vec<Pos2> = (0..=8).map(|i| at(-0.8 + 0.2 * i as f32, -0.45 + if i % 2 == 0 { -0.2 } else { 0.2 })).collect();
+            p.add(egui::Shape::line(zig, thin));
+            let soft: Vec<Pos2> = (0..=16).map(|i| {
+                let x = -0.8 + 0.1 * i as f32;
+                at(x, 0.45 - 0.15 * (x * 2.5).cos())
+            }).collect();
+            p.add(egui::Shape::line(soft, Stroke::new(2.0, theme::ACCENT_ORANGE)));
+        }
+        Icon::Line | Icon::LineU | Icon::LineV => {
+            // ligne ondulée (fine), et la même rendue droite (orange)
+            let (a, b) = match icon {
+                Icon::LineU => (at(-0.8, 0.35), at(0.8, 0.35)),
+                Icon::LineV => (at(0.35, -0.8), at(0.35, 0.8)),
+                _ => (at(-0.8, 0.6), at(0.6, -0.8)),
+            };
+            let wave: Vec<Pos2> = (0..=10).map(|i| {
+                let t = i as f32 / 10.0;
+                let w = 0.25 * (t * 9.0).sin();
+                match icon {
+                    Icon::LineU => at(-0.8 + 1.6 * t, -0.35 + w),
+                    Icon::LineV => at(-0.35 + w, -0.8 + 1.6 * t),
+                    _ => at(-0.8 + 1.4 * t + w * 0.5, 0.6 - 1.4 * t + w * 0.5),
+                }
+            }).collect();
+            p.add(egui::Shape::line(wave, thin));
+            p.line_segment([a, b], Stroke::new(2.0, theme::ACCENT_ORANGE));
+            p.circle_filled(a, 2.2, col);
+            p.circle_filled(b, 2.2, col);
+        }
         Icon::Angle => {
             // deux pans qui font un angle, l'arête vive en orange
             p.line_segment([at(-0.85, 0.6), at(0.0, -0.1)], st);
@@ -293,6 +328,17 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
                 seen + (f - seen) * t
             }
             Icon::Grid => f + egui::vec2((j as f32 * 2.1 + i as f32).sin() * cell.x * 0.18, (i as f32 * 1.4).sin() * cell.y * 0.35) * (1.0 - t),
+            // seules les faces choisies (colonnes 2 à 5) s'adoucissent
+            Icon::Smooth if (2..=6).contains(&i) => f + jitter(i, j) * (1.0 - t),
+            // la rangée 1 ondule puis devient droite, ses voisines suivent à moitié
+            Icon::Line | Icon::LineU => {
+                let k = match j { 1 => 1.0, 0 | 2 => 0.5, _ => 0.2 };
+                f + egui::vec2(0.0, (i as f32 * 1.3).sin() * cell.y * 0.4 * k * (1.0 - t))
+            }
+            Icon::LineV => {
+                let k = match i { 4 => 1.0, 3 | 5 => 0.5, _ => 0.0 };
+                f + egui::vec2((j as f32 * 2.0).sin() * cell.x * 0.45 * k * (1.0 - t), 0.0)
+            }
             Icon::Orient => {
                 let (sn, cs) = (0.5 * (1.0 - t)).sin_cos();
                 let v = f - center;
@@ -328,6 +374,9 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
             brush = Some((Pos2::new(area.left() + area.width() * t, center.y), cell.y * 0.9));
         }
         Icon::Angle => highlight.extend((0..ny).flat_map(|j| [(3, j, 3, j + 1), (6, j, 6, j + 1)])),
+        Icon::Smooth => fill_cells.extend((2..6).flat_map(|i| (0..ny).map(move |j| (i, j)))),
+        Icon::Line | Icon::LineU => highlight.extend((0..nx).map(|i| (i, 1, i + 1, 1))),
+        Icon::LineV => highlight.extend((0..ny).map(|j| (4, j, 4, j + 1))),
     }
     // faces surlignées
     for &(i, j) in &fill_cells {
@@ -405,6 +454,10 @@ pub fn preview(ui: &mut egui::Ui, icon: Icon) {
         Icon::Lasso => "tracer la zone à main levée",
         Icon::Circle => "peindre la sélection",
         Icon::Angle => "arêtes vives, ou faces d'un même pan",
+        Icon::Smooth => "la sélection s'adoucit, le reste ne bouge pas",
+        Icon::Line => "la ligne choisie devient droite",
+        Icon::LineU => "la ligne choisie devient horizontale",
+        Icon::LineV => "la ligne choisie devient verticale",
     };
     p.text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, caption, egui::FontId::proportional(11.0), theme::TEXT_DIM);
 }

@@ -1,6 +1,6 @@
 use crate::icons::{self, Icon};
 use crate::io;
-use crate::scene::{Scene, SelectMode};
+use crate::scene::{Scene, SelectMode, SelectionOp};
 use crate::theme::{self, primary_button, section};
 use crate::update::{self, Release};
 use crate::uvview::{self, SelShape, UvCache, UvCamera, UvEditor, UvEvent, UvTool};
@@ -8,7 +8,7 @@ use crate::raster::Mips;
 use crate::viewport::{self, Camera, RenderCache, Shading, ViewOptions, TEX_SIZE};
 use easyuv::checker::{generate_rgba8, CheckerStyle};
 use easyuv::learn::{self, Learner};
-use easyuv::uvtools;
+use easyuv::uvtools::{self, LineAxis};
 use easyuv::math::V3;
 use easyuv::mesh::Mesh;
 use easyuv::model::Model;
@@ -216,6 +216,23 @@ fn score_details(ui: &mut egui::Ui, sc: &easyuv::metrics::UvScore) {
 
 /// Outil d'îlots : (maillage, UV des coins, îlot de chaque face, îlots visés).
 type UvOp = Box<dyn Fn(&easyuv::mesh::Mesh, &mut [[f32; 2]], &[u32], &[usize])>;
+
+/// Outils de sélection (lisser, rendre droit) et leur explication.
+const SELECTION_OPS: [(SelectionOp, &str); 4] = [
+    (SelectionOp::Smooth, "Lisse la sélection (sommets, arêtes, faces ou îlots) : les arêtes reprennent leur longueur 3D, les ondulations disparaissent. Le reste ne bouge pas ; recommencez pour lisser davantage."),
+    (SelectionOp::Line(LineAxis::Free), "Sommets ou arêtes : la ligne choisie devient droite d'un bout à l'autre. Faces : elles se rangent en grille droite. Les faces autour suivent."),
+    (SelectionOp::Line(LineAxis::U), "La ligne de sommets ou d'arêtes choisie devient droite et horizontale (le long de U). Les faces autour suivent."),
+    (SelectionOp::Line(LineAxis::V), "La ligne de sommets ou d'arêtes choisie devient droite et verticale (le long de V). Les faces autour suivent."),
+];
+
+fn selection_icon(op: SelectionOp) -> Icon {
+    match op {
+        SelectionOp::Smooth => Icon::Smooth,
+        SelectionOp::Line(LineAxis::Free) => Icon::Line,
+        SelectionOp::Line(LineAxis::U) => Icon::LineU,
+        SelectionOp::Line(LineAxis::V) => Icon::LineV,
+    }
+}
 
 const UNDO_LEVELS: usize = 32;
 /// Part de la vue 3D par défaut : Layout, UV Editing.
@@ -909,6 +926,14 @@ impl EasyUvApp {
             ui.close();
             self.straighten_strips();
         }
+        ui.menu_button("Lignes et faces (sélection)", |ui| {
+            for (op, txt) in SELECTION_OPS {
+                if ui.add_enabled(has_isl, egui::Button::new(op.label())).on_hover_text(txt).clicked() {
+                    ui.close();
+                    self.selection_op(op);
+                }
+            }
+        });
         if item(ui, self.scene.is_some(), "Projeter depuis la vue", "") {
             ui.close();
             self.project_view_op(false);
@@ -1019,6 +1044,22 @@ impl EasyUvApp {
             (d, 0) => format!("{d} îlot(s) rendu(s) droit(s) — Ctrl+P pour ranger"),
             (d, k) => format!("{d} îlot(s) rendu(s) droit(s), {k} ignoré(s) : pas une bande, ou le redressement l'aurait abîmé"),
         };
+    }
+
+    /// Lisser ou rendre droit la sélection (ligne, faces), annulable.
+    fn selection_op(&mut self, op: SelectionOp) {
+        if self.scene.is_none() {
+            return;
+        }
+        self.snapshot();
+        let ts = self.params.texture_size;
+        match self.scene.as_mut().unwrap().selection_tool(op, ts) {
+            Ok(m) => self.status = m,
+            Err(e) => {
+                self.undo.pop();
+                self.status = e;
+            }
+        }
     }
 
     /// Outil d'îlots de `easyuv::uvtools` sur la sélection, annulable.
@@ -1455,6 +1496,15 @@ impl EasyUvApp {
             }
             if icons::button(ui, Icon::Unwrap, false, "Déplier la sélection UV", "U", "Dépliage intelligent des seules faces sélectionnées ; le reste ne bouge pas.").clicked() {
                 self.unwrap_uv_selection();
+            }
+        });
+        // lisser, rendre droit : à l'endroit choisi (ligne, faces)
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Lignes et faces").color(theme::TEXT_DIM));
+            for (op, help) in SELECTION_OPS {
+                if icons::button(ui, selection_icon(op), false, op.label(), "clic droit", help).clicked() {
+                    self.selection_op(op);
+                }
             }
         });
         if self.uv_edit.tool.brush().is_some() {

@@ -4,7 +4,7 @@
 bl_info = {
     "name": "EasyUV",
     "author": "Lucas",
-    "version": (0, 3, 6),
+    "version": (0, 3, 7),
     "blender": (4, 2, 0),
     "location": "Vue 3D > Barre laterale (N) > EasyUV",
     "description": "Depliage UV intelligent (Rust) : coutures auto, LSCM + ARAP, densite de texels, damier",

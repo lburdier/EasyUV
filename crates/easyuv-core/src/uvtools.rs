@@ -156,6 +156,17 @@ impl UvGraph {
         self.locked.iter().filter(|&&l| !l).count()
     }
 
+    /// Sommet UV de chaque coin (`usize::MAX` : coin hors du graphe).
+    pub fn vertex_of_corner(&self, n_corners: usize) -> Vec<usize> {
+        let mut v = vec![usize::MAX; n_corners];
+        for (k, cs) in self.corners.iter().enumerate() {
+            for &c in cs {
+                v[c] = k;
+            }
+        }
+        v
+    }
+
     pub fn len(&self) -> usize {
         self.corners.len()
     }
@@ -267,6 +278,205 @@ fn straighten_target(g: &UvGraph, p: &[V2], i: usize) -> Option<V2> {
         wsum += w;
     }
     (wsum > 1e-9).then(|| acc * (1.0 / wsum))
+}
+
+// ---------------------------------------------------------------------------------------
+// Outils de sélection : lisser, rendre droit une ligne ou des faces
+// ---------------------------------------------------------------------------------------
+
+/// Lisse les sommets choisis (`sel`) : chaque arête revient vers sa longueur 3D, ce qui
+/// efface ondulations et étirement. Les autres sommets et les sommets figés ne bougent pas.
+pub fn smooth(g: &UvGraph, pts: &mut [V2], sel: &[bool], iterations: usize) {
+    for _ in 0..iterations {
+        let old = pts.to_vec();
+        for i in 0..pts.len() {
+            if !sel[i] || g.locked[i] {
+                continue;
+            }
+            if let Some(t) = relax_target(g, &old, i) {
+                pts[i] = old[i] + (t - old[i]) * 0.5;
+            }
+        }
+    }
+}
+
+/// Direction d'une ligne redressée.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineAxis {
+    /// Droite d'un bout à l'autre, sans changer de direction.
+    Free,
+    /// Horizontale (le long de U).
+    U,
+    /// Verticale (le long de V).
+    V,
+}
+
+/// Chaînes de sommets choisis reliés par des arêtes (composantes connexes de `sel`).
+fn chains(g: &UvGraph, sel: &[bool]) -> Vec<Vec<usize>> {
+    let mut seen = vec![false; g.len()];
+    let mut out = Vec::new();
+    for s in 0..g.len() {
+        if !sel[s] || seen[s] {
+            continue;
+        }
+        let mut comp = vec![s];
+        seen[s] = true;
+        let mut k = 0;
+        while k < comp.len() {
+            let i = comp[k];
+            k += 1;
+            for &(j, _) in &g.nbrs[i] {
+                if sel[j] && !seen[j] {
+                    seen[j] = true;
+                    comp.push(j);
+                }
+            }
+        }
+        out.push(comp);
+    }
+    out
+}
+
+/// Chemin simple d'une chaîne (d'un bout à l'autre), ou None si elle se referme ou se
+/// ramifie.
+fn as_path(g: &UvGraph, sel: &[bool], comp: &[usize]) -> Option<Vec<usize>> {
+    let deg = |i: usize| g.nbrs[i].iter().filter(|&&(j, _)| sel[j]).count();
+    if comp.iter().any(|&i| deg(i) > 2) {
+        return None;
+    }
+    let start = *comp.iter().find(|&&i| deg(i) == 1)?;
+    let mut path = vec![start];
+    let mut prev = usize::MAX;
+    let mut cur = start;
+    while let Some(&(next, _)) = g.nbrs[cur].iter().find(|&&(j, _)| sel[j] && j != prev) {
+        path.push(next);
+        prev = cur;
+        cur = next;
+    }
+    (path.len() == comp.len()).then_some(path)
+}
+
+/// Rend droites les lignes de sommets choisis : chaque chaîne va en ligne droite d'un bout
+/// à l'autre, ses sommets espacés selon les longueurs 3D. `axis` la couche à l'horizontale
+/// ou à la verticale autour de son milieu. Une sélection qui se referme ou se ramifie est
+/// projetée sur sa droite moyenne. Renvoie le nombre de lignes redressées.
+pub fn straighten_lines(g: &UvGraph, pts: &mut [V2], sel: &[bool], axis: LineAxis) -> usize {
+    let mut done = 0;
+    for comp in chains(g, sel) {
+        if comp.len() < 2 {
+            continue;
+        }
+        let unit = |d: V2| {
+            let (s, l) = match axis {
+                LineAxis::Free => return d * (1.0 / len2(d).max(1e-300)),
+                LineAxis::U => (d.x, V2::new(1.0, 0.0)),
+                LineAxis::V => (d.y, V2::new(0.0, 1.0)),
+            };
+            if s < 0.0 { l * -1.0 } else { l }
+        };
+        match as_path(g, sel, &comp) {
+            Some(path) => {
+                let (a, b) = (pts[path[0]], pts[*path.last().unwrap()]);
+                let len = len2(b - a);
+                if len < 1e-12 {
+                    continue;
+                }
+                let (mid, dir) = ((a + b) * 0.5, unit(b - a));
+                let (a, b) = if axis == LineAxis::Free { (a, b) } else { (mid - dir * (len * 0.5), mid + dir * (len * 0.5)) };
+                // abscisse de chaque sommet : longueur 3D parcourue depuis le début
+                let mut t = vec![0.0; path.len()];
+                for k in 1..path.len() {
+                    let l = g.nbrs[path[k - 1]].iter().find(|&&(j, _)| j == path[k]).map_or(0.0, |x| x.1);
+                    t[k] = t[k - 1] + l;
+                }
+                let total = t.last().copied().unwrap_or(0.0).max(1e-300);
+                for (k, &i) in path.iter().enumerate() {
+                    if !g.locked[i] {
+                        pts[i] = a + (b - a) * (t[k] / total);
+                    }
+                }
+            }
+            None => {
+                // droite moyenne (axe principal) passant par le centre
+                let n = comp.len() as f64;
+                let c = comp.iter().fold(V2::new(0.0, 0.0), |s, &i| s + pts[i]) * (1.0 / n);
+                let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+                for &i in &comp {
+                    let d = pts[i] - c;
+                    sxx += d.x * d.x;
+                    sxy += d.x * d.y;
+                    syy += d.y * d.y;
+                }
+                let ang = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+                let dir = unit(V2::new(ang.cos(), ang.sin()));
+                for &i in &comp {
+                    if !g.locked[i] {
+                        let d = pts[i] - c;
+                        pts[i] = c + dir * (d.x * dir.x + d.y * dir.y);
+                    }
+                }
+            }
+        }
+        done += 1;
+    }
+    done
+}
+
+/// Rend droites des faces : chaque arête de `edges` (paires de sommets du graphe) se couche
+/// sur l'horizontale ou la verticale la plus proche, jusqu'à former une grille. Les
+/// diagonales (45°) pèsent peu. Renvoie le nombre de sommets déplacés.
+pub fn straighten_faces(g: &UvGraph, pts: &mut [V2], edges: &[(usize, usize)], iterations: usize) -> usize {
+    let mut nb: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &(a, b) in edges {
+        nb.entry(a).or_default().push(b);
+        nb.entry(b).or_default().push(a);
+    }
+    let mut verts: Vec<usize> = nb.keys().copied().filter(|&i| !g.locked[i]).collect();
+    verts.sort_unstable();
+    for _ in 0..iterations {
+        let old = pts.to_vec();
+        for &i in &verts {
+            let (mut acc, mut wsum) = (V2::new(0.0, 0.0), 0.0);
+            for &j in &nb[&i] {
+                let d = old[i] - old[j];
+                let dl = len2(d);
+                if dl < 1e-12 {
+                    continue;
+                }
+                let w = ((d.x * d.x - d.y * d.y) / (dl * dl)).abs();
+                let snapped = if d.x.abs() >= d.y.abs() { V2::new(dl.copysign(d.x), 0.0) } else { V2::new(0.0, dl.copysign(d.y)) };
+                acc = acc + (old[j] + snapped) * w;
+                wsum += w;
+            }
+            if wsum > 1e-9 {
+                pts[i] = old[i] + (acc * (1.0 / wsum) - old[i]) * 0.5;
+            }
+        }
+    }
+    verts.len()
+}
+
+/// Détend les sommets proches (à moins de `rings` arêtes) de ceux qui ont bougé (`moved`),
+/// qui eux restent en place : les faces autour d'une ligne redressée la suivent sans se
+/// retourner.
+pub fn relax_around(g: &UvGraph, pts: &mut [V2], moved: &[bool], rings: usize, iterations: usize) {
+    let mut ring = vec![usize::MAX; g.len()];
+    let mut front: Vec<usize> = (0..g.len()).filter(|&i| moved[i]).collect();
+    front.iter().for_each(|&i| ring[i] = 0);
+    for r in 1..=rings {
+        let mut next = Vec::new();
+        for &i in &front {
+            for &(j, _) in &g.nbrs[i] {
+                if ring[j] == usize::MAX {
+                    ring[j] = r;
+                    next.push(j);
+                }
+            }
+        }
+        front = next;
+    }
+    let free: Vec<bool> = (0..g.len()).map(|i| ring[i] != usize::MAX && ring[i] > 0 && !g.locked[i]).collect();
+    smooth(g, pts, &free, iterations);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1246,6 +1456,106 @@ mod tests {
         }
         assert!(err(&pts) < damaged * 0.5, "{} -> {}", damaged, err(&pts));
         g.write(&pts, &mut uv);
+    }
+
+    /// Plan de n × n quads de côté 1 dont les UV ondulent (une seule île).
+    fn wavy_grid(n: u32) -> (Mesh, Vec<[f32; 2]>, UvGraph) {
+        let mut pos = Vec::new();
+        for j in 0..=n {
+            for i in 0..=n {
+                pos.push(V3::new(i as f64, j as f64, 0.0));
+            }
+        }
+        let id = |i: u32, j: u32| j * (n + 1) + i;
+        let faces: Vec<Vec<u32>> = (0..n).flat_map(|j| (0..n).map(move |i| vec![id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)])).collect();
+        let m = Mesh::from_faces(pos, &faces);
+        let uv: Vec<[f32; 2]> = m
+            .corners
+            .iter()
+            .map(|&v| {
+                let p = m.positions[v as usize];
+                let w = 0.15 * ((p.x * 1.7).sin() + (p.y * 2.3).cos());
+                [(p.x * 0.1 + w * 0.1) as f32, (p.y * 0.1 + w * 0.08) as f32]
+            })
+            .collect();
+        let isl = Islands { faces: vec![(0..m.face_count()).collect()], corners: vec![(0..m.corners.len()).collect()] };
+        let g = UvGraph::build(&m, &uv, &isl);
+        (m, uv, g)
+    }
+
+    /// Sommets du graphe sur la rangée j de la grille.
+    fn row(m: &Mesh, g: &UvGraph, n: u32, j: u32) -> Vec<bool> {
+        (0..g.len()).map(|v| m.positions[m.corners[g.corners[v][0]] as usize].y == j as f64 && n > 0).collect()
+    }
+
+    #[test]
+    fn straighten_line_and_axes() {
+        let n = 6;
+        let (m, uv, g) = wavy_grid(n);
+        let sel = row(&m, &g, n, 3);
+        for axis in [LineAxis::Free, LineAxis::U, LineAxis::V] {
+            let mut pts = g.positions(&uv);
+            let before = pts.clone();
+            assert_eq!(straighten_lines(&g, &mut pts, &sel, axis), 1);
+            let line: Vec<usize> = (0..g.len()).filter(|&i| sel[i]).collect();
+            // tous les sommets de la rangée sur une même droite, espacés régulièrement (3D)
+            let (a, b) = (pts[line[0]], pts[line[1]]);
+            let d = b - a;
+            for &i in &line {
+                let e = pts[i] - a;
+                assert!((d.x * e.y - d.y * e.x).abs() < 1e-9, "{axis:?} : sommet hors de la droite");
+            }
+            match axis {
+                LineAxis::U => assert!(line.iter().all(|&i| (pts[i].y - pts[line[0]].y).abs() < 1e-9)),
+                LineAxis::V => assert!(line.iter().all(|&i| (pts[i].x - pts[line[0]].x).abs() < 1e-9)),
+                LineAxis::Free => {}
+            }
+            // le reste n'a pas bougé
+            assert!((0..g.len()).filter(|&i| !sel[i]).all(|i| pts[i] == before[i]));
+        }
+    }
+
+    #[test]
+    fn smooth_and_straighten_faces_reduce_waves() {
+        let n = 6;
+        let (_, uv, g) = wavy_grid(n);
+        let all = vec![true; g.len()];
+        let err = |pts: &[V2]| -> f64 {
+            let mut e = 0.0;
+            for (i, nb) in g.nbrs.iter().enumerate() {
+                for &(j, l) in nb {
+                    e += (len2(pts[i] - pts[j]) / (l * g.scale[g.island[i]]) - 1.0).abs();
+                }
+            }
+            e
+        };
+        let mut pts = g.positions(&uv);
+        let before = err(&pts);
+        smooth(&g, &mut pts, &all, 60);
+        assert!(err(&pts) < before * 0.5, "lisser : {before} -> {}", err(&pts));
+        // rendre droites les faces : chaque arête finit presque horizontale ou verticale
+        let mut pts = g.positions(&uv);
+        let edges: Vec<(usize, usize)> = g.nbrs.iter().enumerate().flat_map(|(i, nb)| nb.iter().filter(move |x| x.0 > i).map(move |x| (i, x.0))).collect();
+        let tilt = |pts: &[V2]| edges.iter().map(|&(a, b)| { let d = pts[b] - pts[a]; d.x.abs().min(d.y.abs()) / len2(d) }).fold(0.0, f64::max);
+        let t0 = tilt(&pts);
+        assert!(straighten_faces(&g, &mut pts, &edges, 200) > 0);
+        assert!(tilt(&pts) < t0 * 0.1, "faces droites : {t0} -> {}", tilt(&pts));
+    }
+
+    #[test]
+    fn relax_around_keeps_moved_vertices() {
+        let n = 6;
+        let (m, uv, g) = wavy_grid(n);
+        let sel = row(&m, &g, n, 3);
+        let mut pts = g.positions(&uv);
+        straighten_lines(&g, &mut pts, &sel, LineAxis::U);
+        let line = pts.clone();
+        relax_around(&g, &mut pts, &sel, 2, 20);
+        assert!((0..g.len()).filter(|&i| sel[i]).all(|i| pts[i] == line[i]));
+        // rangée 0 : à 3 arêtes de la ligne, hors de portée
+        let far = row(&m, &g, n, 0);
+        assert!((0..g.len()).filter(|&i| far[i]).all(|i| pts[i] == line[i]));
+        assert!((0..g.len()).any(|i| pts[i] != line[i]), "rien n'a été détendu autour");
     }
 
     #[test]

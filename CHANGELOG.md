@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.7] - 2026-10-24
+
+### Lisser et rendre droit à l'endroit choisi
+- **Lisser** la sélection (sommets, arêtes, faces ou îlots) : les arêtes reprennent leur longueur 3D, les ondulations disparaissent ; le reste ne bouge pas.
+- **Rendre droit** une ligne de sommets ou d'arêtes (une boucle, par exemple), ou des faces, qui se rangent en grille droite.
+- **Ligne horizontale / verticale** : la ligne choisie devient droite et se couche sur U ou sur V.
+- Les faces autour suivent la ligne redressée sans se retourner ; une opération qui abîmerait des faces est annulée. La zone isolée (`H`) est respectée.
+- Dans le panneau *Outils UV* (rangée *Lignes et faces*), le menu *UV* et le clic droit de l'éditeur UV.
+
 ## [0.3.6] - 2026-10-24
 
 ### Isoler une zone des UV

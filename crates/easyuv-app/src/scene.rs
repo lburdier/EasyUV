@@ -5,6 +5,28 @@ use easyuv::model::Model;
 use easyuv::UvResult;
 use std::collections::HashSet;
 
+/// Outils qui lissent ou redressent la sélection de l'éditeur UV, à l'endroit choisi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionOp {
+    /// Lisser : les arêtes reprennent leur longueur 3D, les ondulations disparaissent.
+    Smooth,
+    /// Rendre droit : une ligne de sommets ou d'arêtes (droite, horizontale, verticale),
+    /// ou des faces (grille, avec `Free`).
+    Line(easyuv::uvtools::LineAxis),
+}
+
+impl SelectionOp {
+    pub fn label(self) -> &'static str {
+        use easyuv::uvtools::LineAxis;
+        match self {
+            SelectionOp::Smooth => "Lisser",
+            SelectionOp::Line(LineAxis::Free) => "Rendre droit",
+            SelectionOp::Line(LineAxis::U) => "Ligne horizontale",
+            SelectionOp::Line(LineAxis::V) => "Ligne verticale",
+        }
+    }
+}
+
 /// Mode de sélection de l'éditeur UV, comme Blender (1 / 2 / 3 / 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SelectMode {
@@ -754,6 +776,96 @@ impl Scene {
             return corners;
         }
         corners.into_iter().filter(|&c| self.isolated[c as usize]).collect()
+    }
+
+    /// Lisser ou rendre droit la sélection, à l'endroit choisi : sommets ou arêtes (une
+    /// ligne), faces (une grille), îlots entiers pour Lisser. Les faces autour suivent et la
+    /// zone isolée est respectée. Une opération qui retournerait des faces est annulée.
+    pub fn selection_tool(&mut self, op: SelectionOp, texture_size: u32) -> Result<String, String> {
+        use easyuv::uvtools::{self, Islands, LineAxis, UvGraph};
+        if self.uv.is_none() {
+            return Err("Dépliez d'abord l'objet (U)".into());
+        }
+        if !self.has_island_selection() {
+            return Err(format!("{} : sélectionnez d'abord des sommets, des arêtes ou des faces (1 à 3)", op.label()));
+        }
+        let mode = self.sel_mode;
+        if matches!(op, SelectionOp::Line(LineAxis::U | LineAxis::V)) && matches!(mode, SelectMode::Face | SelectMode::Island) {
+            return Err(format!("{} : choisissez une ligne de sommets ou d'arêtes (mode 1 ou 2)", op.label()));
+        }
+        let ids = self.selected_island_ids();
+        let m = &self.model.mesh;
+        // copie de travail : la scène reste lisible pendant le calcul
+        let mut cuv = self.uv.as_ref().unwrap().corner_uv.clone();
+        let isl = Islands::new(m, &self.face_island, &ids);
+        let mut g = UvGraph::build(m, &cuv, &isl);
+        if !self.isolated.is_empty() {
+            g.lock_outside(&self.isolated);
+        }
+        let vc = g.vertex_of_corner(m.corners.len());
+        let island_sel = |c: usize| {
+            let f = m.face_start.partition_point(|&s| s <= c).saturating_sub(1);
+            self.island_selected.get(self.face_island[f] as usize).copied().unwrap_or(false)
+        };
+        let mut sel = vec![false; g.len()];
+        for (v, cs) in g.corners.iter().enumerate() {
+            sel[v] = cs.iter().any(|&c| if mode == SelectMode::Island { island_sel(c) } else { self.corner_sel[c] });
+        }
+        if (0..g.len()).all(|v| !sel[v] || g.locked[v]) {
+            return Err(format!("{} : rien à modifier dans la zone isolée (Alt+H pour la libérer)", op.label()));
+        }
+        let faces: Vec<usize> = isl.faces.iter().flatten().copied().collect();
+        let before = uvtools::damaged_faces(m, &cuv, &faces);
+        let mut pts = g.positions(&cuv);
+        let msg = match op {
+            SelectionOp::Smooth => {
+                uvtools::smooth(&g, &mut pts, &sel, 30);
+                format!("Lisser : {} sommet(s) — recommencez pour lisser davantage", sel.iter().filter(|&&s| s).count())
+            }
+            SelectionOp::Line(axis) if mode != SelectMode::Face => {
+                let n = uvtools::straighten_lines(&g, &mut pts, &sel, axis);
+                if n == 0 {
+                    return Err(format!("{} : choisissez au moins deux sommets reliés (une arête, une boucle)", op.label()));
+                }
+                uvtools::relax_around(&g, &mut pts, &sel, 3, 30);
+                format!("{} : {n} ligne(s)", op.label())
+            }
+            SelectionOp::Line(_) => {
+                // faces entièrement sélectionnées : leurs arêtes se couchent sur U et V
+                let mut edges = Vec::new();
+                for &f in &faces {
+                    if self.face_selected(f) {
+                        let r: Vec<usize> = m.face_range(f).map(|c| vc[c]).collect();
+                        for i in 0..r.len() {
+                            let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                            if a != b && a != usize::MAX && b != usize::MAX {
+                                edges.push((a.min(b), a.max(b)));
+                            }
+                        }
+                    }
+                }
+                edges.sort_unstable();
+                edges.dedup();
+                if edges.is_empty() {
+                    return Err(format!("{} : sélectionnez des faces entières", op.label()));
+                }
+                let n = uvtools::straighten_faces(&g, &mut pts, &edges, 150);
+                let mut moved = vec![false; g.len()];
+                edges.iter().for_each(|&(a, b)| {
+                    moved[a] = true;
+                    moved[b] = true;
+                });
+                uvtools::relax_around(&g, &mut pts, &moved, 3, 30);
+                format!("{} : {n} sommet(s) mis en grille", op.label())
+            }
+        };
+        g.write(&pts, &mut cuv);
+        if uvtools::damaged_faces(m, &cuv, &faces) > before + (faces.len() / 50).max(1) {
+            return Err(format!("{} : annulé, des faces se seraient retournées (choisissez une zone plus petite ou plus régulière)", op.label()));
+        }
+        self.uv.as_mut().unwrap().corner_uv = cuv;
+        self.refresh(texture_size);
+        Ok(format!("{msg} — Ctrl+Z pour annuler"))
     }
 
     /// Outil d'îlots (aligner, répartir, empiler…) appliqué aux îlots sélectionnés.
@@ -1784,6 +1896,38 @@ mod tests {
         assert!(s.editable_corners().iter().all(|&c| free[c as usize]));
         assert!(s.clear_isolation());
         assert_eq!(s.editable_corners().len(), s.model.mesh.corners.len());
+    }
+
+    #[test]
+    fn selection_tools_touch_only_their_island() {
+        use easyuv::uvtools::LineAxis;
+        let mut s = scene();
+        assert!(s.selection_tool(SelectionOp::Smooth, 2048).is_err(), "rien de sélectionné");
+        // une arête du tore (mode sommets) : elle devient horizontale, les autres îlots restent
+        let f = s.model.objects[1].face_start + 5;
+        let i = s.face_island[f] as usize;
+        let r = s.model.mesh.face_range(f);
+        s.set_select_mode(SelectMode::Vertex);
+        let picked: Vec<usize> = [r.start, r.start + 1].into_iter().flat_map(|c| s.sticky(c)).collect();
+        for c in picked {
+            s.corner_sel[c] = true;
+        }
+        let before = s.uv.as_ref().unwrap().corner_uv.clone();
+        s.selection_tool(SelectionOp::Line(LineAxis::U), 2048).unwrap();
+        let after = &s.uv.as_ref().unwrap().corner_uv;
+        assert!((after[r.start][1] - after[r.start + 1][1]).abs() < 1e-5, "l'arête n'est pas horizontale");
+        for g in 0..s.model.mesh.face_count() {
+            if s.face_island[g] as usize != i {
+                assert!(s.model.mesh.face_range(g).all(|c| after[c] == before[c]), "un autre îlot a bougé");
+            }
+        }
+        // en mode faces, horizontale / verticale n'ont pas de sens : message, rien ne bouge
+        s.set_select_mode(SelectMode::Face);
+        assert!(s.selection_tool(SelectionOp::Line(LineAxis::V), 2048).is_err());
+        // îlot entier : Lisser marche
+        s.set_select_mode(SelectMode::Island);
+        s.click_island(Some(i), false);
+        assert!(s.selection_tool(SelectionOp::Smooth, 2048).is_ok());
     }
 
     #[test]
