@@ -86,6 +86,8 @@ pub struct UvGraph {
     pub boundary: Vec<bool>,
     /// Rapport longueur UV / longueur 3D de chaque îlot (échelle de l'îlot).
     pub scale: Vec<f64>,
+    /// Sommets figés : les pinceaux ne les déplacent pas (hors de la zone isolée).
+    pub locked: Vec<bool>,
 }
 
 impl UvGraph {
@@ -139,7 +141,19 @@ impl UvGraph {
         // ordre stable des voisins (les tables de hachage ne le sont pas)
         nbrs.iter_mut().for_each(|v| v.sort_by_key(|x| x.0));
         let scale = su.iter().zip(&s3).map(|(u, t)| if *t > 0.0 { u / t } else { 1.0 }).collect();
-        UvGraph { corners, island, nbrs, boundary, scale }
+        UvGraph { corners, island, nbrs, boundary, scale, locked: vec![false; n] }
+    }
+
+    /// Fige les sommets dont un coin n'est pas libre (`free` : un booléen par coin).
+    pub fn lock_outside(&mut self, free: &[bool]) {
+        for (l, cs) in self.locked.iter_mut().zip(&self.corners) {
+            *l = cs.iter().any(|&c| !free[c]);
+        }
+    }
+
+    /// Nombre de sommets que les pinceaux peuvent déplacer.
+    pub fn free_count(&self) -> usize {
+        self.locked.iter().filter(|&&l| !l).count()
     }
 
     pub fn len(&self) -> usize {
@@ -202,7 +216,7 @@ pub fn brush_step(g: &UvGraph, pts: &mut [V2], brush: Brush, center: V2, radius:
     let w = brush_weights(pts, center, radius);
     let old = pts.to_vec();
     for i in 0..pts.len() {
-        if w[i] <= 0.0 {
+        if w[i] <= 0.0 || g.locked[i] {
             continue;
         }
         let k = (w[i] * strength).clamp(0.0, 1.0);
@@ -1232,6 +1246,31 @@ mod tests {
         }
         assert!(err(&pts) < damaged * 0.5, "{} -> {}", damaged, err(&pts));
         g.write(&pts, &mut uv);
+    }
+
+    #[test]
+    fn locked_vertices_stay_put() {
+        let (m, uv, fi, n) = setup();
+        let ids: Vec<usize> = (0..n).collect();
+        let isl = Islands::new(&m, &fi, &ids);
+        let mut g = UvGraph::build(&m, &uv, &isl);
+        // seule la première moitié des coins est libre
+        let free: Vec<bool> = (0..uv.len()).map(|c| c < uv.len() / 2).collect();
+        g.lock_outside(&free);
+        assert!(g.free_count() > 0 && g.free_count() < g.len());
+        let start = g.positions(&uv);
+        let mut pts = start.clone();
+        for _ in 0..20 {
+            for b in [Brush::Relax, Brush::Straighten, Brush::Pinch] {
+                brush_step(&g, &mut pts, b, start[0], 10.0, 0.8, false);
+            }
+        }
+        for i in 0..g.len() {
+            if g.locked[i] {
+                assert_eq!(pts[i], start[i], "un sommet figé a bougé");
+            }
+        }
+        assert!((0..g.len()).any(|i| pts[i] != start[i]), "rien n'a bougé dans la zone libre");
     }
 
     #[test]

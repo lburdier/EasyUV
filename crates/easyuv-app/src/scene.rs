@@ -81,6 +81,9 @@ pub struct Scene {
     pub marked_seams: HashSet<(u32, u32)>,
     /// Îlot survolé dans l'éditeur UV : mis en évidence sur le modèle 3D.
     pub hover_island: Option<usize>,
+    /// Zone isolée de l'éditeur UV (H) : coins libres, un booléen par coin (vide : aucune).
+    /// Les pinceaux et G / R / S ne touchent qu'elle, le reste est figé.
+    pub isolated: Vec<bool>,
 }
 
 /// Une entrée de reconstruction : objet source, décalage éventuel (copie), état.
@@ -121,6 +124,7 @@ impl Scene {
             corner_sel: Vec::new(),
             marked_seams: HashSet::new(),
             hover_island: None,
+            isolated: Vec::new(),
         };
         s.rebuild_derived();
         s
@@ -151,6 +155,8 @@ impl Scene {
         self.hidden.resize(self.model.objects.len(), false);
         // la sélection de sommets / arêtes / faces existe aussi avant tout dépliage (vue 3D)
         self.corner_sel = vec![false; mesh.corners.len()];
+        // les coins ont changé (objets supprimés, dupliqués…) : la zone isolée n'a plus de sens
+        self.isolated.clear();
         self.active = self.active.min(self.model.objects.len().saturating_sub(1));
         self.touch();
     }
@@ -648,6 +654,106 @@ impl Scene {
             return sel;
         }
         (0..self.island_selected.len()).filter(|&i| self.island_visible(i)).collect()
+    }
+
+    /// Coins libres d'après la sélection : îlots entiers, faces sélectionnées ou sommets
+    /// choisis. Un sommet UV partagé avec une face hors sélection reste figé, pour que
+    /// les faces voisines ne soient pas déformées.
+    fn selection_free(&self) -> Vec<bool> {
+        let m = &self.model.mesh;
+        let nc = m.corners.len();
+        let zone: Vec<bool> = match self.sel_mode {
+            SelectMode::Vertex | SelectMode::Edge => {
+                let mut free = self.corner_sel.clone();
+                free.resize(nc, false);
+                for f in 0..m.face_count() {
+                    if !self.face_visible(f) {
+                        m.face_range(f).for_each(|c| free[c] = false);
+                    }
+                }
+                return free;
+            }
+            SelectMode::Island => (0..m.face_count()).map(|f| self.face_island.get(f).is_some_and(|&i| self.island_selected.get(i as usize).copied().unwrap_or(false))).collect(),
+            SelectMode::Face => (0..m.face_count()).map(|f| self.face_selected(f)).collect(),
+        };
+        let Some(uv) = &self.uv else { return vec![false; nc] };
+        // sommet UV (sommet, position, îlot) libre si toutes ses faces sont dans la zone
+        let key = |f: usize, c: usize| (m.corners[c], uv.corner_uv[c][0].to_bits(), uv.corner_uv[c][1].to_bits(), self.face_island.get(f).copied().unwrap_or(u32::MAX));
+        let mut all_in: std::collections::HashMap<(u32, u32, u32, u32), bool> = std::collections::HashMap::new();
+        for f in 0..m.face_count() {
+            let z = zone[f] && self.face_visible(f);
+            for c in m.face_range(f) {
+                *all_in.entry(key(f, c)).or_insert(true) &= z;
+            }
+        }
+        let mut free = vec![false; nc];
+        for f in 0..m.face_count() {
+            for c in m.face_range(f) {
+                free[c] = all_in[&key(f, c)];
+            }
+        }
+        free
+    }
+
+    pub fn is_isolated(&self) -> bool {
+        !self.isolated.is_empty()
+    }
+
+    /// Isole la sélection (H) : seuls ses coins pourront bouger. Renvoie le nombre de faces
+    /// entièrement libres, ou None s'il n'y a rien de sélectionné.
+    pub fn isolate_selection(&mut self) -> Option<usize> {
+        if self.uv.is_none() || !self.has_island_selection() {
+            return None;
+        }
+        let free = self.selection_free();
+        if !free.iter().any(|&f| f) {
+            return None;
+        }
+        let m = &self.model.mesh;
+        let n = (0..m.face_count()).filter(|&f| m.face_range(f).all(|c| free[c])).count();
+        self.isolated = free;
+        self.touch();
+        Some(n)
+    }
+
+    /// Libère la zone isolée (Alt+H). Renvoie vrai s'il y en avait une.
+    pub fn clear_isolation(&mut self) -> bool {
+        let had = self.is_isolated();
+        self.isolated.clear();
+        self.touch();
+        had
+    }
+
+    /// Coins que les pinceaux peuvent déplacer : la zone isolée, sinon la sélection.
+    /// None : rien n'est restreint, tout ce qui est visible peut bouger.
+    pub fn brush_free(&self) -> Option<Vec<bool>> {
+        if self.is_isolated() {
+            return Some(self.isolated.clone());
+        }
+        self.has_island_selection().then(|| self.selection_free())
+    }
+
+    /// Zone d'un coup de pinceau : îlots concernés et coins libres (None : tout est libre).
+    pub fn brush_zone(&self) -> (Vec<usize>, Option<Vec<bool>>) {
+        let Some(free) = self.brush_free() else { return (self.brush_islands(), None) };
+        let mut hit = vec![false; self.island_selected.len()];
+        for f in 0..self.model.mesh.face_count() {
+            if self.model.mesh.face_range(f).any(|c| free[c]) {
+                if let Some(&i) = self.face_island.get(f) {
+                    hit[i as usize] = true;
+                }
+            }
+        }
+        ((0..hit.len()).filter(|&i| hit[i] && self.island_visible(i)).collect(), Some(free))
+    }
+
+    /// Coins déplacés par G / R / S : la sélection, limitée à la zone isolée s'il y en a une.
+    pub fn editable_corners(&self) -> Vec<u32> {
+        let corners = self.selected_corners();
+        if !self.is_isolated() {
+            return corners;
+        }
+        corners.into_iter().filter(|&c| self.isolated[c as usize]).collect()
     }
 
     /// Outil d'îlots (aligner, répartir, empiler…) appliqué aux îlots sélectionnés.
@@ -1644,6 +1750,40 @@ mod tests {
         assert!(s.selected[3] && !s.selected[1]);
         assert_eq!(s.active, 3);
         assert_eq!(s.uv.as_ref().unwrap().corner_uv.len(), s.model.mesh.corners.len());
+    }
+
+    #[test]
+    fn isolation_freezes_the_rest() {
+        let mut s = scene();
+        assert_eq!(s.isolate_selection(), None, "rien de sélectionné : rien à isoler");
+        // une face seule : ses sommets partagés avec des voisines hors zone sont figés, et
+        // aucun coin d'une autre face n'est libre (les voisines ne se déforment pas)
+        s.set_select_mode(SelectMode::Face);
+        let f = s.model.objects[1].face_start + 3;
+        for c in s.model.mesh.face_range(f) {
+            s.corner_sel[c] = true;
+        }
+        let free = s.selection_free();
+        for g in (0..s.model.mesh.face_count()).filter(|&g| g != f) {
+            assert!(s.model.mesh.face_range(g).all(|c| !free[c]));
+        }
+        // l'îlot entier du tore : tout est libre dans l'îlot, rien ailleurs
+        s.set_select_mode(SelectMode::Island);
+        let i = s.face_island[f] as usize;
+        s.click_island(Some(i), false);
+        assert!(s.isolate_selection().unwrap() > 0);
+        let (ids, free) = s.brush_zone();
+        assert_eq!(ids, vec![i]);
+        let free = free.unwrap();
+        for g in 0..s.model.mesh.face_count() {
+            let inside = s.face_island[g] as usize == i;
+            assert!(s.model.mesh.face_range(g).all(|c| free[c] == inside));
+        }
+        // la zone tient même quand la sélection change, et G / R / S n'en sortent pas
+        s.select_all_uv(true);
+        assert!(s.editable_corners().iter().all(|&c| free[c as usize]));
+        assert!(s.clear_isolation());
+        assert_eq!(s.editable_corners().len(), s.model.mesh.corners.len());
     }
 
     #[test]

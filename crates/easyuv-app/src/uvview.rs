@@ -235,7 +235,7 @@ impl UvEditor {
     }
 
     fn begin(&mut self, kind: Kind, scene: &Scene, start: Pos2, drag: bool) -> bool {
-        let corners = scene.selected_corners();
+        let corners = scene.editable_corners();
         let (Some((lo, hi)), Some(uv)) = (scene.corners_bounds(&corners), scene.uv.as_ref()) else { return false };
         self.modal = Some(Modal {
             kind,
@@ -322,6 +322,10 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
     }
     if key(egui::Key::CloseBracket) {
         ed.radius = (ed.radius * 1.15).min(600.0);
+    }
+    // --- zone isolée : H isole la sélection, Alt+H libère tout (comme masquer / révéler) ---
+    if ed.modal.is_none() && ed.stroke.is_none() && !ctrl && key(egui::Key::H) {
+        return Some(UvEvent::Status(if alt { release_text(scene) } else { isolate_text(scene) }));
     }
     if ed.tool != UvTool::Select {
         if let Some(ev) = tool_interact(ui, resp, view, scene, ed, pointer, shift, &key) {
@@ -448,7 +452,8 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         if !ctrl && !shift && key(k) {
             if let Some(p) = start {
                 if !ed.begin(kind, scene, p, false) {
-                    return Some(UvEvent::Status("Sélectionnez d'abord des éléments (clic, A ou rectangle)".into()));
+                    let txt = if scene.is_isolated() && scene.has_island_selection() { "La sélection est hors de la zone isolée (Alt+H pour la libérer)" } else { "Sélectionnez d'abord des éléments (clic, A ou rectangle)" };
+                    return Some(UvEvent::Status(txt.into()));
                 }
                 return None;
             }
@@ -532,6 +537,19 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         }
     }
     None
+}
+
+/// Isole la sélection et décrit le résultat (barre d'état).
+pub fn isolate_text(scene: &mut Scene) -> String {
+    match scene.isolate_selection() {
+        Some(n) => format!("Zone isolée ({n} face(s)) : seule elle bouge au pinceau et avec G / R / S, le reste est figé · Alt+H : libérer"),
+        None => "Sélectionnez d'abord la zone à isoler (îlot, faces ou sommets), puis H".into(),
+    }
+}
+
+/// Libère la zone isolée et décrit le résultat (barre d'état).
+pub fn release_text(scene: &mut Scene) -> String {
+    if scene.clear_isolation() { "Zone libérée : tout peut de nouveau bouger".into() } else { "Aucune zone isolée".into() }
 }
 
 /// Point dans un polygone (règle pair-impair).
@@ -618,16 +636,28 @@ fn tool_interact(ui: &egui::Ui, resp: &egui::Response, view: View, scene: &mut S
     let brush = ed.tool.brush()?;
     let radius_uv = (ed.radius / view.side) as f64;
     if resp.drag_started_by(egui::PointerButton::Primary) {
-        let ids = scene.brush_islands();
+        // zone du pinceau : la zone isolée, sinon la sélection ; le reste ne bouge pas
+        let (ids, free) = scene.brush_zone();
         if ids.is_empty() {
             return Some(UvEvent::Status("Aucun îlot visible à modifier".into()));
         }
         let uv = &scene.uv.as_ref()?.corner_uv;
         let isl = Islands::new(&scene.model.mesh, &scene.face_island, &ids);
-        let graph = UvGraph::build(&scene.model.mesh, uv, &isl);
+        let mut graph = UvGraph::build(&scene.model.mesh, uv, &isl);
+        if let Some(free) = &free {
+            graph.lock_outside(free);
+            if graph.free_count() == 0 {
+                return Some(UvEvent::Status("Rien à modifier : la zone choisie n'a que des sommets de bord (figés)".into()));
+            }
+        }
         let pts = graph.positions(uv);
         let start_uv = v2(view.to_uv(origin.or(pointer)?));
-        let weights = uvtools::brush_weights(&pts, start_uv, radius_uv);
+        let mut weights = uvtools::brush_weights(&pts, start_uv, radius_uv);
+        for (w, &l) in weights.iter_mut().zip(&graph.locked) {
+            if l {
+                *w = 0.0;
+            }
+        }
         ed.stroke = Some(BrushStroke { orig: uv.clone(), graph, start: pts.clone(), pts, weights, start_uv });
     }
     let st = ed.stroke.as_mut()?;
@@ -694,9 +724,13 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
     let mut hs = DefaultHasher::new();
     (scene.generation, scene as *const Scene as usize, shading as u8, rect.min.x.to_bits(), rect.min.y.to_bits(), rect.max.x.to_bits(), rect.max.y.to_bits()).hash(&mut hs);
     (cam.center.x.to_bits(), cam.center.y.to_bits(), cam.zoom.to_bits()).hash(&mut hs);
+    // avec un pinceau ou une zone isolée, ce qui ne bougera pas est estompé
+    let masked = ed.tool.brush().is_some() || scene.is_isolated();
+    masked.hash(&mut hs);
     let key = hs.finish();
     if key != cache.key || cache.fill.is_none() {
-        let (fill, lines) = build_meshes(scene, uv, shading, tex, &to_screen);
+        let free = if masked { scene.brush_free() } else { None };
+        let (fill, lines) = build_meshes(scene, uv, shading, tex, &to_screen, free.as_deref());
         cache.fill = Some(Arc::new(fill));
         cache.lines = Some(Arc::new(lines));
         cache.key = key;
@@ -744,11 +778,18 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, scene: Option<&Scene>, cam: &UvCamera
             painter.circle_filled(p, 1.5, col);
         }
     }
+    if scene.is_isolated() {
+        let txt = "Zone isolée — le reste est figé  ·  H : isoler la sélection  ·  Alt+H : libérer";
+        let galley = painter.layout_no_wrap(txt.to_string(), egui::FontId::proportional(12.0), Color32::BLACK);
+        let pos = rect.left_top() + egui::vec2(10.0, 8.0);
+        painter.rect_filled(Rect::from_min_size(pos - egui::vec2(6.0, 3.0), galley.size() + egui::vec2(12.0, 6.0)), 4.0, theme::ACCENT_ORANGE);
+        painter.galley(pos, galley, Color32::BLACK);
+    }
     // Aide de l'outil actif (hors sélection)
     if ed.tool != UvTool::Select && ed.info().is_none() {
         let txt = match ed.tool.brush() {
             Some(_) => format!(
-                "{}  ·  rayon {:.0} px  ·  force {:.0} %   —   {}   ·   [ ] ou Ctrl+molette : rayon   ·   clic : limiter à un îlot   ·   Échap : annuler",
+                "{}  ·  rayon {:.0} px  ·  force {:.0} %   —   {}   ·   [ ] ou Ctrl+molette : rayon   ·   seule la sélection bouge (clic : un îlot)   ·   H : isoler   ·   Échap : annuler",
                 ed.tool.label(),
                 ed.radius,
                 ed.strength * 100.0,
@@ -780,7 +821,8 @@ pub struct UvCache {
     lines: Option<Arc<egui::Mesh>>,
 }
 
-fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: TextureId, to_screen: &dyn Fn(f32, f32) -> Pos2) -> (egui::Mesh, egui::Mesh) {
+/// `free` : coins que le pinceau peut déplacer ; les faces sans aucun coin libre sont estompées.
+fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: TextureId, to_screen: &dyn Fn(f32, f32) -> Pos2, free: Option<&[bool]>) -> (egui::Mesh, egui::Mesh) {
     let m = &scene.model.mesh;
     let mut fill = egui::Mesh::with_texture(tex);
     let mut lines = egui::Mesh::with_texture(tex);
@@ -807,10 +849,13 @@ fn build_meshes(scene: &Scene, uv: &easyuv::UvResult, shading: Shading, tex: Tex
             continue;
         }
         let picked = island_sel(f);
-        // comme Blender : avec une sélection, les autres objets sont estompés
-        let dim = has_sel && !scene.selected[o] && !picked;
         let r = m.face_range(f);
-        let col = if picked {
+        let frozen = free.is_some_and(|fr| r.clone().all(|c| !fr[c]));
+        // comme Blender : avec une sélection, les autres objets sont estompés
+        let dim = (has_sel && !scene.selected[o] && !picked) || frozen;
+        let col = if frozen {
+            Color32::from_gray(90).gamma_multiply(0.12)
+        } else if picked {
             Color32::from_rgba_unmultiplied(0xff, 0xa0, 0x28, 80)
         } else {
             match shading {

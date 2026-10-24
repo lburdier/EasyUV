@@ -110,7 +110,11 @@ Damiers : Couleur, Mono, Numéroté, Cercles, Flèches, Dégradé UV, Diagonales
 
 Le score UV (sur 100) est affiché en direct dans l'en-tête de l'éditeur UV : distorsion, chevauchements, faces retournées, remplissage, densité égale, coutures.
 
-Rayon du pinceau : `[` `]` ou `Ctrl`+molette. Les pinceaux agissent sur les îlots sélectionnés, ou sur tous si rien n'est sélectionné ; `Échap` annule le coup de pinceau, `Ctrl+Z` après.
+Rayon du pinceau : `[` `]` ou `Ctrl`+molette. `Échap` annule le coup de pinceau, `Ctrl+Z` après.
+
+**Zone du pinceau.** Les pinceaux ne touchent que la sélection : un îlot (clic), des faces ou des sommets. Le reste est figé et estompé à l'écran. Sans sélection, tout ce qui est visible peut bouger. Les sommets partagés avec une face hors de la zone restent figés, donc les faces voisines ne se déforment pas.
+
+**Isoler une zone.** `H` (ou *UV > Isoler la sélection*) fige tout sauf la sélection. La zone reste isolée quand vous changez de sélection, et `G` / `R` / `S` n'en sortent pas non plus. `Alt+H` la libère.
 
 Outils d'îlots (sur la sélection) : aligner (gauche, centre, droite, haut, bas), répartir en U ou en V, pivoter d'un angle, miroir, échelle, empiler, égaliser la densité, remplir la tuile, rendre droit, orienter, optimiser (ARAP), redéplier.
 

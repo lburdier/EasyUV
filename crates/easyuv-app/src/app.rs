@@ -879,6 +879,19 @@ impl EasyUvApp {
                 s.invert_islands();
             }
         }
+        let isolated = self.scene.as_ref().is_some_and(|s| s.is_isolated());
+        if item(ui, has_isl, "Isoler la sélection (le reste est figé)", "H") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                self.status = uvview::isolate_text(s);
+            }
+        }
+        if item(ui, isolated, "Libérer la zone isolée", "Alt+H") {
+            ui.close();
+            if let Some(s) = &mut self.scene {
+                self.status = uvview::release_text(s);
+            }
+        }
         ui.separator();
         let ops: [(&str, fn([f32; 2]) -> [f32; 2]); 4] = [
             ("Pivoter de 90° (gauche)", |p| [-p[1], p[0]]),
@@ -1454,6 +1467,22 @@ impl EasyUvApp {
                 ui.end_row();
             });
         }
+        // zone isolée : seule elle bouge au pinceau et avec G / R / S
+        ui.horizontal_wrapped(|ui| {
+            let isolated = self.scene.as_ref().is_some_and(|s| s.is_isolated());
+            let txt = if isolated { RichText::new("Zone isolée : le reste est figé").color(theme::ACCENT_ORANGE) } else { RichText::new("Zone du pinceau : la sélection, sinon tout").color(theme::TEXT_DIM) };
+            ui.label(txt);
+            if ui.add_enabled(has_isl, egui::Button::new("Isoler").small()).on_hover_text("H : seule la sélection pourra bouger (pinceaux, G / R / S), même si vous changez de sélection ensuite. Les sommets partagés avec le reste restent figés.").clicked() {
+                if let Some(s) = &mut self.scene {
+                    self.status = uvview::isolate_text(s);
+                }
+            }
+            if ui.add_enabled(isolated, egui::Button::new("Libérer").small()).on_hover_text("Alt+H : tout peut de nouveau bouger").clicked() {
+                if let Some(s) = &mut self.scene {
+                    self.status = uvview::release_text(s);
+                }
+            }
+        });
         ui.label(RichText::new(self.uv_edit.tool.hint()).small().color(theme::TEXT_DIM));
         ui.add_space(4.0);
         ui.add_enabled_ui(has_isl, |ui| {

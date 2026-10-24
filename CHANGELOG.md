@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6] - 2026-10-24
+
+### Isoler une zone des UV
+- Les pinceaux (Déplacer, Détendre, Redresser, Pincer) ne modifient que la **sélection** : un îlot, des faces ou des sommets. Ce qui ne bougera pas est estompé dans l'éditeur UV.
+- **`H` isole la sélection** (menu *UV* ou bouton *Isoler* du panneau) : seule cette zone bouge, au pinceau comme avec `G` / `R` / `S`, même après avoir changé de sélection. `Alt+H` (ou *Libérer*) rend tout modifiable.
+- Les sommets partagés avec une face hors de la zone restent figés : les faces voisines ne sont jamais déformées.
+
 ## [0.3.5] - 2026-10-23
 
 ### Modes Objet et Édition comme Blender
