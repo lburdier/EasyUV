@@ -814,6 +814,13 @@ impl Scene {
         if matches!(op, SelectionOp::Line(LineAxis::U | LineAxis::V)) && matches!(mode, SelectMode::Face | SelectMode::Island) {
             return Err(format!("{} : choisissez une ligne de sommets ou d'arêtes (mode 1 ou 2)", op.label()));
         }
+        // îlots entiers : Rendre droit (bandes, arcs), comme Maj+W
+        if op == SelectionOp::Line(LineAxis::Free) && mode == SelectMode::Island {
+            return match self.straighten_strips(texture_size) {
+                (0, _) => Err("Rendre droit : ces îlots ne sont pas des bandes ; en mode arêtes (2), choisissez la ligne à redresser".into()),
+                (d, _) => Ok(format!("Rendre droit : {d} îlot(s) — Ctrl+Z pour annuler")),
+            };
+        }
         let ids = self.selected_island_ids();
         let m = &self.model.mesh;
         // copie de travail : la scène reste lisible pendant le calcul
@@ -837,7 +844,36 @@ impl Scene {
         }
         let faces: Vec<usize> = isl.faces.iter().flatten().copied().collect();
         let before = uvtools::damaged_faces(m, &cuv, &faces);
+        let tol = before + (faces.len() / 50).max(1);
         let mut pts = g.positions(&cuv);
+        let damage = |p: &[V2]| {
+            let mut test = cuv.clone();
+            g.write(p, &mut test);
+            uvtools::damaged_faces(m, &test, &faces)
+        };
+        // sommets déplacés par l'outil : les faces autour sont ensuite recalculées d'après la
+        // 3D (LSCM épinglé sur eux), sur une zone de plus en plus large jusqu'à l'îlot entier,
+        // tant que des faces se retourneraient. Sinon, le résultat le moins abîmé est gardé
+        // (une ligne très courbe au milieu d'un îlot ne peut pas devenir droite sans plier)
+        let follow = |pts: &mut Vec<V2>, moved: &[bool]| {
+            let ring = uvtools::ring_distance(&g, moved);
+            let mut best = (damage(pts), pts.clone());
+            for reach in [4, 10, usize::MAX - 1] {
+                let free: Vec<bool> = (0..g.len()).map(|i| ring[i] > 0 && ring[i] <= reach && !g.locked[i]).collect();
+                let mut p = pts.clone();
+                if !uvtools::solve_free(m, &g, &faces, &mut p, &free) {
+                    continue;
+                }
+                let d = damage(&p);
+                if d < best.0 {
+                    best = (d, p);
+                }
+                if best.0 <= tol {
+                    break;
+                }
+            }
+            *pts = best.1;
+        };
         let msg = match op {
             SelectionOp::Smooth => {
                 uvtools::smooth(&g, &mut pts, &sel, 30);
@@ -846,9 +882,9 @@ impl Scene {
             SelectionOp::Line(axis) if mode != SelectMode::Face => {
                 let n = uvtools::straighten_lines(&g, &mut pts, &sel, axis);
                 if n == 0 {
-                    return Err(format!("{} : choisissez au moins deux sommets reliés (une arête, une boucle)", op.label()));
+                    return Err(format!("{} : choisissez au moins deux sommets reliés, une ligne ouverte (une boucle fermée, comme le tour d'un œil, ne peut pas devenir droite)", op.label()));
                 }
-                uvtools::relax_around(&g, &mut pts, &sel, 3, 30);
+                follow(&mut pts, &sel);
                 format!("{} : {n} ligne(s)", op.label())
             }
             SelectionOp::Line(_) => {
@@ -876,17 +912,20 @@ impl Scene {
                     moved[a] = true;
                     moved[b] = true;
                 });
-                uvtools::relax_around(&g, &mut pts, &moved, 3, 30);
+                follow(&mut pts, &moved);
                 format!("{} : {n} sommet(s) mis en grille", op.label())
             }
         };
         g.write(&pts, &mut cuv);
-        if uvtools::damaged_faces(m, &cuv, &faces) > before + (faces.len() / 50).max(1) {
-            return Err(format!("{} : annulé, des faces se seraient retournées (choisissez une zone plus petite ou plus régulière)", op.label()));
-        }
+        let after = uvtools::damaged_faces(m, &cuv, &faces);
+        let warn = if after > tol {
+            format!(" ; attention, {} face(s) pliée(s) ou écrasée(s) : la ligne est trop courbe pour cet îlot (une bande entière : mode îlots puis Rendre droit, ou Couper l'îlot)", after - before.min(after))
+        } else {
+            String::new()
+        };
         self.uv.as_mut().unwrap().corner_uv = cuv;
         self.refresh(texture_size);
-        Ok(format!("{msg} — Ctrl+Z pour annuler"))
+        Ok(format!("{msg}{warn} — Ctrl+Z pour annuler"))
     }
 
     /// Outil d'îlots (aligner, répartir, empiler…) appliqué aux îlots sélectionnés.
@@ -1980,6 +2019,70 @@ mod tests {
         assert!(s.selection_tool(SelectionOp::Smooth, 2048).is_ok());
     }
 
+    /// Suzanne dépliée, et les sommets UV (coins collants) d'une boucle d'arêtes passant par
+    /// la première arête de la face `f`, restreinte à l'îlot de cette face.
+    fn suzanne_loop(f: usize) -> (Scene, usize) {
+        // dépliée une seule fois pour tous les essais
+        static BASE: std::sync::OnceLock<Scene> = std::sync::OnceLock::new();
+        let mut s = BASE
+            .get_or_init(|| {
+                let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/models/suzanne.obj")).unwrap();
+                let m = easyuv::obj::parse_obj_model(&text, "Suzanne").unwrap();
+                let mut s = Scene::new("test".into(), m);
+                let uv = easyuv::model::unwrap_model(&s.model, &easyuv::Params::default(), true);
+                s.set_uv(uv, 2048);
+                s
+            })
+            .clone();
+        s.set_select_mode(SelectMode::Edge);
+        let vs = s.model.mesh.face(f).to_vec();
+        let lp = easyuv::uvtools::edge_loop(&s.model.mesh, vs[0], vs[1]);
+        let isl = s.face_island[f];
+        let verts: HashSet<u32> = lp.iter().flat_map(|&(a, b)| [a, b]).collect();
+        let m = &s.model.mesh;
+        for g in 0..m.face_count() {
+            if s.face_island[g] == isl {
+                for c in m.face_range(g) {
+                    if verts.contains(&m.corners[c]) {
+                        s.corner_sel[c] = true;
+                    }
+                }
+            }
+        }
+        (s, lp.len())
+    }
+
+    #[test]
+    fn straighten_works_on_real_loops() {
+        use easyuv::uvtools::LineAxis;
+        let (mut fails, mut warned) = (Vec::new(), 0);
+        let n = 40;
+        for k in 0..n {
+            let f = k * 47 % 1968;
+            for axis in [LineAxis::Free, LineAxis::U] {
+                let (mut s, len) = suzanne_loop(f);
+                match s.selection_tool(SelectionOp::Line(axis), 2048) {
+                    Ok(msg) if msg.contains("attention") => warned += 1,
+                    Ok(_) => {}
+                    // une boucle fermée (tour d'un œil) ne peut pas devenir droite : refus normal
+                    Err(e) if e.contains("boucle fermée") => {}
+                    Err(e) => fails.push(format!("face {f} ({len} arêtes, {axis:?}) : {e}")),
+                }
+            }
+        }
+        // les lignes très courbes au milieu d'un îlot plient forcément un peu : au plus un quart
+        eprintln!("{warned} redressement(s) sur {} avec avertissement", 2 * n);
+        assert!(warned <= n / 2, "{warned} redressement(s) sur {} avec des faces pliées", 2 * n);
+        // îlot entier : Rendre droit doit aussi faire quelque chose
+        let (mut s, _) = suzanne_loop(0);
+        s.set_select_mode(SelectMode::Island);
+        s.click_island(Some(s.face_island[0] as usize), false);
+        if let Err(e) = s.selection_tool(SelectionOp::Line(LineAxis::Free), 2048) {
+            fails.push(format!("îlot : {e}"));
+        }
+        assert!(fails.len() <= n / 10, "{} échec(s) :\n{}", fails.len(), fails.join("\n"));
+    }
+
     #[test]
     fn zone_select_in_3d() {
         let mut s = scene();
@@ -2267,3 +2370,4 @@ mod tests {
         assert_eq!(s.island_selected.iter().filter(|&&x| x).count(), all);
     }
 }
+

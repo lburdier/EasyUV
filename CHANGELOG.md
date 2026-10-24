@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.9] - 2026-10-25
+
+### Rendre droit : corrections
+- **Rendre droit, Ligne horizontale et Ligne verticale marchent sur les vraies lignes** : sur Suzanne, la plupart étaient refusées (« des faces se seraient retournées »). Les faces autour de la ligne sont maintenant recalculées d'après la 3D (LSCM épinglé sur la ligne), d'abord près d'elle puis sur tout l'îlot s'il le faut.
+- La ligne redressée **garde sa longueur** au lieu d'être écrasée entre ses deux bouts.
+- Une ligne trop courbe pour son îlot est quand même redressée, au mieux, avec un message qui compte les faces pliées (`Ctrl+Z` pour annuler) ; une boucle fermée est refusée avec une explication.
+- **En mode îlots**, Rendre droit fait comme `Maj+W` (bandes, arcs) au lieu d'échouer.
+- **Avec un pinceau actif**, le double-clic sur une arête sélectionne sa boucle, comme avec l'outil Sélection.
+
 ## [0.3.8] - 2026-10-24
 
 ### Sélection par zone dans la vue 3D

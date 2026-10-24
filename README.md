@@ -112,11 +112,12 @@ Rendre droit (`Maj+W`) : grille de quads, arc déroulé ou rectangle à bord ép
 | Outil | Sur une sélection de… | Effet |
 |---|---|---|
 | Lisser | sommets, arêtes, faces ou îlots | les arêtes reprennent leur longueur 3D, les ondulations disparaissent ; recommencer lisse davantage |
-| Rendre droit | sommets ou arêtes (une ligne, une boucle) | la ligne va droit d'un bout à l'autre, sommets espacés selon les longueurs 3D |
+| Rendre droit | sommets ou arêtes (une ligne ouverte : une partie de boucle, une rangée) | la ligne devient droite dans la direction de ses deux bouts, en gardant sa longueur ; sommets espacés selon les longueurs 3D |
 | Rendre droit | faces | les faces se rangent en grille droite |
+| Rendre droit | îlots | comme `Maj+W` : la bande ou l'arc devient droit |
 | Ligne horizontale / verticale | sommets ou arêtes | la ligne devient droite et se couche sur U ou sur V |
 
-Les faces autour suivent la ligne redressée, et le reste ne bouge pas. Une zone isolée (`H`) est respectée. Si l'opération devait retourner des faces, elle est annulée et un message le signale.
+Les faces autour sont recalculées d'après la 3D pour suivre la ligne redressée (d'abord près de la ligne, puis sur tout l'îlot s'il le faut) ; les autres îlots ne bougent pas, et une zone isolée (`H`) est respectée. Une boucle fermée (le tour d'un œil) ne peut pas devenir droite. Une ligne très courbe au milieu d'un îlot plie forcément quelques faces : le message le signale, `Ctrl+Z` annule. Avec un pinceau actif, le double-clic sur une arête choisit aussi sa boucle.
 
 Damiers : Couleur, Mono, Numéroté, Cercles, Flèches, Dégradé UV, Diagonales. Les îlots sélectionnés et l'îlot survolé dans l'éditeur UV sont mis en évidence sur le modèle 3D.
 

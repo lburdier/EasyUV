@@ -356,10 +356,11 @@ fn as_path(g: &UvGraph, sel: &[bool], comp: &[usize]) -> Option<Vec<usize>> {
     (path.len() == comp.len()).then_some(path)
 }
 
-/// Rend droites les lignes de sommets choisis : chaque chaîne va en ligne droite d'un bout
-/// à l'autre, ses sommets espacés selon les longueurs 3D. `axis` la couche à l'horizontale
-/// ou à la verticale autour de son milieu. Une sélection qui se referme ou se ramifie est
-/// projetée sur sa droite moyenne. Renvoie le nombre de lignes redressées.
+/// Rend droites les lignes de sommets choisis : chaque chaîne devient droite dans la
+/// direction de ses deux bouts (ou à l'horizontale / la verticale avec `axis`), centrée sur
+/// leur milieu, en gardant sa longueur ; ses sommets sont espacés selon les longueurs 3D. Une boucle fermée est laissée telle quelle ; une
+/// sélection ramifiée est projetée sur sa droite moyenne. Renvoie le nombre de lignes
+/// redressées.
 pub fn straighten_lines(g: &UvGraph, pts: &mut [V2], sel: &[bool], axis: LineAxis) -> usize {
     let mut done = 0;
     for comp in chains(g, sel) {
@@ -377,12 +378,14 @@ pub fn straighten_lines(g: &UvGraph, pts: &mut [V2], sel: &[bool], axis: LineAxi
         match as_path(g, sel, &comp) {
             Some(path) => {
                 let (a, b) = (pts[path[0]], pts[*path.last().unwrap()]);
-                let len = len2(b - a);
-                if len < 1e-12 {
+                if len2(b - a) < 1e-12 {
                     continue;
                 }
+                // la ligne garde sa longueur UV (une ligne courbe n'est pas écrasée sur sa
+                // corde), centrée sur le milieu de ses deux bouts
+                let len: f64 = path.windows(2).map(|w| len2(pts[w[1]] - pts[w[0]])).sum();
                 let (mid, dir) = ((a + b) * 0.5, unit(b - a));
-                let (a, b) = if axis == LineAxis::Free { (a, b) } else { (mid - dir * (len * 0.5), mid + dir * (len * 0.5)) };
+                let (a, b) = (mid - dir * (len * 0.5), mid + dir * (len * 0.5));
                 // abscisse de chaque sommet : longueur 3D parcourue depuis le début
                 let mut t = vec![0.0; path.len()];
                 for k in 1..path.len() {
@@ -396,8 +399,10 @@ pub fn straighten_lines(g: &UvGraph, pts: &mut [V2], sel: &[bool], axis: LineAxi
                     }
                 }
             }
+            // boucle fermée (le tour d'un œil…) : elle ne peut pas devenir une droite
+            None if comp.iter().all(|&i| g.nbrs[i].iter().filter(|&&(j, _)| sel[j]).count() == 2) => continue,
             None => {
-                // droite moyenne (axe principal) passant par le centre
+                // sélection ramifiée : droite moyenne (axe principal) passant par le centre
                 let n = comp.len() as f64;
                 let c = comp.iter().fold(V2::new(0.0, 0.0), |s, &i| s + pts[i]) * (1.0 / n);
                 let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
@@ -456,14 +461,15 @@ pub fn straighten_faces(g: &UvGraph, pts: &mut [V2], edges: &[(usize, usize)], i
     verts.len()
 }
 
-/// Détend les sommets proches (à moins de `rings` arêtes) de ceux qui ont bougé (`moved`),
-/// qui eux restent en place : les faces autour d'une ligne redressée la suivent sans se
-/// retourner.
-pub fn relax_around(g: &UvGraph, pts: &mut [V2], moved: &[bool], rings: usize, iterations: usize) {
+/// Distance en arêtes de chaque sommet aux sommets `from` (`usize::MAX` : hors d'atteinte,
+/// par exemple dans un autre îlot).
+pub fn ring_distance(g: &UvGraph, from: &[bool]) -> Vec<usize> {
     let mut ring = vec![usize::MAX; g.len()];
-    let mut front: Vec<usize> = (0..g.len()).filter(|&i| moved[i]).collect();
+    let mut front: Vec<usize> = (0..g.len()).filter(|&i| from[i]).collect();
     front.iter().for_each(|&i| ring[i] = 0);
-    for r in 1..=rings {
+    let mut r = 0;
+    while !front.is_empty() {
+        r += 1;
         let mut next = Vec::new();
         for &i in &front {
             for &(j, _) in &g.nbrs[i] {
@@ -475,8 +481,63 @@ pub fn relax_around(g: &UvGraph, pts: &mut [V2], moved: &[bool], rings: usize, i
         }
         front = next;
     }
-    let free: Vec<bool> = (0..g.len()).map(|i| ring[i] != usize::MAX && ring[i] > 0 && !g.locked[i]).collect();
-    smooth(g, pts, &free, iterations);
+    ring
+}
+
+/// Recalcule les sommets `free` d'après la 3D (LSCM épinglé sur tous les autres, qui ne
+/// bougent pas) : autour d'une ligne redressée, les faces se réarrangent sans se plier.
+/// `faces` sont les faces du graphe. Renvoie faux si la résolution échoue.
+pub fn solve_free(mesh: &Mesh, g: &UvGraph, faces: &[usize], pts: &mut [V2], free: &[bool]) -> bool {
+    let vc = g.vertex_of_corner(mesh.corners.len());
+    let mut idx = vec![usize::MAX; g.len()];
+    let mut verts: Vec<usize> = Vec::new();
+    let mut tris: Vec<[u32; 3]> = Vec::new();
+    for &f in faces {
+        let r: Vec<usize> = mesh.face_range(f).map(|c| vc[c]).collect();
+        // seules les faces qui touchent un sommet libre comptent
+        if r.iter().any(|&v| v == usize::MAX) || !r.iter().any(|&v| free[v]) {
+            continue;
+        }
+        let local: Vec<u32> = r
+            .iter()
+            .map(|&v| {
+                if idx[v] == usize::MAX {
+                    idx[v] = verts.len();
+                    verts.push(v);
+                }
+                idx[v] as u32
+            })
+            .collect();
+        for t in mesh.fan(f) {
+            tris.push([local[t[0]], local[t[1]], local[t[2]]]);
+        }
+    }
+    let n = verts.len();
+    if n == 0 {
+        return true;
+    }
+    let pos: Vec<V3> = verts.iter().map(|&v| mesh.positions[mesh.corners[g.corners[v][0]] as usize]).collect();
+    let init: Vec<V2> = verts.iter().map(|&v| pts[v]).collect();
+    let mut fixed = vec![None; 2 * n];
+    for (k, &v) in verts.iter().enumerate() {
+        if !free[v] {
+            fixed[k] = Some(pts[v].x);
+            fixed[n + k] = Some(pts[v].y);
+        }
+    }
+    if fixed.iter().filter(|x| x.is_some()).count() < 4 {
+        return false;
+    }
+    let solved = crate::unwrap::lscm_pinned(&pos, &tris, &fixed, &init, 3000);
+    if solved.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return false;
+    }
+    for (k, &v) in verts.iter().enumerate() {
+        if free[v] {
+            pts[v] = solved[k];
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1543,19 +1604,22 @@ mod tests {
     }
 
     #[test]
-    fn relax_around_keeps_moved_vertices() {
+    fn solve_around_keeps_line_and_far_rows() {
         let n = 6;
         let (m, uv, g) = wavy_grid(n);
         let sel = row(&m, &g, n, 3);
         let mut pts = g.positions(&uv);
         straighten_lines(&g, &mut pts, &sel, LineAxis::U);
         let line = pts.clone();
-        relax_around(&g, &mut pts, &sel, 2, 20);
+        let ring = ring_distance(&g, &sel);
+        let free: Vec<bool> = (0..g.len()).map(|i| ring[i] > 0 && ring[i] <= 2).collect();
+        let faces: Vec<usize> = (0..m.face_count()).collect();
+        assert!(solve_free(&m, &g, &faces, &mut pts, &free));
         assert!((0..g.len()).filter(|&i| sel[i]).all(|i| pts[i] == line[i]));
         // rangée 0 : à 3 arêtes de la ligne, hors de portée
         let far = row(&m, &g, n, 0);
         assert!((0..g.len()).filter(|&i| far[i]).all(|i| pts[i] == line[i]));
-        assert!((0..g.len()).any(|i| pts[i] != line[i]), "rien n'a été détendu autour");
+        assert!((0..g.len()).any(|i| pts[i] != line[i]), "rien n'a été recalculé autour");
     }
 
     #[test]

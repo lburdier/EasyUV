@@ -331,6 +331,15 @@ pub fn interact(ui: &egui::Ui, resp: &egui::Response, cam: &mut UvCamera, rect: 
         if let Some(ev) = tool_interact(ui, resp, view, scene, ed, pointer, shift, &key) {
             return Some(ev);
         }
+        // double-clic sur une arête : sa boucle, comme avec l'outil Sélection (pour Rendre droit)
+        if resp.double_clicked() && ed.stroke.is_none() && scene.sel_mode == SelectMode::Edge {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let n = scene.select_loop(view.to_uv(p), PICK_PX / view.side, shift);
+                if n > 0 {
+                    return Some(UvEvent::Status(format!("Boucle de {n} arête(s) sélectionnée")));
+                }
+            }
+        }
         // un simple clic choisit l'élément visé (pour limiter le pinceau à son îlot)
         if resp.clicked() && ed.stroke.is_none() {
             if let Some(p) = resp.interact_pointer_pos() {
