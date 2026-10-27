@@ -1,183 +1,191 @@
+**English** · [Français](README.fr.md)
+
 # EasyUV
 
-Dépliage UV automatique intelligent, écrit en Rust : **application Windows**, **outil en ligne de commande** et **addon Blender** qui partagent le même moteur.
+Smart automatic UV unwrapping, written in Rust: a **Windows app**, a **command-line tool** and a **Blender add-on** sharing the same engine.
 
-- Coutures placées automatiquement, dépliage à faible distorsion (LSCM + ARAP).
-- Densité de texels uniforme et contrôlable en px/m.
-- Damier de contrôle.
-- Interface inspirée de Blender.
-- Mises à jour automatiques à chaque release.
+- Seams placed automatically, low-distortion unwrapping (LSCM + ARAP).
+- Uniform texel density, controllable in px/m.
+- Checker preview.
+- Blender-inspired interface.
+- Automatic updates with every release.
 
-## Télécharger
+> The app's interface is currently in French. Menu names are given below with their French label in parentheses.
 
-Page des [releases](https://github.com/lburdier/EasyUV/releases/latest) :
+## Download
 
-| Fichier | Contenu |
+From the [releases](https://github.com/lburdier/EasyUV/releases/latest) page:
+
+| File | Contents |
 |---|---|
-| `EasyUV-windows-x64.zip` | Application + `easyuv-cli.exe` |
-| `easyuv-blender-<version>.zip` | Extension Blender 4.2+ / 5.x |
+| `EasyUV-windows-x64.zip` | App + `easyuv-cli.exe` |
+| `easyuv-blender-<version>.zip` | Blender extension, 4.2+ / 5.x |
 
-### Mises à jour automatiques
+### Automatic updates
 
-- **Application :** au démarrage, EasyUV interroge la dernière release GitHub. Si une version plus récente existe, un bouton orange « Mise à jour disponible » apparaît. L'installation télécharge le nouvel exécutable, **vérifie son empreinte SHA-256**, le remplace et relance l'application. Le menu *Aide > Vérifier les mises à jour* fait la même chose à la demande. Pour désactiver la vérification au démarrage, définissez `EASYUV_NO_UPDATE=1`.
-- **Blender :** *Préférences > Get Extensions > Repositories > `+` > Add Remote Repository*, URL :
+- **App:** on startup, EasyUV checks the latest GitHub release. If a newer version exists, an orange "Update available" (*Mise à jour disponible*) button appears. Installing downloads the new executable, **checks its SHA-256 hash**, replaces it and restarts the app. *Help > Check for updates* (*Aide > Vérifier les mises à jour*) does the same on demand. To turn off the startup check, set `EASYUV_NO_UPDATE=1`.
+- **Blender:** *Preferences > Get Extensions > Repositories > `+` > Add Remote Repository*, URL:
   `https://github.com/lburdier/EasyUV/releases/latest/download/index.json`
-  Cochez *Check for Updates on Startup* : Blender proposera chaque nouvelle version.
+  Tick *Check for Updates on Startup*: Blender will offer every new version.
 
-## Comment le dépliage décide
+## How the unwrapper decides
 
-1. **Coutures de départ :** arêtes vives (angle dièdre réglable), coutures déjà marquées, géométrie non-manifold.
-2. **Topologie :** chaque îlot doit être un disque.
-   - tube (bras, cylindre) → une seule couture, le long du chemin le plus discret entre ses bords, de préférence dans un pli ;
-   - forme fermée ou trouée (sphère, tore) → partition géodésique dont la frontière suit les plis.
-3. **Dépliage :** LSCM (conforme), puis relaxation **ARAP** (préserve les aires).
-4. **Contrôle qualité :** un îlot trop déformé ou avec des triangles retournés est redécoupé, récursivement.
-5. **Densité de texels :** les îlots sont à l'échelle réelle (espace monde, mètres), donc la densité est la même partout. Deux modes : *Remplir 0-1* ou *Densité cible*.
-6. **Plusieurs objets :** rangement dans une tuile commune (même densité pour tous) ou une tuile par objet.
-7. **Empaquetage :** rotation qui minimise la boîte englobante, puis skyline avec rotation de 90°.
+1. **Initial seams:** sharp edges (adjustable dihedral angle), seams already marked, non-manifold geometry.
+2. **Topology:** every island must be a disc.
+   - tube (arm, cylinder) → a single seam, along the least visible path between its borders, preferably in a crease;
+   - closed or holed shape (sphere, torus) → geodesic partition whose boundary follows the creases.
+3. **Unwrapping:** LSCM (conformal), then **ARAP** relaxation (preserves areas).
+4. **Quality check:** an island that is too distorted or has flipped triangles is split again, recursively.
+5. **Texel density:** islands are at real-world scale (world space, metres), so density is the same everywhere. Two modes: *Fill 0-1* or *Target density*.
+6. **Several objects:** packed into one shared tile (same density for all) or one tile per object.
+7. **Packing:** rotation that minimises the bounding box, then skyline packing with 90° rotation.
 
-## Auto-apprentissage
+## Self-learning
 
-EasyUV s'améliore à force de déplier.
+EasyUV gets better the more it unwraps.
 
-1. **Empreinte.** Chaque maillage est décrit par une empreinte invariante d'échelle : taille, part de triangles, arêtes vives, courbure, bords ouverts, topologie, forme.
-2. **Prédiction.** Un modèle de substitution à noyau estime, à partir des expériences sur des maillages similaires, le gain de chaque réglage (angle de couture, tolérance de distorsion, ARAP) par rapport aux réglages d'usine.
-3. **Essais.** EasyUV essaie en parallèle la prédiction, les réglages d'usine, vos réglages et quelques variantes, puis garde le meilleur. L'exploration diminue quand la confiance augmente.
-4. **Mémoire.** Les mesures de chaque essai (distorsion, coutures, îlots, remplissage, retournements) sont enregistrées. Elles servent pour tous les maillages qui suivent.
+1. **Fingerprint.** Each mesh is described by a scale-invariant fingerprint: size, share of triangles, sharp edges, curvature, open borders, topology, shape.
+2. **Prediction.** A kernel surrogate model uses past results on similar meshes to estimate how much each setting (seam angle, distortion tolerance, ARAP) improves on the factory settings.
+3. **Trials.** EasyUV tries the prediction, the factory settings, your settings and a few variants in parallel, and keeps the best. Exploration decreases as confidence grows.
+4. **Memory.** The measurements of each trial (distortion, seams, islands, fill, flips) are recorded and used for every following mesh.
 
-Le curseur **Priorité : coutures ↔ distorsion** change le compromis immédiatement, sans réentraînement : les mesures sont stockées brutes et le score est recalculé.
+The **Priority: seams ↔ distortion** slider changes the trade-off immediately, without retraining: measurements are stored raw and the score is recomputed.
 
-Le modèle se trouve dans `%APPDATA%\EasyUV\apprentissage.txt`. Il est partagé par l'application, le CLI et Blender, et écrit en ajout seul. Un modèle de base pré-entraîné est livré. Pour l'enrichir d'un coup sur vos propres modèles :
+The model lives in `%APPDATA%\EasyUV\apprentissage.txt`. It is shared by the app, the CLI and Blender, and is append-only. A pre-trained base model ships with EasyUV. To train it on your own models in one go:
 
 ```text
-easyuv-cli --train D:\mes_modeles --rounds 3      # entraîner
-easyuv-cli --eval D:\autres_modeles               # mesurer le gain sur des maillages jamais vus
+easyuv-cli --train D:\my_models --rounds 3      # train
+easyuv-cli --eval D:\other_models               # measure the gain on unseen meshes
 ```
 
 ## Formats
 
 | Format | Import | Export |
 |---|---|---|
-| OBJ (multi-objets) | oui | oui |
-| glTF / GLB | oui (quads reconstruits) | GLB |
-| FBX | oui (natif, via [ufbx](https://github.com/ufbx/ufbx)) | oui, via Blender installé |
+| OBJ (multi-object) | yes | yes |
+| glTF / GLB | yes (quads rebuilt) | GLB |
+| FBX | yes (native, via [ufbx](https://github.com/ufbx/ufbx)) | yes, through an installed Blender |
 
-Les transformations des objets sont appliquées (espace monde). Le FBX et le glTF sont convertis en Z vers le haut et en mètres.
+Object transforms are applied (world space). FBX and glTF are converted to Z-up and metres.
 
-## Application
+## App
 
-Raccourcis :
+Shortcuts:
 
-| Touche | Action |
+| Key | Action |
 |---|---|
-| `U` | Déplier |
-| `F` / `Origine` | Cadrer la sélection / tout (dans la vue sous le pointeur) |
-| Clic + glisser | Sélection par zone : rectangle, lasso ou cercle (`W` pour changer, `[` `]` : rayon du cercle), `Maj` ajoute, `Ctrl` retire. Objets en mode Objet ; sommets, arêtes, faces ou îlots en Édition |
-| `Alt` + glisser / molette cliquée | Orbite |
-| Clic droit glissé / `Maj` + molette cliquée | Déplacer la vue |
-| Molette | Zoom |
-| `Ctrl+O` / `Ctrl+I` / `Ctrl+S` | Ouvrir / importer dans la scène / exporter |
+| `U` | Unwrap |
+| `F` / `Home` | Frame selection / everything (in the view under the cursor) |
+| Click + drag | Area selection: box, lasso or circle (`W` to switch, `[` `]`: circle radius), `Shift` adds, `Ctrl` removes. Objects in Object mode; vertices, edges, faces or islands in Edit mode |
+| `Alt` + drag / middle click | Orbit |
+| Right-drag / `Shift` + middle click | Pan |
+| Mouse wheel | Zoom |
+| `Ctrl+O` / `Ctrl+I` / `Ctrl+S` | Open / import into the scene / export |
 
-Glisser-déposer un fichier pour l'ouvrir, avec `Maj` pour l'ajouter à la scène. Modes d'affichage : Solide, Damier, Îlots, Étirement.
+Drag and drop a file to open it, with `Shift` to add it to the scene. Display modes: Solid, Checker, Islands, Stretch.
 
-### Outils UV
+### UV tools
 
-Panneau « Outils UV », menu UV et clic droit dans l'éditeur UV, dans l'esprit du UV Toolkit de Maya et de RizomUV.
+"UV Tools" panel, UV menu and right click in the UV editor, in the spirit of Maya's UV Toolkit and RizomUV.
 
-Modes de sélection, comme Blender : sommets `1`, arêtes `2` (double-clic : boucle), faces `3`, îlots `4`. Avec une sélection, `U` ne déplie qu'elle ; `Maj+U` déplie les objets.
+Selection modes, as in Blender: vertices `1`, edges `2` (double-click: loop), faces `3`, islands `4`. With a selection, `U` unwraps only that selection; `Shift+U` unwraps the objects.
 
-| Outil (touche dans l'éditeur UV) | Effet |
+| Tool (key in the UV editor) | Effect |
 |---|---|
-| Sélection `Q` | clic, `Maj`+clic, rectangle ; glisser, `G` `R` `S` pour transformer |
-| Pinceau Déplacer `Maj+1` | tire les UV sous le pinceau, l'effet s'atténue vers le bord |
-| Pinceau Détendre `Maj+2` | les arêtes reprennent leur longueur 3D (moins d'étirement) |
-| Pinceau Redresser `Maj+3` | les arêtes s'alignent sur l'horizontale ou la verticale la plus proche : rend droite la zone peinte |
-| Pinceau Pincer `Maj+4` | resserre les UV vers le centre, `Maj` pour les écarter |
-| Rectangle `Maj+5` | dessinez un rectangle : l'îlot sélectionné y est rendu droit puis étiré pour le remplir |
+| Select `Q` | click, `Shift`+click, box; drag, `G` `R` `S` to transform |
+| Move brush `Shift+1` | pulls the UVs under the brush, with falloff towards the edge |
+| Relax brush `Shift+2` | edges return to their 3D length (less stretching) |
+| Straighten brush `Shift+3` | edges snap to the nearest horizontal or vertical: straightens the painted area |
+| Pinch brush `Shift+4` | pulls UVs towards the centre, `Shift` to push them apart |
+| Rectangle `Shift+5` | draw a rectangle: the selected island is straightened, then stretched to fill it |
 
-Coutures (sur les arêtes sélectionnées) : Couper, Coudre (rapprocher et souder les îlots), Marquer la couture pour les prochains dépliages, Retirer la marque.
+Seams (on the selected edges): Cut, Sew (bring islands together and weld them), Mark seam for future unwraps, Clear seam.
 
-Sélection par zone : rectangle, lasso ou cercle (`W`), `Maj` pour ajouter, `Ctrl` pour retirer. Sélection par angle : arêtes vives (mode arêtes) ou faces d'un même pan.
+Area selection: box, lasso or circle (`W`), `Shift` to add, `Ctrl` to remove. Select by angle: sharp edges (edge mode) or faces of the same flat area.
 
-Vue 3D comme Blender : gizmo cliquable et pavé numérique pour les vues d'axe orthographiques ; `Tab` passe les objets sélectionnés en mode Édition, où l'on choisit leurs sommets, arêtes et faces sur le modèle (`Alt`+clic : boucle, `L` / `Ctrl+L` : relié, `Ctrl+E` : couture).
+3D view like Blender: clickable gizmo and numpad for orthographic axis views; `Tab` puts the selected objects in Edit mode, where you pick their vertices, edges and faces on the model (`Alt`+click: loop, `L` / `Ctrl+L`: linked, `Ctrl+E`: seam).
 
-Projeter depuis la vue : les UV prennent ce que l'on voit dans la vue 3D (comme Project From View de Blender), rangées dans la place libre ou étirées sur la tuile (Cadré).
+Project from view: UVs take what you see in the 3D view (like Blender's Project From View), placed in the free space or stretched over the tile (Fit).
 
-Grille parfaite (`Maj+G`) : rangées et colonnes sur des droites. Remettre d'aplomb : îlots tournés d'après leurs arêtes.
+Perfect grid (`Shift+G`): rows and columns on straight lines. Straighten orientation: islands rotated according to their edges.
 
-Rendre droit (`Maj+W`) : grille de quads, arc déroulé ou rectangle à bord épinglé, la méthode la moins déformée l'emporte. En mode sommets, 4 sommets choisis sur le bord d'une bande en sont les coins imposés.
+Make straight (`Shift+W`): quad grid, unrolled arc or rectangle with a pinned border; the least distorted method wins. In vertex mode, 4 vertices picked on the border of a strip become its fixed corners.
 
-**Lignes et faces, à l'endroit choisi** (panneau *Outils UV*, menu *UV* ou clic droit > *Lignes et faces*) :
+**Lines and faces, exactly where you choose** (*UV Tools* panel, *UV* menu or right click > *Lines and faces*):
 
-| Outil | Sur une sélection de… | Effet |
+| Tool | On a selection of… | Effect |
 |---|---|---|
-| Lisser | sommets, arêtes, faces ou îlots | les arêtes reprennent leur longueur 3D, les ondulations disparaissent ; recommencer lisse davantage |
-| Rendre droit | sommets ou arêtes (une ligne ouverte : une partie de boucle, une rangée) | la ligne devient droite dans la direction de ses deux bouts, en gardant sa longueur ; sommets espacés selon les longueurs 3D |
-| Rendre droit | faces | les faces se rangent en grille droite |
-| Rendre droit | îlots | comme `Maj+W` : la bande ou l'arc devient droit |
-| Ligne horizontale / verticale | sommets ou arêtes | la ligne devient droite et se couche sur U ou sur V |
+| Smooth | vertices, edges, faces or islands | edges return to their 3D length and ripples disappear; repeat to smooth further |
+| Make straight | vertices or edges (an open line: part of a loop, a row) | the line becomes straight in the direction of its two ends, keeping its length; vertices spaced by their 3D lengths |
+| Make straight | faces | faces are arranged in a straight grid |
+| Make straight | islands | like `Shift+W`: the strip or arc becomes straight |
+| Horizontal / vertical line | vertices or edges | the line becomes straight and lies along U or V |
 
-Les faces autour sont recalculées d'après la 3D pour suivre la ligne redressée (d'abord près de la ligne, puis sur tout l'îlot s'il le faut) ; les autres îlots ne bougent pas, et une zone isolée (`H`) est respectée. Une boucle fermée (le tour d'un œil) ne peut pas devenir droite. Une ligne très courbe au milieu d'un îlot plie forcément quelques faces : le message le signale, `Ctrl+Z` annule. Avec un pinceau actif, le double-clic sur une arête choisit aussi sa boucle.
+Surrounding faces are recomputed from the 3D shape to follow the straightened line (first near the line, then across the whole island if needed); other islands don't move, and an isolated area (`H`) is respected. A closed loop (around an eye) cannot become straight. A strongly curved line in the middle of an island will fold a few faces: a message tells you, and `Ctrl+Z` undoes it. With a brush active, double-clicking an edge also selects its loop.
 
-Damiers : Couleur, Mono, Numéroté, Cercles, Flèches, Dégradé UV, Diagonales. Les îlots sélectionnés et l'îlot survolé dans l'éditeur UV sont mis en évidence sur le modèle 3D.
+Checkers: Colour, Mono, Numbered, Circles, Arrows, UV gradient, Diagonals. Selected islands and the island under the cursor in the UV editor are highlighted on the 3D model.
 
-Le score UV (sur 100) est affiché en direct dans l'en-tête de l'éditeur UV : distorsion, chevauchements, faces retournées, remplissage, densité égale, coutures.
+The UV score (out of 100) is shown live in the UV editor's header: distortion, overlaps, flipped faces, fill, even density, seams.
 
-Rayon du pinceau : `[` `]` ou `Ctrl`+molette. `Échap` annule le coup de pinceau, `Ctrl+Z` après.
+Brush radius: `[` `]` or `Ctrl`+wheel. `Esc` cancels the stroke, `Ctrl+Z` afterwards.
 
-**Zone du pinceau.** Les pinceaux ne touchent que la sélection : un îlot (clic), des faces ou des sommets. Le reste est figé et estompé à l'écran. Sans sélection, tout ce qui est visible peut bouger. Les sommets partagés avec une face hors de la zone restent figés, donc les faces voisines ne se déforment pas.
+**Brush area.** Brushes only affect the selection: an island (click), faces or vertices. Everything else is frozen and dimmed on screen. With no selection, everything visible can move. Vertices shared with a face outside the area stay frozen, so neighbouring faces don't get distorted.
 
-**Isoler une zone.** `H` (ou *UV > Isoler la sélection*) fige tout sauf la sélection. La zone reste isolée quand vous changez de sélection, et `G` / `R` / `S` n'en sortent pas non plus. `Alt+H` la libère.
+**Isolate an area.** `H` (or *UV > Isolate selection*) freezes everything except the selection. The area stays isolated when you change the selection, and `G` / `R` / `S` stay inside it too. `Alt+H` releases it.
 
-Outils d'îlots (sur la sélection) : aligner (gauche, centre, droite, haut, bas), répartir en U ou en V, pivoter d'un angle, miroir, échelle, empiler, égaliser la densité, remplir la tuile, rendre droit, orienter, optimiser (ARAP), redéplier.
+Island tools (on the selection): align (left, centre, right, top, bottom), distribute along U or V, rotate by an angle, mirror, scale, stack, equalise density, fill the tile, make straight, orient, optimise (ARAP), re-unwrap.
 
-## Ligne de commande
+## Command line
 
 ```text
-easyuv-cli modele.fbx                          # -> modele_uv.obj
-easyuv-cli a.glb b.obj -o scene.glb            # une scène, rangement commun
-easyuv-cli dossier\ --format fbx --separate    # traitement par lots
-easyuv-cli x.obj --density 512 --tex 2048      # densité cible 512 px/m
+easyuv-cli model.fbx                           # -> model_uv.obj
+easyuv-cli a.glb b.obj -o scene.glb            # one scene, shared packing
+easyuv-cli folder\ --format fbx --separate     # batch processing
+easyuv-cli x.obj --density 512 --tex 2048      # target density 512 px/m
 easyuv-cli --check-update | --self-update
 ```
 
 ## Blender
 
-Panneau : Vue 3D → barre latérale `N` → onglet **EasyUV** (aussi dans l'éditeur UV). Raccourci `Alt+U` en mode édition, et menu `U` → *Dépliage intelligent*.
+Panel: 3D View → `N` sidebar → **EasyUV** tab (also in the UV editor). Shortcut `Alt+U` in Edit mode, and the `U` menu → *Smart unwrap*.
 
-Fonctions :
-- dépliage de la sélection, ensemble ou objet par objet ;
-- respect des coutures et arêtes vives existantes ;
-- marquage des coutures calculées ;
-- mesure, copie et application de la densité ;
-- damier activable et désactivable, avec restauration des matériaux d'origine.
+Features:
+- unwrap the selection, all together or object by object;
+- respects existing seams and sharp edges;
+- marks the computed seams;
+- measure, copy and apply texel density;
+- toggle the checker on and off, restoring the original materials.
 
-## Compiler
+## Build
 
-Prérequis : Rust stable (MSVC), Python 3.11+, et Blender pour les tests de l'addon.
+Requirements: stable Rust (MSVC), Python 3.11+, and Blender for the add-on tests.
 
 ```powershell
-.\build.ps1                                   # compile et prépare dist\
+.\build.ps1                                   # build and prepare dist\
 cargo test --release --workspace
 blender --background --factory-startup --python tests\blender_test.py
-blender --background --factory-startup --python tests\make_models.py   # modèles de test
+blender --background --factory-startup --python tests\make_models.py   # test models
 ```
 
-| Dossier | Rôle |
+| Folder | Role |
 |---|---|
-| `crates/easyuv-core` | Moteur (aucune dépendance) + API C `easyuv.dll` |
-| `crates/easyuv-app` | Application egui, `easyuv-cli`, import/export, mises à jour |
-| `blender_addon/easyuv` | Extension Blender (ctypes → `easyuv.dll`) |
-| `tools/package.py` | Assets de release + index du dépôt d'extensions Blender |
+| `crates/easyuv-core` | Engine (no dependencies) + C API `easyuv.dll` |
+| `crates/easyuv-app` | egui app, `easyuv-cli`, import / export, updates |
+| `blender_addon/easyuv` | Blender extension (ctypes → `easyuv.dll`) |
+| `tools/package.py` | Release assets + Blender extension repository index |
 
-## Publier une version
+## Releasing
 
-1. Mettre la même version dans `Cargo.toml`, `blender_addon/easyuv/blender_manifest.toml` et `bl_info`.
-2. Ajouter une section `## [x.y.z]` dans `CHANGELOG.md`.
-3. Lancer `git tag vx.y.z && git push origin vx.y.z`.
+1. Set the same version in `Cargo.toml`, `blender_addon/easyuv/blender_manifest.toml` and `bl_info`.
+2. Add a `## [x.y.z]` section to `CHANGELOG.md`.
+3. Run `git tag vx.y.z && git push origin vx.y.z`.
 
-GitHub Actions teste, compile et publie la release. L'application et Blender la proposent ensuite automatiquement.
+GitHub Actions tests, builds and publishes the release. The app and Blender then offer it automatically.
 
-## Licence
+## Contributing
 
-[GPL-3.0-or-later](LICENSE), compatible avec l'écosystème Blender.
+Issues and pull requests are welcome, in English or French. Run `cargo test --release --workspace` before opening a PR.
+
+## License
+
+[GPL-3.0-or-later](LICENSE), compatible with the Blender ecosystem.
