@@ -4,6 +4,8 @@
 
 Dépliage UV automatique intelligent, écrit en Rust : **application Windows**, **outil en ligne de commande** et **addon Blender** qui partagent le même moteur.
 
+![EasyUV : Suzanne dépliée automatiquement, 17 îlots, score UV 88](docs/screenshot.png)
+
 - Coutures placées automatiquement, dépliage à faible distorsion (LSCM + ARAP).
 - Densité de texels uniforme et contrôlable en px/m.
 - Damier de contrôle.

@@ -4,6 +4,8 @@
 
 Smart automatic UV unwrapping, written in Rust: a **Windows app**, a **command-line tool** and a **Blender add-on** sharing the same engine.
 
+![EasyUV: Suzanne unwrapped automatically, 17 islands, UV score 88](docs/screenshot.png)
+
 - Seams placed automatically, low-distortion unwrapping (LSCM + ARAP).
 - Uniform texel density, controllable in px/m.
 - Checker preview.
